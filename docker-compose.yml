@@ -1,0 +1,40 @@
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-releaseradar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-locally}
+      POSTGRES_DB: ${POSTGRES_DB:-releaseradar}
+    ports:
+      # Host port is 5433, NOT 5432: this machine runs a native PostgreSQL
+      # service that already owns 5432. The app container still talks to
+      # db:5432 over the compose network, so only host access is remapped.
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # The app runs migrations at boot, so it must not start before Postgres
+      # is genuinely accepting connections.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-releaseradar} -d ${POSTGRES_DB:-releaseradar}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-releaseradar}:${POSTGRES_PASSWORD:-change-me-locally}@db:5432/${POSTGRES_DB:-releaseradar}?sslmode=disable
+      HTTP_ADDR: ":8080"
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      USER_AGENT: ${USER_AGENT:-ReleaseRadar/0.1 ( unset@example.com )}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "8080:8080"
+
+volumes:
+  pgdata:

@@ -1,0 +1,20 @@
+# secrets
+.env
+
+# build output — anchored to the repo root, otherwise the bare name would also
+# ignore the cmd/releaseradar/ source directory
+/bin/
+/releaseradar
+/releaseradar.exe
+
+# spike scratch
+/.spike/
+/spike/server/spike-server
+/spike/server/spike-server.exe
+
+# editors / os
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

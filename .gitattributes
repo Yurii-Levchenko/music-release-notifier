@@ -1,0 +1,6 @@
+# Normalise line endings so a Windows checkout does not produce noisy diffs.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.excalidraw text eol=lf
