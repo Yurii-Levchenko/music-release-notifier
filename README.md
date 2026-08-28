@@ -8,8 +8,8 @@ message when a new album, single or EP lands.
 
 **Go · PostgreSQL · ListenBrainz / MusicBrainz**
 
-> Status: **S0 complete** — skeleton, schema and the deduplication invariants
-> are in place and tested. The bot itself is next (S1).
+> Status: **S1 in progress** — the bot connects, registers its commands and
+> polls for updates. Artist search is next (S2).
 
 ---
 
@@ -95,7 +95,7 @@ behind. Without `TEST_DATABASE_URL` they skip rather than fail, keeping
 |---|---|
 | ✅ S0 | Skeleton: compose, migrations, `/healthz`, structured logging |
 | ✅ S7 | Spike: proved a Spicetify extension can `fetch()` this backend |
-| ⬜ S1 | Bot answers `/start` |
+| 🔨 S1 | Bot answers `/start` — implemented, live check pending |
 | ⬜ S2 | Artist search via MusicBrainz, paginated picker card |
 | ⬜ S3 | Subscriptions, `/list`, `/stop` |
 | ⬜ S4 | Release detection |

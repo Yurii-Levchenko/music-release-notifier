@@ -1,0 +1,241 @@
+package telegram
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"html"
+	"log/slog"
+	"strconv"
+	"strings"
+
+	"github.com/mymmrac/telego"
+
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/notify"
+)
+
+// UserStore is the slice of storage the bot actually needs. Declared here, as a
+// consumer-side interface, so the bot stays testable and never grows a
+// dependency on pgx.
+type UserStore interface {
+	// UpsertUser records the chat and returns the internal user id. Must be
+	// idempotent: /start is pressed more than once.
+	UpsertUser(ctx context.Context, chatID int64, username string) (int64, error)
+	// SetBlocked flips the blocked flag when the user blocks or unblocks the bot.
+	SetBlocked(ctx context.Context, chatID int64, blocked bool) error
+}
+
+// Bot consumes inbound updates. Long polling, not webhooks: Telegram's own
+// advice is "you use getUpdates and it works, keep it that way", and it needs
+// no domain, no TLS and no inbound port (SPEC D12).
+type Bot struct {
+	client *Client
+	users  UserStore
+	log    *slog.Logger
+}
+
+func NewBot(c *Client, users UserStore, log *slog.Logger) *Bot {
+	return &Bot{client: c, users: users, log: log}
+}
+
+// Run blocks until ctx is cancelled. Returns nil on a clean shutdown.
+func (b *Bot) Run(ctx context.Context) error {
+	if err := b.client.SetCommands(ctx); err != nil {
+		// Not fatal: the bot works without a command menu.
+		b.log.Warn("could not register command list", "err", err)
+	}
+
+	// allowed_updates is deliberately narrow. my_chat_member is what tells us a
+	// user blocked the bot, which is cheaper and earlier than waiting for a 403
+	// on the next send.
+	updates, err := b.client.api.UpdatesViaLongPolling(ctx, &telego.GetUpdatesParams{
+		Timeout:        30,
+		AllowedUpdates: []string{"message", "callback_query", "my_chat_member"},
+	})
+	if err != nil {
+		return fmt.Errorf("start long polling: %w", err)
+	}
+
+	b.log.Info("bot polling for updates", "bot", b.client.Username())
+
+	for {
+		select {
+		case <-ctx.Done():
+			b.log.Info("bot stopping")
+			return nil
+		case update, ok := <-updates:
+			if !ok {
+				b.log.Info("update channel closed")
+				return nil
+			}
+			b.handle(ctx, update)
+		}
+	}
+}
+
+// handle dispatches one update. It never returns an error: one bad update must
+// not stop the loop, or a single malformed message becomes an outage.
+func (b *Bot) handle(ctx context.Context, u telego.Update) {
+	switch {
+	case u.Message != nil:
+		b.handleMessage(ctx, u.Message)
+	case u.MyChatMember != nil:
+		b.handleMyChatMember(ctx, u.MyChatMember)
+	case u.CallbackQuery != nil:
+		// Wired up in S2 with the artist picker. Answer anyway so the client
+		// stops showing a spinner on the button.
+		if err := b.client.api.AnswerCallbackQuery(ctx, &telego.AnswerCallbackQueryParams{
+			CallbackQueryID: u.CallbackQuery.ID,
+		}); err != nil {
+			b.log.Warn("answer callback query", "err", err)
+		}
+	}
+}
+
+func (b *Bot) handleMessage(ctx context.Context, msg *telego.Message) {
+	if msg.Chat.Type != telego.ChatTypePrivate {
+		// This bot is a private-chat product. Groups have a different rate
+		// limit and no meaningful subscription owner.
+		return
+	}
+
+	chatID := msg.Chat.ID
+	text := strings.TrimSpace(msg.Text)
+	command, args := splitCommand(text)
+
+	log := b.log.With("chat_id", chatID, "command", command)
+
+	switch command {
+	case "/start":
+		b.onStart(ctx, chatID, msg.From, args, log)
+	case "/help":
+		b.reply(ctx, chatID, helpText(b.client.Username()), log)
+	case "/search":
+		b.reply(ctx, chatID,
+			"Пошук виконавців ще не готовий — це наступний етап.\n"+
+				"Скоро тут можна буде написати назву й обрати зі списку.", log)
+	case "/list":
+		b.reply(ctx, chatID,
+			"Список підписок ще не готовий — він з'явиться разом із підписками.", log)
+	case "/stop":
+		b.reply(ctx, chatID,
+			"Поки що нема від чого відписуватися: підписки ще не реалізовані.", log)
+	case "":
+		// Plain text will become a search query in S2.
+		b.reply(ctx, chatID,
+			"Я поки що вмію тільки /start. Пошук виконавців — наступний етап.", log)
+	default:
+		b.reply(ctx, chatID,
+			"Не знаю такої команди. Спробуй /help.", log)
+	}
+}
+
+func (b *Bot) onStart(ctx context.Context, chatID int64, from *telego.User, payload string, log *slog.Logger) {
+	username := ""
+	if from != nil {
+		username = from.Username
+	}
+
+	// Idempotent by construction: ON CONFLICT on telegram_chat_id.
+	userID, err := b.users.UpsertUser(ctx, chatID, username)
+	if err != nil {
+		log.Error("upsert user", "err", err)
+		b.reply(ctx, chatID, "Щось зламалося на моєму боці. Спробуй ще раз за хвилину.", log)
+		return
+	}
+	log.Info("user started", "user_id", userID, "has_payload", payload != "")
+
+	if payload != "" {
+		// The extension linking flow lands here in S8. Acknowledge rather than
+		// silently ignore, so a stale deep link is not confusing.
+		log.Info("start payload received but linking is not implemented yet")
+		b.reply(ctx, chatID,
+			"Прив'язка розширення Spotify ще не готова — вона з'явиться пізніше.\n"+
+				"Але сам бот уже працює: /help", log)
+		return
+	}
+
+	b.reply(ctx, chatID, helpText(b.client.Username()), log)
+}
+
+// handleMyChatMember catches blocks and unblocks. For private chats this update
+// arrives exactly when the user blocks or unblocks the bot, which is the cheap
+// way to stop sending to a dead chat.
+func (b *Bot) handleMyChatMember(ctx context.Context, upd *telego.ChatMemberUpdated) {
+	if upd.Chat.Type != telego.ChatTypePrivate {
+		return
+	}
+	status := upd.NewChatMember.MemberStatus()
+	blocked := status == telego.MemberStatusBanned || status == telego.MemberStatusLeft
+
+	if err := b.users.SetBlocked(ctx, upd.Chat.ID, blocked); err != nil {
+		b.log.Error("record block status", "chat_id", upd.Chat.ID, "blocked", blocked, "err", err)
+		return
+	}
+	b.log.Info("chat member status changed",
+		"chat_id", upd.Chat.ID, "status", status, "blocked", blocked)
+}
+
+// reply sends a message and swallows the error after logging: an undeliverable
+// reply is not worth propagating out of the update loop.
+func (b *Bot) reply(ctx context.Context, chatID int64, text string, log *slog.Logger) {
+	err := b.client.SendHTML(ctx, chatID, text)
+	if err == nil {
+		return
+	}
+	if IsUserGone(err) {
+		log.Info("chat unreachable, marking blocked")
+		if serr := b.users.SetBlocked(ctx, chatID, true); serr != nil {
+			log.Error("record block status", "err", serr)
+		}
+		return
+	}
+	log.Warn("reply failed", "err", err)
+}
+
+func helpText(botUsername string) string {
+	name := botUsername
+	if name == "" {
+		name = "цей бот"
+	} else {
+		name = "@" + name
+	}
+	return "<b>Release Radar</b>\n\n" +
+		"Я повідомляю, коли виконавець, на якого ти підписаний, випускає новий " +
+		"альбом, сингл або EP.\n\n" +
+		"Spotify дає тебе підписатися на виконавця, але надійно не повідомляє " +
+		"про релізи. Це закриває ту прогалину.\n\n" +
+		"<b>Команди</b>\n" +
+		"/search — знайти виконавця\n" +
+		"/list — мої підписки\n" +
+		"/stop — відписатися від усього\n\n" +
+		"Дані про релізи — з MusicBrainz і ListenBrainz.\n" +
+		"<i>" + html.EscapeString(name) + " ще в розробці: працює /start, решта — на підході.</i>"
+}
+
+// splitCommand separates "/cmd@bot payload" into "/cmd" and "payload".
+func splitCommand(text string) (command, args string) {
+	if !strings.HasPrefix(text, "/") {
+		return "", text
+	}
+	command, args, _ = strings.Cut(text, " ")
+	// Telegram appends @botname when several bots share a chat.
+	if at := strings.IndexByte(command, '@'); at >= 0 {
+		command = command[:at]
+	}
+	return strings.ToLower(command), strings.TrimSpace(args)
+}
+
+func parseChatID(address string) (int64, error) {
+	id, err := strconv.ParseInt(strings.TrimSpace(address), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("telegram address %q is not a numeric chat id: %w", address, err)
+	}
+	return id, nil
+}
+
+// asDeliveryError is errors.As with a concrete target, kept here so client.go
+// does not need to import errors.
+func asDeliveryError(err error, target **notify.DeliveryError) bool {
+	return errors.As(err, target)
+}

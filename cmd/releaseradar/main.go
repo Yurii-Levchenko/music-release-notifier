@@ -1,6 +1,6 @@
-// Command releaseradar is the whole application: one binary that will host the
-// bot, poller, notifier and api as goroutines (SPEC.md §5). S0 wires up config,
-// database, migrations, HTTP and shutdown — the workers arrive in S1 and later.
+// Command releaseradar is the whole application: one binary hosting the bot,
+// poller, notifier and api as goroutines (SPEC.md §5). S0 wired up config,
+// database, migrations, HTTP and shutdown; S1 adds the Telegram bot worker.
 package main
 
 import (
@@ -13,10 +13,13 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/config"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/httpx"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/notify"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/storage"
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/telegram"
 )
 
 func main() {
@@ -53,9 +56,28 @@ func run() error {
 		return err
 	}
 
-	// D13: the channel registry exists from the first commit even though no
-	// channel is implemented yet. Empty here, Telegram joins in S5.
-	channels := notify.NewRegistry()
+	// D13: delivery channels are plugins. The registry is what the notifier
+	// worker will resolve against in S5; nothing above it knows about Telegram.
+	var channels *notify.Registry
+	var bot *telegram.Bot
+
+	if cfg.TelegramBotToken == "" {
+		// The app must still boot without a token: S0's compose default has
+		// none, and a missing token should not take down /healthz.
+		log.Warn("TELEGRAM_BOT_TOKEN is not set — bot disabled, HTTP only")
+		channels = notify.NewRegistry()
+	} else {
+		client, err := telegram.NewClient(cfg.TelegramBotToken, log)
+		if err != nil {
+			return err
+		}
+		// Fail fast on a bad token rather than on the first send.
+		if err := client.Init(ctx); err != nil {
+			return err
+		}
+		channels = notify.NewRegistry(telegram.NewNotifier(client))
+		bot = telegram.NewBot(client, storage.NewUsers(pool), log)
+	}
 	log.Info("notification channels registered", "kinds", channels.Kinds())
 
 	srv := &http.Server{
@@ -65,31 +87,38 @@ func run() error {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	// Serve in the background so the main goroutine can wait on ctx.
-	serveErr := make(chan error, 1)
-	go func() {
+	// One errgroup per long-running worker. The group's context is cancelled as
+	// soon as any worker returns an error, which is what makes the whole binary
+	// stop together instead of limping on half-dead.
+	g, gctx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
 		log.Info("http listening", "addr", cfg.HTTPAddr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			serveErr <- err
-			return
-		}
-		serveErr <- nil
-	}()
-
-	select {
-	case err := <-serveErr:
-		if err != nil {
 			return err
 		}
-	case <-ctx.Done():
-		log.Info("shutdown signal received")
+		return nil
+	})
+
+	if bot != nil {
+		g.Go(func() error { return bot.Run(gctx) })
 	}
 
-	// Fresh context: ctx is already cancelled, and shutdown needs to outlive it.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Warn("http shutdown", "err", err)
+	// Shut the HTTP server down when anything else asks us to stop; without
+	// this, ListenAndServe would keep the group waiting forever.
+	g.Go(func() error {
+		<-gctx.Done()
+		// Fresh context: gctx is already cancelled and shutdown must outlive it.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Warn("http shutdown", "err", err)
+		}
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		return err
 	}
 	log.Info("stopped cleanly")
 	return nil
