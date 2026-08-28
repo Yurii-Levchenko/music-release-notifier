@@ -134,6 +134,42 @@ backoff. `400 can't parse entities` — наш баг, підписку **не �
 
 ---
 
+## Процес — ніяких прямих пушів у main
+
+**Кожна зміна йде через гілку й PR.** `main` не приймає прямих комітів.
+
+```bash
+git checkout -b feat/s2-artist-search   # feat/ fix/ chore/ docs/ + номер етапу
+make check                             # те саме, що перевіряє CI
+git push -u origin HEAD
+gh pr create --fill                    # шаблон у .github/pull_request_template.md
+```
+
+Опис PR мусить відповідати на питання, якого **не видно з дифу**: що розглядалося
+й було відкинуто, яке рішення зі `SPEC.md` це реалізує. «Added artist search» —
+поганий опис; «MusicBrainz замість Spotify, бо C12» — хороший.
+
+## Лінтер і конвенції
+
+```bash
+make lint     # golangci-lint run
+make check    # fmt + vet + lint + тести з БД, у порядку CI
+```
+
+- **`golangci-lint` запінений на `v1.64.8`** одночасно в `.golangci.yml` (коментар
+  у шапці), у `env.GOLANGCI_LINT_VERSION` у `.github/workflows/ci.yml`, і локально.
+  Оновлювати **всі три разом**, інакше отримаєш «локально зелено, в CI червоно».
+- **`depguard` машинно стежить за межею `Notifier`** (D13): будь-який імпорт
+  `telego` поза `internal/telegram` — це помилка збірки в CI, а не коментар,
+  який хтось прочитає. Перевірено негативним тестом.
+- **Орфографія — US English** (`misspell locale: US`), як в екосистемі Go.
+  Не `honoured`/`cancelled`/`serialise`, а `honored`/`canceled`/`serialize`.
+- Заглушки лінтера **завжди з причиною**. `//nolint:xxx` без пояснення — це
+  борг, а не рішення. Вимкнені перевірки (`shadow`, `hugeParam`, `fieldalignment`)
+  задокументовані просто в `.golangci.yml`.
+- `-race` у CI, але **не локально**: race-детектор потребує cgo, а стандартний
+  Windows-тулчейн без C-компілятора його не має.
+
 ## Правило спеки
 
 **`SPEC.md` оновлюється тим самим комітом, що й зміна в коді.**

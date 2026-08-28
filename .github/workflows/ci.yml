@@ -1,0 +1,169 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Lets a red build be re-run without an empty commit.
+  workflow_dispatch:
+
+# A new push to a PR makes the previous run pointless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Keep this in lockstep with the version developers run locally, and with the
+  # header comment in .golangci.yml. A version drift here is the classic
+  # "green locally, red in CI" trap.
+  GOLANGCI_LINT_VERSION: v1.64.8
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        # golangci-lint does not fail on formatting by default, and an
+        # unformatted diff is noise in every later review.
+        run: |
+          unformatted=$(gofmt -l ./cmd ./internal)
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files are not gofmt-clean:"
+            echo "$unformatted"
+            gofmt -d ./cmd ./internal
+            exit 1
+          fi
+          echo "gofmt clean"
+
+      - name: go mod tidy is committed
+        # Catches a dependency added without tidying, which makes builds
+        # non-reproducible for everyone else.
+        run: |
+          go mod tidy
+          if ! git diff --exit-code --quiet go.mod go.sum; then
+            echo "::error::go.mod/go.sum are not tidy — run 'go mod tidy' and commit"
+            git diff go.mod go.sum
+            exit 1
+          fi
+          echo "go.mod tidy"
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          args: --timeout=5m
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    # The database invariant tests are the ones that matter most, so CI runs a
+    # real Postgres rather than letting them skip. A suite that silently skips
+    # its most important assertions is worse than no suite.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: releaseradar
+          POSTGRES_PASSWORD: ci-throwaway
+          POSTGRES_DB: releaseradar
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U releaseradar -d releaseradar"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+
+    env:
+      # The suite migrates the schema itself (see storage TestMain), so no
+      # separate migration step is needed here.
+      TEST_DATABASE_URL: postgres://releaseradar:ci-throwaway@localhost:5432/releaseradar?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Test with race detector and coverage
+        run: go test ./... -race -count=1 -coverprofile=coverage.out -covermode=atomic
+
+      - name: Fail if the database tests skipped
+        # Guards against the failure mode this job exists to prevent: a broken
+        # TEST_DATABASE_URL turning the invariant tests into no-ops while CI
+        # still reports success.
+        run: |
+          output=$(go test ./internal/storage/ -count=1 -v 2>&1)
+          echo "$output"
+          if echo "$output" | grep -q "TEST_DATABASE_URL not set"; then
+            echo "::error::database invariant tests skipped — TEST_DATABASE_URL is not reaching them"
+            exit 1
+          fi
+          echo "database invariant tests ran"
+
+      - name: Coverage summary
+        run: |
+          go tool cover -func=coverage.out | tail -1
+          {
+            echo "### Coverage"
+            echo '```'
+            go tool cover -func=coverage.out | tail -20
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build binary
+        run: go build -trimpath -o /tmp/releaseradar ./cmd/releaseradar
+
+      - name: Build Docker image
+        # Proves the Dockerfile still works, which `go build` alone does not.
+        run: docker build -t releaseradar:ci .
+
+  # The spike is a separate module and deliberately excluded from the main
+  # build; check it still compiles so it does not rot before S8 deletes it.
+  spike:
+    name: Spike compiles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+        working-directory: spike/server
+      - run: go build -o /dev/null ./...
+        working-directory: spike/server

@@ -38,7 +38,7 @@ func NewBot(c *Client, users UserStore, log *slog.Logger) *Bot {
 	return &Bot{client: c, users: users, log: log}
 }
 
-// Run blocks until ctx is cancelled. Returns nil on a clean shutdown.
+// Run blocks until ctx is canceled. Returns nil on a clean shutdown.
 func (b *Bot) Run(ctx context.Context) error {
 	if err := b.client.SetCommands(ctx); err != nil {
 		// Not fatal: the bot works without a command menu.
@@ -68,14 +68,14 @@ func (b *Bot) Run(ctx context.Context) error {
 				b.log.Info("update channel closed")
 				return nil
 			}
-			b.handle(ctx, update)
+			b.handle(ctx, &update)
 		}
 	}
 }
 
 // handle dispatches one update. It never returns an error: one bad update must
 // not stop the loop, or a single malformed message becomes an outage.
-func (b *Bot) handle(ctx context.Context, u telego.Update) {
+func (b *Bot) handle(ctx context.Context, u *telego.Update) {
 	switch {
 	case u.Message != nil:
 		b.handleMessage(ctx, u.Message)
@@ -203,8 +203,8 @@ func helpText(botUsername string) string {
 	return "<b>Release Radar</b>\n\n" +
 		"Я повідомляю, коли виконавець, на якого ти підписаний, випускає новий " +
 		"альбом, сингл або EP.\n\n" +
-		"Spotify дає тебе підписатися на виконавця, але надійно не повідомляє " +
-		"про релізи. Це закриває ту прогалину.\n\n" +
+		"Spotify дає тобі підписатися на виконавця, але надійно не повідомляє " +
+		"про релізи. Я закриваю цю прогалину.\n\n" +
 		"<b>Команди</b>\n" +
 		"/search — знайти виконавця\n" +
 		"/list — мої підписки\n" +

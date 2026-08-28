@@ -1,0 +1,151 @@
+# golangci-lint v1.64.8 — pinned to the same version CI runs, so "green locally,
+# red in CI" cannot happen. Upgrade both together (see CLAUDE.md).
+
+run:
+  timeout: 5m
+  tests: true
+
+issues:
+  # Report everything, not the default first-50-per-linter.
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-rules:
+    # Test code legitimately builds throwaway values and long literal tables.
+    - path: _test\.go
+      linters:
+        - dupl
+        - gosec
+        - unparam
+
+linters:
+  enable:
+    # --- correctness ---
+    - errcheck        # unchecked errors
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gosimple
+    - errorlint       # %v instead of %w, == instead of errors.Is
+    - nilerr          # returning nil after a non-nil error check
+    - bodyclose       # unclosed HTTP response bodies
+    - rowserrcheck    # missing rows.Err()
+    - sqlclosecheck   # unclosed sql.Rows / Stmt
+    - noctx           # HTTP requests without a context
+    - contextcheck    # dropping an inherited context
+    - makezero
+    - durationcheck
+
+    # --- architecture ---
+    - depguard        # enforces the notify.Notifier boundary, see below
+
+    # --- style / conventions ---
+    - revive          # golint's successor: naming, exported comments, early return
+    - gocritic
+    - misspell
+    - unconvert
+    - unparam
+    - wastedassign
+    - whitespace
+    - goconst
+    - predeclared     # shadowing builtins like len, cap, new
+
+    # --- security ---
+    - gosec
+
+linters-settings:
+  depguard:
+    rules:
+      # SPEC.md D13: the delivery channel is a plugin. Telegram-specific types
+      # must never cross the notify.Notifier boundary. This makes that
+      # architectural rule machine-checked instead of a comment nobody reads —
+      # the whole point of the abstraction is that it cannot be bypassed by
+      # accident under deadline pressure.
+      notifier-boundary:
+        list-mode: lax
+        files:
+          - "**/internal/notify/**"
+          - "**/internal/storage/**"
+          - "**/internal/httpx/**"
+          - "**/internal/config/**"
+          - "**/internal/listenbrainz/**"
+          - "**/internal/musicbrainz/**"
+          - "**/cmd/**"
+        deny:
+          - pkg: github.com/mymmrac/telego
+            desc: >-
+              Only internal/telegram may import telego. Everything else talks to
+              notify.Notifier (SPEC.md D13). If you need this, you are about to
+              leak a chat_id into the domain.
+
+      # The channel boundary must not know about its implementations, or the
+      # dependency arrow points the wrong way and the abstraction is decorative.
+      notify-stays-abstract:
+        list-mode: lax
+        files:
+          - "**/internal/notify/**"
+        deny:
+          - pkg: github.com/Yurii-Levchenko/music-release-notifier/internal/telegram
+            desc: "internal/notify defines the interface; it must not depend on an implementation."
+
+  errcheck:
+    # Deliberate fire-and-forget writes. Everything else must be handled.
+    exclude-functions:
+      - (*strings.Builder).WriteString
+      - (*strings.Builder).WriteByte
+      - (*strings.Builder).WriteRune
+
+  govet:
+    enable-all: true
+    disable:
+      # Struct field alignment micro-optimization; not worth the churn here.
+      - fieldalignment
+      # Flags idiomatic Go: `if _, err := f(); err != nil` inside a function
+      # that already has an `err`. Famously noisy, and the alternative is
+      # uglier and no safer.
+      - shadow
+
+  revive:
+    rules:
+      - name: exported
+        arguments:
+          - disableStutteringCheck
+      - name: early-return
+      - name: unused-parameter
+      - name: indent-error-flow
+      - name: error-strings
+      - name: error-return
+      - name: context-as-argument
+      - name: context-keys-type
+      - name: unreachable-code
+      - name: redefines-builtin-id
+
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - style
+      - performance
+    disabled-checks:
+      # Fires on short if/else that is clearer than a switch.
+      - ifElseChain
+      # We prefer explicit named returns in a few spots for documentation value.
+      - unnamedResult
+      # Would push notify.Release and telego.Update behind pointers. For
+      # Release that is an interface-design decision (value semantics keep the
+      # Notifier contract simple), and one 112-byte copy per delivered message
+      # is not a cost worth complicating the API for.
+      - hugeParam
+
+  gosec:
+    excludes:
+      # G404: we use math/rand only where unpredictability does not matter.
+      # Token generation uses crypto/rand explicitly.
+      - G404
+
+  misspell:
+    locale: US
+
+  goconst:
+    min-len: 3
+    min-occurrences: 4
+    ignore-tests: true

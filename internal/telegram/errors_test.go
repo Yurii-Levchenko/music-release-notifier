@@ -49,7 +49,7 @@ func TestClassify(t *testing.T) {
 		// every subscription in the database on one bad deploy.
 		{"unauthorized is NOT permanent", apiErr(401, "Unauthorized"), notify.Transient},
 
-		// Anything unrecognised must not widen "permanent".
+		// Anything unrecognized must not widen "permanent".
 		{"unknown 400", apiErr(400, "Bad Request: something brand new"), notify.Transient},
 		{"non-api error", errors.New("dial tcp: connection refused"), notify.Transient},
 		{"nil-safe wrapped", fmt.Errorf("send: %w", apiErr(500, "Internal Server Error")), notify.Transient},
@@ -67,7 +67,7 @@ func TestClassify(t *testing.T) {
 
 // retry_after lives inside parameters, not at the top level, and is in seconds.
 // Getting this wrong turns one 429 into a multi-hour lockout.
-func TestClassifyHonoursRetryAfter(t *testing.T) {
+func TestClassifyHonorsRetryAfter(t *testing.T) {
 	err := &telegoapi.Error{
 		ErrorCode:   429,
 		Description: "Too Many Requests: retry after 35",
@@ -114,7 +114,7 @@ func TestWrapNilIsNil(t *testing.T) {
 	}
 }
 
-// DispositionOf is what the outbox calls. An unrecognised error reaching it must
+// DispositionOf is what the outbox calls. An unrecognized error reaching it must
 // default to transient, never to deleting subscriptions.
 func TestDispositionOfUnknownErrorIsTransient(t *testing.T) {
 	d, _ := notify.DispositionOf(errors.New("something we have never seen"))

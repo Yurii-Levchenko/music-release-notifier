@@ -2,12 +2,17 @@ package storage_test
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"testing"
 	"time"
 
-	"github.com/Yurii-Levchenko/music-release-notifier/internal/storage"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/storage"
 )
 
 // These tests assert the invariants that the whole deduplication design rests
@@ -20,24 +25,59 @@ import (
 // Needs a live Postgres:  docker compose up -d db
 // Skipped when TEST_DATABASE_URL is unset, so `go test ./...` stays green
 // without Docker.
-func testPool(t *testing.T) (context.Context, pgx.Tx) {
-	t.Helper()
+var testDBPool *pgxpool.Pool
 
+// TestMain opens one pool for the whole package and migrates the schema itself.
+// Self-migrating matters: CI runs against an empty throwaway Postgres, and a
+// test suite that needs someone to have run the app first is a test suite that
+// silently skips in CI.
+func TestMain(m *testing.M) {
+	// os.Exit skips deferred calls, so all setup lives in a function that can
+	// return an exit code and let its defers run.
+	os.Exit(testMain(m))
+}
+
+func testMain(m *testing.M) int {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
+		// Nothing to test against; individual tests skip themselves.
+		return m.Run()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	pool, err := storage.Open(ctx, dsn)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "test setup: open database: %v\n", err)
+		return 1
+	}
+	defer pool.Close()
+
+	// Discard migration chatter; a failure still surfaces through the error.
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if err := storage.Migrate(ctx, pool, log); err != nil {
+		fmt.Fprintf(os.Stderr, "test setup: migrate: %v\n", err)
+		return 1
+	}
+
+	testDBPool = pool
+	return m.Run()
+}
+
+// testTx hands out a transaction that is always rolled back, so tests leave no
+// rows behind and can safely run against a development database.
+func testTx(t *testing.T) (context.Context, pgx.Tx) {
+	t.Helper()
+
+	if testDBPool == nil {
 		t.Skip("TEST_DATABASE_URL not set; skipping database invariant tests")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
 
-	pool, err := storage.Open(ctx, dsn)
-	if err != nil {
-		t.Fatalf("open database: %v", err)
-	}
-	t.Cleanup(pool.Close)
-
-	tx, err := pool.Begin(ctx)
+	tx, err := testDBPool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
@@ -74,7 +114,7 @@ func fixtures(ctx context.Context, t *testing.T, tx pgx.Tx) (userID, releaseID i
 // NFR-2: subscribing from the bot and from the extension must collapse to one
 // row. This is the requirement that the user/artist pair is unique.
 func TestSubscriptionPairIsUnique(t *testing.T) {
-	ctx, tx := testPool(t)
+	ctx, tx := testTx(t)
 	userID, _, artistMBID := fixtures(ctx, t, tx)
 
 	for _, source := range []string{"bot", "extension"} {
@@ -99,7 +139,7 @@ func TestSubscriptionPairIsUnique(t *testing.T) {
 // NFR-1: the poller running twice over an overlapping window must not produce a
 // second notification. This is what makes a generous poll window safe (D15).
 func TestNotificationIsSentOnlyOnce(t *testing.T) {
-	ctx, tx := testPool(t)
+	ctx, tx := testTx(t)
 	userID, releaseID, _ := fixtures(ctx, t, tx)
 
 	for i := range 3 {
@@ -125,7 +165,7 @@ func TestNotificationIsSentOnlyOnce(t *testing.T) {
 // D7: MusicBrainz release groups already merge every edition of an album, so
 // the same release re-appearing under a different title must be a no-op.
 func TestReleaseGroupDedupesEditions(t *testing.T) {
-	ctx, tx := testPool(t)
+	ctx, tx := testTx(t)
 	_, _, artistMBID := fixtures(ctx, t, tx)
 
 	if _, err := tx.Exec(ctx,
@@ -150,7 +190,7 @@ func TestReleaseGroupDedupesEditions(t *testing.T) {
 // FR-2.3: only Album, Single and EP are notifiable. The live ListenBrainz feed
 // also carries Broadcast, Other and null types, so the database must refuse them.
 func TestUnwantedReleaseTypesAreRejected(t *testing.T) {
-	ctx, tx := testPool(t)
+	ctx, tx := testTx(t)
 	_, _, artistMBID := fixtures(ctx, t, tx)
 
 	for _, badType := range []string{"Broadcast", "Other", "Compilation"} {
@@ -177,7 +217,7 @@ func TestUnwantedReleaseTypesAreRejected(t *testing.T) {
 // C1: a bot can only address a numeric chat id, so that column is the identity
 // of a user and must not duplicate.
 func TestTelegramChatIDIsUnique(t *testing.T) {
-	ctx, tx := testPool(t)
+	ctx, tx := testTx(t)
 	fixtures(ctx, t, tx)
 
 	if _, err := tx.Exec(ctx, "SAVEPOINT dup_chat"); err != nil {

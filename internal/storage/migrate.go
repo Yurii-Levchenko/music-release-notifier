@@ -33,7 +33,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) error {
 	}
 	defer conn.Release()
 
-	// Serialise migration across instances. Released when the session ends,
+	// Serialize migration across instances. Released when the session ends,
 	// but we unlock explicitly so a long-lived pooled connection is not held.
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, advisoryLockKey); err != nil {
 		return fmt.Errorf("acquire advisory lock: %w", err)
