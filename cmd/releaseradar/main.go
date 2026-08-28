@@ -17,10 +17,16 @@ import (
 
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/config"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/httpx"
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/musicbrainz"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/notify"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/storage"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/telegram"
 )
+
+// searchCacheTTL is how long an artist search stays usable. MusicBrainz allows
+// one request per second per IP (SPEC.md C25), and an artist's identity does not
+// change week to week, so a generous window costs nothing and saves a lot.
+const searchCacheTTL = 7 * 24 * time.Hour
 
 func main() {
 	// run() so every exit path can defer cleanly; main only sets the exit code.
@@ -75,8 +81,21 @@ func run() error {
 		if err := client.Init(ctx); err != nil {
 			return err
 		}
+		// Refuses to build without a User-Agent carrying a contact address:
+		// MusicBrainz answers an anonymous client with 403 and a generic one
+		// with 503, and neither improves on retry.
+		mb, err := musicbrainz.New(cfg.UserAgent, log)
+		if err != nil {
+			return err
+		}
 		channels = notify.NewRegistry(telegram.NewNotifier(client))
-		bot = telegram.NewBot(client, storage.NewUsers(pool), log)
+		bot = telegram.NewBot(
+			client,
+			storage.NewUsers(pool),
+			mb,
+			storage.NewSearchCache(pool, searchCacheTTL),
+			log,
+		)
 	}
 	log.Info("notification channels registered", "kinds", channels.Kinds())
 
