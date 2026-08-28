@@ -156,9 +156,19 @@ make lint     # golangci-lint run
 make check    # fmt + vet + lint + тести з БД, у порядку CI
 ```
 
-- **`golangci-lint` запінений на `v1.64.8`** одночасно в `.golangci.yml` (коментар
-  у шапці), у `env.GOLANGCI_LINT_VERSION` у `.github/workflows/ci.yml`, і локально.
-  Оновлювати **всі три разом**, інакше отримаєш «локально зелено, в CI червоно».
+- **`golangci-lint` запінений на `v2.13.2`** одночасно в `.golangci.yml` (коментар
+  у шапці), у `env.GOLANGCI_LINT_VERSION` у `.github/workflows/ci.yml`, і локально
+  (`go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2`).
+  Оновлювати **всі три разом**.
+- **Чому саме v2, а не v1:** офіційні бінарники v1 зібрані під Go 1.24 і
+  відмовляються працювати з модулем, що таргетить Go 1.26 — `can't load config:
+  the Go language version (go1.24) used to build golangci-lint is lower than the
+  targeted Go version (1.26.2)`. Пінити **номер версії недостатньо**: бінарник
+  мусить бути зібраний тулчейном не старішим за директиву `go` в `go.mod`.
+  Саме на цьому CI впав з першого разу, поки локально було зелено (локальний
+  бінарник був самозібраний під go1.26).
+- **Форматування — через `golangci-lint fmt`** (`gofmt` + `goimports` з
+  `local-prefixes`), а не окремим кроком `gofmt` у CI. Одне джерело правди.
 - **`depguard` машинно стежить за межею `Notifier`** (D13): будь-який імпорт
   `telego` поза `internal/telegram` — це помилка збірки в CI, а не коментар,
   який хтось прочитає. Перевірено негативним тестом.

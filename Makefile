@@ -3,7 +3,7 @@
 # --- development ---
 run:      ; go run ./cmd/releaseradar
 build:    ; go build -trimpath -o bin/releaseradar ./cmd/releaseradar
-fmt:      ; gofmt -w ./cmd ./internal
+fmt:      ; golangci-lint fmt
 vet:      ; go vet ./...
 lint:     ; golangci-lint run
 

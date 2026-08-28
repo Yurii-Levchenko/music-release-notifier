@@ -18,8 +18,10 @@ permissions:
 env:
   # Keep this in lockstep with the version developers run locally, and with the
   # header comment in .golangci.yml. A version drift here is the classic
-  # "green locally, red in CI" trap.
-  GOLANGCI_LINT_VERSION: v1.64.8
+  # "green locally, red in CI" trap — and pinning the number alone is not
+  # enough: v1 release binaries are built with Go 1.24 and refuse a module
+  # targeting Go 1.26, which is exactly how this workflow failed the first time.
+  GOLANGCI_LINT_VERSION: v2.13.2
 
 jobs:
   lint:
@@ -33,19 +35,6 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: gofmt
-        # golangci-lint does not fail on formatting by default, and an
-        # unformatted diff is noise in every later review.
-        run: |
-          unformatted=$(gofmt -l ./cmd ./internal)
-          if [ -n "$unformatted" ]; then
-            echo "::error::these files are not gofmt-clean:"
-            echo "$unformatted"
-            gofmt -d ./cmd ./internal
-            exit 1
-          fi
-          echo "gofmt clean"
-
       - name: go mod tidy is committed
         # Catches a dependency added without tidying, which makes builds
         # non-reproducible for everyone else.
@@ -58,8 +47,11 @@ jobs:
           fi
           echo "go.mod tidy"
 
+      # v9 of the action is required for golangci-lint v2. It also runs the
+      # configured formatters (gofmt, goimports), so formatting is checked here
+      # rather than in a separate step with its own opinion.
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v9
         with:
           version: ${{ env.GOLANGCI_LINT_VERSION }}
           args: --timeout=5m
