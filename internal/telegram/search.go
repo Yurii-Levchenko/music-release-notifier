@@ -99,7 +99,7 @@ func (b *Bot) handleSearch(ctx context.Context, chatID int64, query string, log 
 		return
 	}
 
-	text, markup := renderCandidate(query, candidates, 0, hash)
+	text, markup := renderCandidate(query, candidates, 0, hash, b.subscribed(ctx, chatID, candidates[0].MBID, log))
 	if _, err := b.client.api.SendMessage(ctx, &telego.SendMessageParams{
 		ChatID:      telego.ChatID{ID: chatID},
 		Text:        text,
@@ -119,6 +119,16 @@ func (b *Bot) handleSearch(ctx context.Context, chatID int64, query string, log 
 	}
 }
 
+// decodeCandidates parses a cached payload. Shared so the search path and the
+// subscription buttons cannot drift apart on how a payload is read.
+func decodeCandidates(payload []byte) ([]musicbrainz.Artist, error) {
+	var out []musicbrainz.Artist
+	if err := json.Unmarshal(payload, &out); err != nil {
+		return nil, fmt.Errorf("decode cached candidates: %w", err)
+	}
+	return out, nil
+}
+
 // lookup returns candidates for a query, from cache when possible, and reports
 // which source answered.
 func (b *Bot) lookup(ctx context.Context, query string, log *slog.Logger) (
@@ -130,8 +140,7 @@ func (b *Bot) lookup(ctx context.Context, query string, log *slog.Logger) (
 		// A broken cache must degrade to a slower search, never to a failed one.
 		log.Warn("search cache read failed, querying upstream", "err", cacheErr)
 	case found:
-		var cachedArtists []musicbrainz.Artist
-		if jsonErr := json.Unmarshal(cached.Payload, &cachedArtists); jsonErr == nil {
+		if cachedArtists, jsonErr := decodeCandidates(cached.Payload); jsonErr == nil {
 			return cachedArtists, cached.Hash, sourceCache, nil
 		}
 		// A payload we cannot decode is worse than no payload; fall through so
@@ -172,8 +181,8 @@ func (b *Bot) handleNavigate(ctx context.Context, cq *telego.CallbackQuery, hash
 		return
 	}
 
-	var candidates []musicbrainz.Artist
-	if err := json.Unmarshal(cached.Payload, &candidates); err != nil {
+	candidates, err := decodeCandidates(cached.Payload)
+	if err != nil {
 		b.answerCallback(ctx, cq.ID, "Не можу прочитати ці результати — пошукай ще раз.", log)
 		return
 	}
@@ -191,7 +200,8 @@ func (b *Bot) handleNavigate(ctx context.Context, cq *telego.CallbackQuery, hash
 		index = len(candidates) - 1
 	}
 
-	text, markup := renderCandidate(cached.Query, candidates, index, hash)
+	text, markup := renderCandidate(cached.Query, candidates, index, hash,
+		b.subscribed(ctx, cq.From.ID, candidates[index].MBID, log))
 
 	if cq.Message == nil {
 		b.answerCallback(ctx, cq.ID, "", log)
@@ -241,7 +251,7 @@ func (b *Bot) answerCallback(ctx context.Context, id, text string, log *slog.Log
 // MusicBrainz has no artist image to show (SPEC.md C32). What it does return —
 // type, country, active years, disambiguation comment and top tags —
 // distinguishes two same-named artists better than a photo would.
-func renderCandidate(query string, candidates []musicbrainz.Artist, index int, hash string) (string, *telego.InlineKeyboardMarkup) {
+func renderCandidate(query string, candidates []musicbrainz.Artist, index int, hash string, subscribed bool) (string, *telego.InlineKeyboardMarkup) {
 	a := candidates[index]
 
 	var b strings.Builder
@@ -259,9 +269,11 @@ func renderCandidate(query string, candidates []musicbrainz.Artist, index int, h
 	}
 	fmt.Fprintf(&b, "\n<a href=\"https://musicbrainz.org/artist/%s\">MusicBrainz</a>",
 		html.EscapeString(a.MBID))
-	b.WriteString("\n\n<i>Підписка з'явиться на наступному етапі.</i>")
+	if subscribed {
+		b.WriteString("\n\n🔔 <b>Ти підписаний на релізи цього виконавця.</b>")
+	}
 
-	return b.String(), navigationKeyboard(hash, index, len(candidates))
+	return b.String(), candidateKeyboard(hash, index, len(candidates), subscribed)
 }
 
 // artistFacts is the one-line summary: what kind of act, from where, and when.
@@ -296,6 +308,41 @@ func artistFacts(a musicbrainz.Artist) string {
 	return strings.Join(parts, " · ")
 }
 
+// candidateKeyboard renders the navigation row plus the subscribe toggle.
+//
+// The label follows the state rather than being fixed, so the button always
+// says what pressing it will do — and after pressing, the card is redrawn so
+// the two never disagree.
+func candidateKeyboard(hash string, index, total int, subscribed bool) *telego.InlineKeyboardMarkup {
+	markup := navigationKeyboard(hash, index, total)
+
+	action := telego.InlineKeyboardButton{
+		Text:         "🔔 Підписатись",
+		CallbackData: cbSubscribe + ":" + hash + ":" + strconv.Itoa(index),
+	}
+	if subscribed {
+		action = telego.InlineKeyboardButton{
+			Text:         "🔕 Відписатись",
+			CallbackData: cbUnsubscribe + ":" + hash + ":" + strconv.Itoa(index),
+		}
+	}
+	markup.InlineKeyboard = append(markup.InlineKeyboard,
+		[]telego.InlineKeyboardButton{action})
+	return markup
+}
+
+// subscribed reports whether this chat already follows the artist. A failure to
+// answer must not block the card, so it degrades to "not subscribed" — the user
+// then sees Subscribe, and pressing it is idempotent anyway.
+func (b *Bot) subscribed(ctx context.Context, chatID int64, mbid string, log *slog.Logger) bool {
+	ok, err := b.subs.IsSubscribed(ctx, chatID, mbid)
+	if err != nil {
+		log.Warn("subscription check failed", "mbid", mbid, "err", err)
+		return false
+	}
+	return ok
+}
+
 // navigationKeyboard renders "◀ 2/5 ▶", omitting arrows that would go nowhere.
 func navigationKeyboard(hash string, index, total int) *telego.InlineKeyboardMarkup {
 	row := make([]telego.InlineKeyboardButton, 0, 3)
@@ -324,25 +371,4 @@ func navigationKeyboard(hash string, index, total int) *telego.InlineKeyboardMar
 
 func navData(hash string, index int) string {
 	return cbNavigate + ":" + hash + ":" + strconv.Itoa(index)
-}
-
-// parseCallbackData splits "prefix:hash:index". Returns ok=false for anything
-// unexpected — callback_data arrives from the client and an old message can
-// carry a format this build no longer speaks.
-func parseCallbackData(data string) (prefix, hash string, index int, ok bool) {
-	parts := strings.Split(data, ":")
-	if len(parts) != 3 {
-		return "", "", 0, false
-	}
-	// Reject empty components here rather than passing a blank hash down to the
-	// cache. The user-visible result would be the same either way, but garbage
-	// that travels is garbage that shows up in logs far from its origin.
-	if parts[0] == "" || parts[1] == "" {
-		return "", "", 0, false
-	}
-	idx, err := strconv.Atoi(parts[2])
-	if err != nil {
-		return "", "", 0, false
-	}
-	return parts[0], parts[1], idx, true
 }

@@ -94,6 +94,7 @@ func run() error {
 			storage.NewUsers(pool),
 			mb,
 			storage.NewSearchCache(pool, searchCacheTTL),
+			storage.NewSubscriptions(pool),
 			log,
 		)
 	}

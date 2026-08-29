@@ -53,26 +53,25 @@ func TestCallbackDataFitsTelegramLimit(t *testing.T) {
 	}
 }
 
-func TestParseCallbackData(t *testing.T) {
-	prefix, hash, index, ok := parseCallbackData("nav:abcdef123456:3")
-	if !ok || prefix != "nav" || hash != "abcdef123456" || index != 3 {
-		t.Fatalf("parse = (%q, %q, %d, %v)", prefix, hash, index, ok)
+func TestParseCardTarget(t *testing.T) {
+	hash, index, ok := parseCardTarget("abcdef123456:3")
+	if !ok || hash != "abcdef123456" || index != 3 {
+		t.Fatalf("parse = (%q, %d, %v)", hash, index, ok)
 	}
 
 	// Callback data comes from the client. An old message from a previous build,
 	// or someone poking at the API, must not produce a panic or a wild index.
 	for _, bad := range []string{
-		"", "nav", "nav:abc", "nav:abc:def", "nav:abc:3:4",
-		"nav::3", ":::", "noop", "nav:abc:", "nav:abc:-",
+		"", "abc", "abc:def", ":3", "abc:", "abc:-", "abc:3:4",
 	} {
-		if _, _, _, ok := parseCallbackData(bad); ok {
-			t.Fatalf("parseCallbackData(%q) reported ok, want rejected", bad)
+		if _, _, ok := parseCardTarget(bad); ok {
+			t.Fatalf("parseCardTarget(%q) reported ok, want rejected", bad)
 		}
 	}
 
-	// A negative index parses; handleNavigate clamps it. Parsing is not the
-	// place to decide policy.
-	if _, _, idx, ok := parseCallbackData("nav:abcdef123456:-2"); !ok || idx != -2 {
+	// A negative index parses; the handler clamps it. Parsing is not the place
+	// to decide policy.
+	if _, idx, ok := parseCardTarget("abcdef123456:-2"); !ok || idx != -2 {
 		t.Fatalf("negative index should parse, got idx=%d ok=%v", idx, ok)
 	}
 }
@@ -130,7 +129,7 @@ func TestRenderCandidateEscapesHTML(t *testing.T) {
 		Tags:           []string{"folk & rock"},
 	}}
 
-	text, _ := renderCandidate("s&g <query>", candidates, 0, "abcdef123456")
+	text, _ := renderCandidate("s&g <query>", candidates, 0, "abcdef123456", false)
 
 	for _, raw := range []string{"Simon & Garfunkel", "<the duo>", `"S&G"`, "s&g <query>"} {
 		if strings.Contains(text, raw) {
@@ -163,7 +162,7 @@ func TestRenderCandidateStaysUnderMessageLimit(t *testing.T) {
 		Tags:           []string{long, long, long},
 	}}
 
-	text, _ := renderCandidate(long, candidates, 0, "abcdef123456")
+	text, _ := renderCandidate(long, candidates, 0, "abcdef123456", false)
 	if n := len([]rune(text)); n > 4096 {
 		t.Fatalf("card is %d characters, over Telegram's 4096 limit", n)
 	}
@@ -201,7 +200,7 @@ func TestRenderCandidateShowsPosition(t *testing.T) {
 	candidates := sampleCandidates()
 
 	for i := range candidates {
-		_, markup := renderCandidate("radiohead", candidates, i, "abcdef123456")
+		_, markup := renderCandidate("radiohead", candidates, i, "abcdef123456", false)
 		var counter string
 		for _, row := range markup.InlineKeyboard {
 			for _, b := range row {
