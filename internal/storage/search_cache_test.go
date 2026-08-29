@@ -157,14 +157,23 @@ func TestSearchCacheExpiry(t *testing.T) {
 		_, _ = testDBPool.Exec(ctx, `DELETE FROM artist_search_cache WHERE query = $1`, query)
 	})
 
-	writer := storage.NewSearchCache(testDBPool, time.Hour)
+	// A 40-year freshness window: long enough that no real entry is ever stale
+	// to this instance, short enough that the 50-year-old fixture is.
+	const staleWindow = 40 * 365 * 24 * time.Hour
+	writer := storage.NewSearchCache(testDBPool, staleWindow)
 	if _, err := writer.Put(ctx, query, []byte(`["x"]`)); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 
-	// Backdate the row rather than sleeping.
+	// Backdate the row rather than sleeping. Fifty years, not two hours, and
+	// the reason matters: EvictStale below issues an unscoped DELETE over the
+	// whole table. Backdating by hours and evicting with an hour-long TTL would
+	// delete every genuine cache entry older than an hour in whatever database
+	// this test happens to point at — which is exactly what happened once
+	// against the development database, and looked like "the cache is broken".
+	// With a 50-year horizon the only row old enough to match is this fixture.
 	if _, err := testDBPool.Exec(ctx,
-		`UPDATE artist_search_cache SET fetched_at = now() - interval '2 hours' WHERE query = $1`,
+		`UPDATE artist_search_cache SET fetched_at = now() - interval '50 years' WHERE query = $1`,
 		query); err != nil {
 		t.Fatalf("backdate: %v", err)
 	}
@@ -179,14 +188,33 @@ func TestSearchCacheExpiry(t *testing.T) {
 
 	// A wider window sees the same row again, proving it was expiry and not
 	// deletion that hid it.
-	tolerant := storage.NewSearchCache(testDBPool, 24*time.Hour)
+	tolerant := storage.NewSearchCache(testDBPool, 100*365*24*time.Hour)
 	if _, found, err := tolerant.Get(ctx, query); err != nil || !found {
 		t.Fatalf("row is gone, not merely stale: found=%v err=%v", found, err)
 	}
 
-	// Eviction removes it for real.
-	if _, err := writer.EvictStale(ctx); err != nil {
+	// Eviction removes it for real — and must remove nothing else. EvictStale
+	// is an unscoped DELETE, so assert the blast radius rather than trusting it.
+	var before int
+	if err := testDBPool.QueryRow(ctx,
+		`SELECT count(*) FROM artist_search_cache`).Scan(&before); err != nil {
+		t.Fatalf("count before: %v", err)
+	}
+	removed, err := writer.EvictStale(ctx)
+	if err != nil {
 		t.Fatalf("EvictStale: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("EvictStale removed %d rows, want exactly 1 (this test's fixture)", removed)
+	}
+	var after int
+	if err := testDBPool.QueryRow(ctx,
+		`SELECT count(*) FROM artist_search_cache`).Scan(&after); err != nil {
+		t.Fatalf("count after: %v", err)
+	}
+	if before-after != 1 {
+		t.Fatalf("table went from %d to %d rows; the sweep took %d, want 1",
+			before, after, before-after)
 	}
 	if _, found, err := tolerant.Get(ctx, query); err != nil || found {
 		t.Fatalf("entry survived eviction: found=%v err=%v", found, err)
