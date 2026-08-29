@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mymmrac/telego"
 
@@ -26,6 +27,15 @@ const searchLimit = 5
 const (
 	cbNavigate = "nav"
 	cbNoop     = "noop"
+)
+
+// Where a result set came from. Logged on every search so cache behavior is
+// visible without turning on debug logging — a successful search used to emit
+// nothing at all, which made "is the cache even working?" unanswerable from
+// the logs.
+const (
+	sourceCache    = "cache"
+	sourceUpstream = "musicbrainz"
 )
 
 // ArtistSearcher is the slice of MusicBrainz the bot needs. Declared on the
@@ -60,7 +70,8 @@ func (b *Bot) handleSearch(ctx context.Context, chatID int64, query string, log 
 		return
 	}
 
-	candidates, hash, err := b.lookup(ctx, query, log)
+	start := time.Now()
+	candidates, hash, source, err := b.lookup(ctx, query, log)
 	if err != nil {
 		if errors.Is(err, musicbrainz.ErrEmptyQuery) {
 			b.reply(ctx, chatID, "У цьому запиті немає чого шукати.", log)
@@ -71,6 +82,14 @@ func (b *Bot) handleSearch(ctx context.Context, chatID int64, query string, log 
 			"MusicBrainz зараз не відповідає. Спробуй ще раз за хвилину.", log)
 		return
 	}
+
+	// One line per search, at info. This is the record that answers "did that
+	// hit the cache", and it is the natural place for the S6 counters to hang.
+	log.Info("artist search",
+		"query", query,
+		"source", source,
+		"results", len(candidates),
+		"duration", time.Since(start).Round(time.Millisecond))
 
 	if len(candidates) == 0 {
 		b.reply(ctx, chatID, fmt.Sprintf(
@@ -100,34 +119,36 @@ func (b *Bot) handleSearch(ctx context.Context, chatID int64, query string, log 
 	}
 }
 
-// lookup returns candidates for a query, from cache when possible.
-func (b *Bot) lookup(ctx context.Context, query string, log *slog.Logger) ([]musicbrainz.Artist, string, error) {
-	cached, found, err := b.cache.Get(ctx, query)
+// lookup returns candidates for a query, from cache when possible, and reports
+// which source answered.
+func (b *Bot) lookup(ctx context.Context, query string, log *slog.Logger) (
+	artists []musicbrainz.Artist, hash, source string, err error,
+) {
+	cached, found, cacheErr := b.cache.Get(ctx, query)
 	switch {
-	case err != nil:
+	case cacheErr != nil:
 		// A broken cache must degrade to a slower search, never to a failed one.
-		log.Warn("search cache read failed, querying upstream", "err", err)
+		log.Warn("search cache read failed, querying upstream", "err", cacheErr)
 	case found:
-		var artists []musicbrainz.Artist
-		if jsonErr := json.Unmarshal(cached.Payload, &artists); jsonErr == nil {
-			log.Debug("search cache hit", "query", query, "cached_at", cached.FetchedAt)
-			return artists, cached.Hash, nil
+		var cachedArtists []musicbrainz.Artist
+		if jsonErr := json.Unmarshal(cached.Payload, &cachedArtists); jsonErr == nil {
+			return cachedArtists, cached.Hash, sourceCache, nil
 		}
 		// A payload we cannot decode is worse than no payload; fall through so
 		// the fresh result overwrites it.
 		log.Warn("discarding undecodable cache entry", "query", query)
 	}
 
-	artists, err := b.search.SearchArtist(ctx, query, searchLimit)
+	artists, err = b.search.SearchArtist(ctx, query, searchLimit)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 
 	payload, err := json.Marshal(artists)
 	if err != nil {
-		return nil, "", fmt.Errorf("encode search payload: %w", err)
+		return nil, "", "", fmt.Errorf("encode search payload: %w", err)
 	}
-	hash, err := b.cache.Put(ctx, query, payload)
+	hash, err = b.cache.Put(ctx, query, payload)
 	if err != nil {
 		// Losing the cache write costs one upstream request next time. The
 		// buttons still need a handle, and the hash is derived from the query,
@@ -135,7 +156,7 @@ func (b *Bot) lookup(ctx context.Context, query string, log *slog.Logger) ([]mus
 		log.Warn("search cache write failed", "err", err)
 		hash = b.cache.HashQuery(query)
 	}
-	return artists, hash, nil
+	return artists, hash, sourceUpstream, nil
 }
 
 // handleNavigate moves between candidates in an existing card.
