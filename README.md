@@ -100,7 +100,9 @@ behind. Without `TEST_DATABASE_URL` they skip rather than fail, keeping
 | ⬜ S3 | Subscriptions, `/list`, `/stop` |
 | ⬜ S4 | Release detection |
 | ⬜ S5 | Delivery: outbox drain, pacing, failure classification |
-| ⬜ S6 | Production: VPS, backups, metrics — **v1 done** |
+| ⬜ S6 | Production: VPS, backups, and observability — **v1 done** |
+| ⬜ S11 | Rank search results by metadata completeness, not score |
+| ⬜ S12 | Dead-letter handling for poison messages (with the v2 broker) |
 | ⬜ S8–S10 | Extension: linking API, subscribe from Spotify, publish |
 
 ## Repo layout
