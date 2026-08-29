@@ -63,7 +63,7 @@ email is an evening, not a refactor.
 ```bash
 cp .env.example .env      # then fill in TELEGRAM_BOT_TOKEN and USER_AGENT
 docker compose up --build
-curl localhost:8080/healthz
+curl localhost:8090/healthz
 ```
 
 The database is published on host port **5433**, not 5432, to stay out of the
