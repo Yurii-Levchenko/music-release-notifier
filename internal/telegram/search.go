@@ -94,6 +94,20 @@ func (b *Bot) handleSearch(ctx context.Context, chatID int64, query string, log 
 	placeholder := b.sendPlaceholder(ctx, chatID, log)
 
 	artists, hash, stale, err := b.fetchOrStale(ctx, query, log)
+
+	// A failed search must not be logged as a search that found nothing. Both
+	// end with zero results, but one is an upstream outage and the other is a
+	// name that does not exist — and a dashboard that counts them together
+	// reports an outage as normal traffic.
+	if err != nil {
+		log.Error("artist search failed",
+			"query", query,
+			"duration", time.Since(started).Round(time.Millisecond),
+			"err", err)
+		b.finish(ctx, chatID, placeholder, upstreamDownText(), nil, log)
+		return
+	}
+
 	source := sourceUpstream
 	if stale {
 		source = sourceStale
@@ -101,8 +115,6 @@ func (b *Bot) handleSearch(ctx context.Context, chatID int64, query string, log 
 	b.logSearch(log, query, source, len(artists), started)
 
 	switch {
-	case err != nil:
-		b.finish(ctx, chatID, placeholder, upstreamDownText(), nil, log)
 	case len(artists) == 0:
 		b.finish(ctx, chatID, placeholder, noResultsText(query), nil, log)
 	default:
