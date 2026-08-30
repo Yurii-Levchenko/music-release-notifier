@@ -36,6 +36,10 @@ const (
 const (
 	sourceCache    = "cache"
 	sourceUpstream = "musicbrainz"
+	// sourceStale means upstream failed and an expired entry was served instead
+	// of an error. It deserves its own value: it looks like success to the user
+	// and must not look like success in the logs.
+	sourceStale = "stale-cache"
 )
 
 // ArtistSearcher is the slice of MusicBrainz the bot needs. Declared on the
@@ -51,6 +55,9 @@ type ArtistSearcher interface {
 // traveling across a package boundary.
 type SearchCache interface {
 	Get(ctx context.Context, query string) (entry storage.CachedSearch, found bool, err error)
+	// GetAnyAge ignores the freshness window. Used only after a live fetch has
+	// already failed, so an outage degrades to stale data instead of an error.
+	GetAnyAge(ctx context.Context, query string) (entry storage.CachedSearch, found bool, err error)
 	GetByHash(ctx context.Context, hash string) (entry storage.CachedSearch, found bool, err error)
 	Put(ctx context.Context, query string, payload []byte) (hash string, err error)
 	HashQuery(query string) string
@@ -70,52 +77,40 @@ func (b *Bot) handleSearch(ctx context.Context, chatID int64, query string, log 
 		return
 	}
 
-	start := time.Now()
-	candidates, hash, source, err := b.lookup(ctx, query, log)
-	if err != nil {
-		if errors.Is(err, musicbrainz.ErrEmptyQuery) {
-			b.reply(ctx, chatID, "У цьому запиті немає чого шукати.", log)
-			return
-		}
-		log.Error("artist search failed", "query", query, "err", err)
-		b.reply(ctx, chatID,
-			"MusicBrainz зараз не відповідає. Спробуй ще раз за хвилину.", log)
+	started := time.Now()
+
+	// Fast path. A cache hit answers in single-digit milliseconds, so a
+	// "searching" placeholder would only flicker and cost a second API call.
+	if artists, hash, ok := b.fromCache(ctx, query, log); ok {
+		b.logSearch(log, query, sourceCache, len(artists), started)
+		b.present(ctx, chatID, 0, query, artists, hash, "", log)
 		return
 	}
 
-	// One line per search, at info. This is the record that answers "did that
-	// hit the cache", and it is the natural place for the S6 counters to hang.
-	log.Info("artist search",
-		"query", query,
-		"source", source,
-		"results", len(candidates),
-		"duration", time.Since(start).Round(time.Millisecond))
+	// Slow path. Going upstream costs a rate-limiter slot and, when MusicBrainz
+	// is under load, several seconds of 503 retries. That used to be silence:
+	// nothing for seven seconds, then an error. Say something first and edit it
+	// in place when the answer arrives.
+	placeholder := b.sendPlaceholder(ctx, chatID, log)
 
-	if len(candidates) == 0 {
-		b.reply(ctx, chatID, fmt.Sprintf(
-			"Не знайшов нікого за запитом <b>%s</b>.\n\n"+
-				"Спробуй іншу назву — або перевір написання на musicbrainz.org.",
-			html.EscapeString(query)), log)
-		return
+	artists, hash, stale, err := b.fetchOrStale(ctx, query, log)
+	source := sourceUpstream
+	if stale {
+		source = sourceStale
 	}
+	b.logSearch(log, query, source, len(artists), started)
 
-	text, markup := renderCandidate(query, candidates, 0, hash, b.subscribed(ctx, chatID, candidates[0].MBID, log))
-	if _, err := b.client.api.SendMessage(ctx, &telego.SendMessageParams{
-		ChatID:      telego.ChatID{ID: chatID},
-		Text:        text,
-		ParseMode:   telego.ModeHTML,
-		ReplyMarkup: markup,
-		LinkPreviewOptions: &telego.LinkPreviewOptions{
-			IsDisabled: true,
-		},
-	}); err != nil {
-		if IsUserGone(err) {
-			if serr := b.users.SetBlocked(ctx, chatID, true); serr != nil {
-				log.Error("record block status", "err", serr)
-			}
-			return
+	switch {
+	case err != nil:
+		b.finish(ctx, chatID, placeholder, upstreamDownText(), nil, log)
+	case len(artists) == 0:
+		b.finish(ctx, chatID, placeholder, noResultsText(query), nil, log)
+	default:
+		note := ""
+		if stale {
+			note = staleNotice
 		}
-		log.Warn("send picker failed", "err", err)
+		b.present(ctx, chatID, placeholder, query, artists, hash, note, log)
 	}
 }
 
@@ -129,43 +124,145 @@ func decodeCandidates(payload []byte) ([]musicbrainz.Artist, error) {
 	return out, nil
 }
 
-// lookup returns candidates for a query, from cache when possible, and reports
-// which source answered.
-func (b *Bot) lookup(ctx context.Context, query string, log *slog.Logger) (
-	artists []musicbrainz.Artist, hash, source string, err error,
-) {
-	cached, found, cacheErr := b.cache.Get(ctx, query)
-	switch {
-	case cacheErr != nil:
+// fromCache answers from a fresh cache entry, or reports that it could not.
+func (b *Bot) fromCache(ctx context.Context, query string, log *slog.Logger) ([]musicbrainz.Artist, string, bool) {
+	cached, found, err := b.cache.Get(ctx, query)
+	if err != nil {
 		// A broken cache must degrade to a slower search, never to a failed one.
-		log.Warn("search cache read failed, querying upstream", "err", cacheErr)
-	case found:
-		if cachedArtists, jsonErr := decodeCandidates(cached.Payload); jsonErr == nil {
-			return cachedArtists, cached.Hash, sourceCache, nil
-		}
-		// A payload we cannot decode is worse than no payload; fall through so
-		// the fresh result overwrites it.
+		log.Warn("search cache read failed, querying upstream", "err", err)
+		return nil, "", false
+	}
+	if !found {
+		return nil, "", false
+	}
+	artists, err := decodeCandidates(cached.Payload)
+	if err != nil {
+		// A payload we cannot decode is worse than no payload; let a fresh
+		// result overwrite it.
 		log.Warn("discarding undecodable cache entry", "query", query)
+		return nil, "", false
 	}
+	return artists, cached.Hash, true
+}
 
+// fetchOrStale queries MusicBrainz and, when that fails, falls back to whatever
+// is cached regardless of age.
+//
+// stale is true when the fallback was used, so the caller can label the answer.
+// An artist's identity does not change week to week, which makes a week-old list
+// enormously more useful than an apology.
+func (b *Bot) fetchOrStale(ctx context.Context, query string, log *slog.Logger) (
+	artists []musicbrainz.Artist, hash string, stale bool, err error,
+) {
 	artists, err = b.search.SearchArtist(ctx, query, searchLimit)
-	if err != nil {
-		return nil, "", "", err
+	if err == nil {
+		payload, marshalErr := json.Marshal(artists)
+		if marshalErr != nil {
+			return nil, "", false, fmt.Errorf("encode search payload: %w", marshalErr)
+		}
+		hash, putErr := b.cache.Put(ctx, query, payload)
+		if putErr != nil {
+			// Losing the write costs one upstream request next time. The buttons
+			// still need a handle, and it is derived from the query.
+			log.Warn("search cache write failed", "err", putErr)
+			hash = b.cache.HashQuery(query)
+		}
+		return artists, hash, false, nil
 	}
 
-	payload, err := json.Marshal(artists)
-	if err != nil {
-		return nil, "", "", fmt.Errorf("encode search payload: %w", err)
+	// An empty query never had a chance upstream and has nothing cached either.
+	if errors.Is(err, musicbrainz.ErrEmptyQuery) {
+		return nil, "", false, err
 	}
-	hash, err = b.cache.Put(ctx, query, payload)
-	if err != nil {
-		// Losing the cache write costs one upstream request next time. The
-		// buttons still need a handle, and the hash is derived from the query,
-		// so compute it anyway rather than dropping the card.
-		log.Warn("search cache write failed", "err", err)
-		hash = b.cache.HashQuery(query)
+
+	cached, found, cacheErr := b.cache.GetAnyAge(ctx, query)
+	if cacheErr != nil {
+		log.Warn("stale cache lookup failed", "err", cacheErr)
+		return nil, "", false, err
 	}
-	return artists, hash, sourceUpstream, nil
+	if !found {
+		return nil, "", false, err
+	}
+	stalled, decodeErr := decodeCandidates(cached.Payload)
+	if decodeErr != nil {
+		return nil, "", false, err
+	}
+
+	log.Warn("upstream unavailable, serving stale results",
+		"query", query, "cached_at", cached.FetchedAt, "err", err)
+	return stalled, cached.Hash, true, nil
+}
+
+// sendPlaceholder posts "searching" and returns the message id to edit, or 0 if
+// it could not be sent. Zero is not worth aborting for: the search still runs
+// and the answer still arrives, just without the interim message.
+func (b *Bot) sendPlaceholder(ctx context.Context, chatID int64, log *slog.Logger) int {
+	msg, err := b.client.api.SendMessage(ctx, &telego.SendMessageParams{
+		ChatID: telego.ChatID{ID: chatID},
+		Text:   searchingText,
+	})
+	if err != nil {
+		if IsUserGone(err) {
+			if serr := b.users.SetBlocked(ctx, chatID, true); serr != nil {
+				log.Error("record block status", "err", serr)
+			}
+			return 0
+		}
+		log.Warn("send placeholder failed", "err", err)
+		return 0
+	}
+	return msg.MessageID
+}
+
+// present shows the first candidate, editing the placeholder when there is one.
+func (b *Bot) present(ctx context.Context, chatID int64, placeholder int, query string,
+	artists []musicbrainz.Artist, hash, note string, log *slog.Logger,
+) {
+	text, markup := renderCandidate(query, artists, 0, hash,
+		b.subscribed(ctx, chatID, artists[0].MBID, log))
+	b.finish(ctx, chatID, placeholder, note+text, markup, log)
+}
+
+// finish delivers the final text: editing the placeholder if one was sent, and
+// otherwise sending a fresh message.
+func (b *Bot) finish(ctx context.Context, chatID int64, placeholder int, text string,
+	markup *telego.InlineKeyboardMarkup, log *slog.Logger,
+) {
+	if placeholder != 0 {
+		_, err := b.client.api.EditMessageText(ctx, &telego.EditMessageTextParams{
+			ChatID:             telego.ChatID{ID: chatID},
+			MessageID:          placeholder,
+			Text:               text,
+			ParseMode:          telego.ModeHTML,
+			ReplyMarkup:        markup,
+			LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
+		})
+		if err == nil || isNotModified(err) {
+			return
+		}
+		// The placeholder may have been deleted by the user. Fall through and
+		// send the answer as a new message rather than losing it.
+		log.Warn("edit placeholder failed, sending a new message", "err", err)
+	}
+
+	if _, err := b.client.api.SendMessage(ctx, &telego.SendMessageParams{
+		ChatID:             telego.ChatID{ID: chatID},
+		Text:               text,
+		ParseMode:          telego.ModeHTML,
+		ReplyMarkup:        markup,
+		LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
+	}); err != nil {
+		b.handleSendError(ctx, chatID, err, log)
+	}
+}
+
+// logSearch emits the one line per search that makes cache behavior visible.
+func (b *Bot) logSearch(log *slog.Logger, query, source string, results int, started time.Time) {
+	log.Info("artist search",
+		"query", query,
+		"source", source,
+		"results", results,
+		"duration", time.Since(started).Round(time.Millisecond))
 }
 
 // handleNavigate moves between candidates in an existing card.

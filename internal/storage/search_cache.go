@@ -81,6 +81,35 @@ func (c *SearchCache) Get(ctx context.Context, query string) (CachedSearch, bool
 	return out, true, nil
 }
 
+// GetAnyAge returns a cached entry regardless of how old it is.
+//
+// This is the upstream-outage fallback. A week-old list of artist names is
+// vastly better than an error message: artist identities do not change, and the
+// alternative is telling someone to come back later. Only call it after a live
+// fetch has already failed — served results should say they are stale.
+func (c *SearchCache) GetAnyAge(ctx context.Context, query string) (CachedSearch, bool, error) {
+	normalized := NormalizeQuery(query)
+	if normalized == "" {
+		return CachedSearch{}, false, nil
+	}
+
+	var out CachedSearch
+	err := c.pool.QueryRow(ctx, `
+		SELECT query, query_hash, payload, fetched_at
+		FROM artist_search_cache
+		WHERE query = $1`,
+		normalized,
+	).Scan(&out.Query, &out.Hash, &out.Payload, &out.FetchedAt)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return CachedSearch{}, false, nil
+	}
+	if err != nil {
+		return CachedSearch{}, false, fmt.Errorf("read stale search cache for %q: %w", normalized, err)
+	}
+	return out, true, nil
+}
+
 // GetByHash resolves the handle carried in a button's callback_data.
 //
 // A hash collision would return the other query's candidates. With 48 bits and
