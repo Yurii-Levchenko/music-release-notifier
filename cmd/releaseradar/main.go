@@ -17,8 +17,10 @@ import (
 
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/config"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/httpx"
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/listenbrainz"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/musicbrainz"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/notify"
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/poller"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/storage"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/telegram"
 )
@@ -27,6 +29,11 @@ import (
 // one request per second per IP (SPEC.md C25), and an artist's identity does not
 // change week to week, so a generous window costs nothing and saves a lot.
 const searchCacheTTL = 7 * 24 * time.Hour
+
+// pollInterval is how often the release feed is read. Daily is enough: the feed
+// is a window, not a stream, and the poller looks back seven days (SPEC.md D15),
+// so a missed run costs nothing as long as the next one lands inside the window.
+const pollInterval = 24 * time.Hour
 
 func main() {
 	// run() so every exit path can defer cleanly; main only sets the exit code.
@@ -100,6 +107,15 @@ func run() error {
 	}
 	log.Info("notification channels registered", "kinds", channels.Kinds())
 
+	// The poller runs whether or not Telegram is configured: detection is
+	// independent of delivery, and a queued notification waits in the outbox
+	// until a channel exists to carry it.
+	lb, err := listenbrainz.New(cfg.UserAgent, log)
+	if err != nil {
+		return err
+	}
+	releasePoller := poller.New(lb, storage.NewReleases(pool), pollInterval, log)
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           httpx.New(pool, log).Routes(),
@@ -123,6 +139,8 @@ func run() error {
 	if bot != nil {
 		g.Go(func() error { return bot.Run(gctx) })
 	}
+
+	g.Go(func() error { return releasePoller.Run(gctx) })
 
 	// Shut the HTTP server down when anything else asks us to stop; without
 	// this, ListenAndServe would keep the group waiting forever.
