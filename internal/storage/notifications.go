@@ -184,19 +184,6 @@ func (n *Notifications) Fail(ctx context.Context, id int64, reason string) error
 	return nil
 }
 
-// Skip closes a notification that will never be deliverable — the recipient is
-// gone. Distinct from failed: nothing was wrong with the message.
-func (n *Notifications) Skip(ctx context.Context, id int64, reason string) error {
-	_, err := n.db.Exec(ctx, `
-		UPDATE notifications
-		SET state = 'skipped', last_error = $2
-		WHERE id = $1`, id, truncateError(reason))
-	if err != nil {
-		return fmt.Errorf("mark notification %d skipped: %w", id, err)
-	}
-	return nil
-}
-
 // DropRecipient handles a permanent delivery failure: the chat is unreachable
 // for good, so the user's subscriptions go and their remaining queued
 // notifications are skipped.

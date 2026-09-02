@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
 
 	"golang.org/x/time/rate"
 )
@@ -169,7 +170,7 @@ func (c *Client) SearchArtist(ctx context.Context, query string, limit int) ([]A
 			Disambiguation: a.Disambiguation,
 			Begin:          a.LifeSpan.Begin,
 			End:            a.LifeSpan.End,
-			Tags:           topTags(a.Tags, 3),
+			Tags:           topTags(a.Tags),
 		})
 	}
 	return out, nil
@@ -265,12 +266,66 @@ func (c *Client) doOnce(ctx context.Context, endpoint string) (body []byte, retr
 	}
 }
 
-// topTags returns the n most-voted tag names. MusicBrainz can attach dozens;
-// three is enough to tell two same-named artists apart.
+// Tags that are notes between MusicBrainz editors rather than descriptions of
+// the music: "fixme label mess", "todo", "needs splitting". They are ordinary
+// voted tags, so they outrank real genres and end up on the card, where they
+// read as nonsense to somebody choosing an artist. Seen live on あいみょん.
+//
+// Matching is by whole word, not by substring. Substring matching looked
+// simpler and was wrong: "spam" also matches the genre "spamdexcore", and
+// "check" matches "checkered pop" — a filter that hides real genres is worse
+// than the noise it removes. Caught by its own test, not in review.
+var (
+	// housekeepingWords disqualify a tag when they appear as a whole word.
+	housekeepingWords = []string{
+		"fixme", "todo", "wip",
+		"needs", "misattributed", "incorrect", "wrongly",
+		"duplicate", "spam", "check", "verify",
+	}
+	// housekeepingPhrases are multi-word notes with no single telling word.
+	housekeepingPhrases = []string{
+		"to split", "to merge", "bad data", "label mess",
+	}
+)
+
+// isHousekeeping reports whether a tag is an editor note rather than a genre.
+//
+// Tags are free text, so this can never be complete. That is acceptable because
+// it fails gracefully both ways: an unlisted note shows one odd tag, and a
+// genre wrongly matched costs one of three slots.
+func isHousekeeping(tag string) bool {
+	lower := strings.ToLower(tag)
+
+	for _, phrase := range housekeepingPhrases {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	for _, word := range strings.FieldsFunc(lower, func(r rune) bool {
+		// Split on anything that is not part of a word. Hyphens count as
+		// separators so "post-rock" is two words, which is harmless, while
+		// "fixme-label" is still caught.
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}) {
+		for _, marker := range housekeepingWords {
+			if word == marker {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// maxTags is how many tags reach the card. MusicBrainz can attach dozens;
+// three is enough to tell two same-named artists apart, and more would push the
+// fields that actually disambiguate off the visible part of the message.
+const maxTags = 3
+
+// topTags returns the most-voted tag names, editor notes removed.
 func topTags(tags []struct {
 	Name  string `json:"name"`
 	Count int    `json:"count"`
-}, n int) []string {
+}) []string {
 	if len(tags) == 0 {
 		return nil
 	}
@@ -281,13 +336,13 @@ func topTags(tags []struct {
 	}
 	sorted := make([]tag, 0, len(tags))
 	for _, t := range tags {
-		if t.Name != "" {
+		if t.Name != "" && !isHousekeeping(t.Name) {
 			sorted = append(sorted, tag{t.Name, t.Count})
 		}
 	}
 	// Simple selection: n is 3, so an O(n*len) pass beats pulling in sort.
-	out := make([]string, 0, n)
-	for len(out) < n && len(sorted) > 0 {
+	out := make([]string, 0, maxTags)
+	for len(out) < maxTags && len(sorted) > 0 {
 		best := 0
 		for i := 1; i < len(sorted); i++ {
 			if sorted[i].count > sorted[best].count {

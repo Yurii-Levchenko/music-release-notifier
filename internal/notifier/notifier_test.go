@@ -372,3 +372,180 @@ func TestRunReturnsNilOnCancellation(t *testing.T) {
 		t.Fatalf("Run after cancellation = %v, want nil", err)
 	}
 }
+
+// --- batch behavior --------------------------------------------------------
+
+// The per-item loop was previously untested: deliver() had tests, the loop
+// around it did not.
+func TestDrainOnceDeliversEveryRowInTheBatch(t *testing.T) {
+	ch := &fakeChannel{}
+	q := &fakeQueue{batches: [][]storage.Pending{{
+		pending(1, 10, 111, 1),
+		pending(2, 11, 222, 1),
+		pending(3, 12, 333, 1),
+	}}}
+	n, _, _ := testNotifier(q, ch)
+
+	sent, err := n.drainOnce(context.Background())
+	if err != nil {
+		t.Fatalf("drainOnce: %v", err)
+	}
+	if sent != 3 {
+		t.Fatalf("sent = %d, want 3", sent)
+	}
+	if len(ch.sent) != 3 || len(q.marked) != 3 {
+		t.Fatalf("channel got %d, queue marked %d, want 3 each", len(ch.sent), len(q.marked))
+	}
+}
+
+// A 429 applies to the connection, not to one message. Continuing through the
+// batch would earn one 429 per remaining row and escalate to a much longer
+// lockout — the exact outcome honoring retry_after is meant to avoid.
+func TestBatchIsAbandonedWhenTheServerAsksUsToWait(t *testing.T) {
+	rateLimited := &notify.DeliveryError{
+		Disposition: notify.Transient,
+		RetryAfter:  30 * time.Second,
+		Err:         errors.New("Too Many Requests: retry after 30"),
+	}
+	// First send succeeds, second is rate limited, and the third must never be
+	// attempted at all.
+	ch := &fakeChannel{errs: []error{nil, rateLimited, nil}}
+	q := &fakeQueue{batches: [][]storage.Pending{{
+		pending(1, 10, 111, 1),
+		pending(2, 11, 222, 1),
+		pending(3, 12, 333, 1),
+	}}}
+	n, _, _ := testNotifier(q, ch)
+
+	if _, err := n.drainOnce(context.Background()); err != nil {
+		t.Fatalf("drainOnce: %v", err)
+	}
+
+	if len(ch.sent) != 2 {
+		t.Fatalf("attempted %d sends, want 2 — the batch kept going after a 429", len(ch.sent))
+	}
+	if len(q.retries) != 1 || q.retries[0].id != 2 {
+		t.Fatalf("retries = %+v, want the rate-limited row rescheduled", q.retries)
+	}
+	// The untouched row keeps its lease and comes back on its own; it must not
+	// have been failed or dropped.
+	if len(q.failed) != 0 || len(q.dropped) != 0 {
+		t.Fatalf("abandoned rows were failed/dropped: failed=%v dropped=%v", q.failed, q.dropped)
+	}
+}
+
+// A transient failure with no server-supplied delay is one bad send, not a rate
+// limit. The batch must continue, or one flaky chat would stall everyone else.
+func TestBatchContinuesAfterAPlainTransientFailure(t *testing.T) {
+	ch := &fakeChannel{errs: []error{errors.New("connection reset"), nil, nil}}
+	q := &fakeQueue{batches: [][]storage.Pending{{
+		pending(1, 10, 111, 1),
+		pending(2, 11, 222, 1),
+		pending(3, 12, 333, 1),
+	}}}
+	n, _, _ := testNotifier(q, ch)
+
+	if _, err := n.drainOnce(context.Background()); err != nil {
+		t.Fatalf("drainOnce: %v", err)
+	}
+	if len(ch.sent) != 3 {
+		t.Fatalf("attempted %d sends, want 3 — one bad send stalled the batch", len(ch.sent))
+	}
+	if len(q.marked) != 2 {
+		t.Fatalf("marked %d, want 2", len(q.marked))
+	}
+}
+
+// Once a chat is known gone, the rest of that user's batch must not be
+// attempted: those rows are already marked skipped, and sending anyway spends
+// rate-limit budget to earn more errors.
+func TestDroppedRecipientsRemainingRowsAreNotAttempted(t *testing.T) {
+	gone := &notify.DeliveryError{
+		Disposition: notify.Permanent,
+		Err:         errors.New("Forbidden: bot was blocked by the user"),
+	}
+	ch := &fakeChannel{errs: []error{gone, nil, nil}}
+	q := &fakeQueue{batches: [][]storage.Pending{{
+		pending(1, 10, 111, 1), // user 10 — turns out to be gone
+		pending(2, 10, 111, 1), // user 10 again — must be skipped
+		pending(3, 11, 222, 1), // somebody else — must still be delivered
+	}}}
+	n, _, _ := testNotifier(q, ch)
+
+	if _, err := n.drainOnce(context.Background()); err != nil {
+		t.Fatalf("drainOnce: %v", err)
+	}
+
+	if len(ch.sent) != 2 {
+		t.Fatalf("attempted %d sends, want 2 — a dropped chat was messaged again", len(ch.sent))
+	}
+	if ch.sent[1].to.Address != "222" {
+		t.Fatalf("second send went to %q, want the other user", ch.sent[1].to.Address)
+	}
+	if len(q.dropped) != 1 {
+		t.Fatalf("dropped = %v, want one drop", q.dropped)
+	}
+	if len(q.marked) != 1 || q.marked[0] != 3 {
+		t.Fatalf("marked = %v, want only the bystander's row", q.marked)
+	}
+}
+
+// If the drop itself failed, the recipient is not actually known-gone, so the
+// short-circuit must not engage — otherwise a database blip would silently
+// swallow that user's remaining releases.
+func TestDropFailureDoesNotSuppressTheRestOfTheBatch(t *testing.T) {
+	gone := &notify.DeliveryError{
+		Disposition: notify.Permanent,
+		Err:         errors.New("Forbidden: bot was blocked by the user"),
+	}
+	ch := &fakeChannel{errs: []error{gone, gone}}
+	q := &failingDropQueue{}
+	q.batches = [][]storage.Pending{{
+		pending(1, 10, 111, 1),
+		pending(2, 10, 111, 1),
+	}}
+	n, _, _ := testNotifier(q, ch)
+
+	if _, err := n.drainOnce(context.Background()); err != nil {
+		t.Fatalf("drainOnce: %v", err)
+	}
+	if len(ch.sent) != 2 {
+		t.Fatalf("attempted %d sends, want 2 — a failed drop was treated as done", len(ch.sent))
+	}
+}
+
+type failingDropQueue struct{ fakeQueue }
+
+func (q *failingDropQueue) DropRecipient(context.Context, int64, string) error {
+	return errors.New("database unreachable")
+}
+
+// Per-chat timing state must not accumulate for the life of the process.
+func TestIdleChatsAreForgotten(t *testing.T) {
+	ch := &fakeChannel{}
+	q := &fakeQueue{batches: [][]storage.Pending{
+		{pending(1, 10, 111, 1)},
+		{pending(2, 11, 222, 1)},
+	}}
+	n, _, clock := testNotifier(q, ch)
+
+	ctx := context.Background()
+	if _, err := n.drainOnce(ctx); err != nil {
+		t.Fatalf("first drain: %v", err)
+	}
+	if len(n.lastSent) != 1 {
+		t.Fatalf("lastSent holds %d entries after one send, want 1", len(n.lastSent))
+	}
+
+	// Move past the gap: chat 111 can no longer delay anything.
+	*clock = clock.Add(10 * time.Second)
+	if _, err := n.drainOnce(ctx); err != nil {
+		t.Fatalf("second drain: %v", err)
+	}
+	if _, stillThere := n.lastSent[111]; stillThere {
+		t.Fatal("an idle chat kept its timing entry; the map grows without bound")
+	}
+	if _, ok := n.lastSent[222]; !ok {
+		t.Fatal("the chat just messaged was forgotten; the per-chat gap would not apply")
+	}
+}
