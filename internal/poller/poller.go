@@ -56,13 +56,19 @@ type Poller struct {
 	// now is injectable so tests can place a release in the future without
 	// waiting for tomorrow.
 	now func() time.Time
+
+	// beat reports that the poll loop is running, for the health registry.
+	beat func()
 }
 
 func New(feed Feed, store Store, interval time.Duration, log *slog.Logger) *Poller {
 	if interval <= 0 {
 		interval = 24 * time.Hour
 	}
-	return &Poller{feed: feed, store: store, interval: interval, log: log, now: time.Now}
+	return &Poller{
+		feed: feed, store: store, interval: interval, log: log,
+		now: time.Now, beat: func() {},
+	}
 }
 
 // Stats describe one poll.
@@ -76,6 +82,16 @@ type Stats struct {
 }
 
 // Run polls on a schedule until ctx is canceled.
+// ReportProgressTo registers a callback invoked after each completed poll,
+// successful or not: the health signal is "the poller is running", and a poll
+// that failed and logged it is still a running poller. A source outage is the
+// upstream metric's job, not the dead-man's switch's.
+func (p *Poller) ReportProgressTo(beat func()) {
+	if beat != nil {
+		p.beat = beat
+	}
+}
+
 func (p *Poller) Run(ctx context.Context) error {
 	// Wait out the remainder of the interval if a previous process already
 	// polled recently. Without this, a container that restarts often would poll
@@ -98,6 +114,7 @@ func (p *Poller) Run(ctx context.Context) error {
 		}
 
 		stats, err := p.PollOnce(ctx)
+		p.beat()
 		if err != nil {
 			// A failed poll is not fatal. The window is wide enough that the
 			// next attempt still covers everything this one missed.

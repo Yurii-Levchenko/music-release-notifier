@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mymmrac/telego"
 
@@ -35,6 +36,10 @@ type Bot struct {
 	cache  SearchCache
 	subs   SubscriptionStore
 	log    *slog.Logger
+
+	// beat reports that the bot is still working, for the health registry.
+	// A no-op by default so the bot runs unmonitored in tests.
+	beat func()
 }
 
 func NewBot(
@@ -45,7 +50,23 @@ func NewBot(
 	subs SubscriptionStore,
 	log *slog.Logger,
 ) *Bot {
-	return &Bot{client: c, users: users, search: search, cache: cache, subs: subs, log: log}
+	return &Bot{
+		client: c, users: users, search: search, cache: cache, subs: subs, log: log,
+		beat: func() {},
+	}
+}
+
+// botAliveInterval is how often an idle bot reports that it is still listening.
+// Comfortably inside the health budget so one missed tick is not an alert.
+const botAliveInterval = time.Minute
+
+// ReportProgressTo registers a callback the bot invokes whenever it proves it
+// is still working. Passing a plain func keeps this package independent of the
+// health registry.
+func (b *Bot) ReportProgressTo(beat func()) {
+	if beat != nil {
+		b.beat = beat
+	}
 }
 
 // Run blocks until ctx is canceled. Returns nil on a clean shutdown.
@@ -68,17 +89,48 @@ func (b *Bot) Run(ctx context.Context) error {
 
 	b.log.Info("bot polling for updates", "bot", b.client.Username())
 
+	return b.consume(ctx, updates)
+}
+
+// consume is the update loop, split out from Run so it can be driven by a test
+// channel. Long polling is created inside telego, so without this seam the
+// most important behavior here — what happens when polling dies — could only
+// be verified by reading it.
+func (b *Bot) consume(ctx context.Context, updates <-chan telego.Update) error {
+	// A tick that only exists to prove this loop is alive and the updates
+	// channel is still open. Without it an idle bot never beats — long polling
+	// delivers nothing when nobody is typing — and a healthy bot would be
+	// reported as wedged.
+	alive := time.NewTicker(botAliveInterval)
+	defer alive.Stop()
+
+	b.beat()
+
 	for {
 		select {
 		case <-ctx.Done():
 			b.log.Info("bot stopping")
 			return nil
+
+		case <-alive.C:
+			b.beat()
+
 		case update, ok := <-updates:
 			if !ok {
-				b.log.Info("update channel closed")
-				return nil
+				if ctx.Err() != nil {
+					// Expected: telego closes the channel on shutdown.
+					b.log.Info("bot stopping")
+					return nil
+				}
+				// Long polling died on its own. Returning nil here would look
+				// like a clean exit to the errgroup: the process would keep
+				// running with no bot, and nobody would find out — which is
+				// exactly how the 14-hour silence happened. Fail loudly so the
+				// group cancels and the restart policy does its job.
+				return errors.New("telegram long polling stopped unexpectedly")
 			}
 			b.handle(ctx, &update)
+			b.beat()
 		}
 	}
 }

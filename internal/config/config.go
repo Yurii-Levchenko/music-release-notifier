@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -18,6 +19,13 @@ type Config struct {
 	// requests without a meaningful one (SPEC C25), so this is required.
 	UserAgent string
 	LogLevel  slog.Level
+
+	// HeartbeatURL is an external dead-man's switch (healthchecks.io or
+	// similar). Optional, and the process says so loudly when it is unset:
+	// an alert raised from inside the application cannot report that the
+	// application is dead (SPEC §15a).
+	HeartbeatURL      string
+	HeartbeatInterval time.Duration
 }
 
 func Load() (Config, error) {
@@ -27,7 +35,14 @@ func Load() (Config, error) {
 		TelegramBotToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
 		UserAgent:        os.Getenv("USER_AGENT"),
 		LogLevel:         parseLevel(envOr("LOG_LEVEL", "info")),
+		HeartbeatURL:     os.Getenv("HEARTBEAT_URL"),
 	}
+
+	interval, err := parseDuration(envOr("HEARTBEAT_INTERVAL", "5m"))
+	if err != nil {
+		return Config{}, fmt.Errorf("config: HEARTBEAT_INTERVAL: %w", err)
+	}
+	c.HeartbeatInterval = interval
 
 	var problems []string
 	if c.DatabaseURL == "" {
@@ -53,9 +68,9 @@ func Load() (Config, error) {
 // Redacted renders the config for logging with nothing secret in it.
 func (c Config) Redacted() string {
 	return fmt.Sprintf(
-		"http=%s db=%s telegram_token=%s user_agent=%q log_level=%s",
+		"http=%s db=%s telegram_token=%s user_agent=%q log_level=%s heartbeat=%s interval=%s",
 		c.HTTPAddr, redactDSN(c.DatabaseURL), present(c.TelegramBotToken),
-		c.UserAgent, c.LogLevel,
+		c.UserAgent, c.LogLevel, present(c.HeartbeatURL), c.HeartbeatInterval,
 	)
 }
 
@@ -94,4 +109,19 @@ func parseLevel(s string) slog.Level {
 	default:
 		return slog.LevelInfo
 	}
+}
+
+// parseDuration accepts Go duration syntax and refuses anything that would
+// silently disable monitoring: zero and negative values are rejected rather
+// than defaulted, because a heartbeat that never fires looks identical to a
+// dead process and would train someone to ignore the alert.
+func parseDuration(raw string) (time.Duration, error) {
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, err
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("must be positive, got %q", raw)
+	}
+	return d, nil
 }

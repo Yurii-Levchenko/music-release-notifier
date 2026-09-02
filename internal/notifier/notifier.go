@@ -80,6 +80,9 @@ type Notifier struct {
 
 	now   func() time.Time
 	sleep func(context.Context, time.Duration) error
+
+	// beat reports that the drain loop is running, for the health registry.
+	beat func()
 }
 
 func New(queue Queue, channels *notify.Registry, log *slog.Logger) *Notifier {
@@ -91,6 +94,7 @@ func New(queue Queue, channels *notify.Registry, log *slog.Logger) *Notifier {
 		lastSent: make(map[int64]time.Time),
 		now:      time.Now,
 		sleep:    sleepCtx,
+		beat:     func() {},
 	}
 }
 
@@ -105,6 +109,15 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 		return ctx.Err()
 	case <-timer.C:
 		return nil
+	}
+}
+
+// ReportProgressTo registers a callback invoked after each drain attempt. An
+// empty queue still counts: "nothing to send" is the normal state most of the
+// day, and treating it as silence would alert every night.
+func (n *Notifier) ReportProgressTo(beat func()) {
+	if beat != nil {
+		n.beat = beat
 	}
 }
 
@@ -137,6 +150,7 @@ func (n *Notifier) Run(ctx context.Context) error {
 		}
 
 		sent, err := n.drainOnce(ctx)
+		n.beat()
 		if err != nil && ctx.Err() == nil {
 			// A failed drain is not fatal: the lease expires and the rows come
 			// back. Log it and wait rather than taking the process down.

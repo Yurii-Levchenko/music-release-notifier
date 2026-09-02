@@ -16,6 +16,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/config"
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/health"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/httpx"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/listenbrainz"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/musicbrainz"
@@ -126,9 +127,27 @@ func run() error {
 	}
 	releasePoller := poller.New(lb, storage.NewReleases(pool), pollInterval, log)
 
+	// The health registry defines what "working" means for the dead-man's
+	// switch. Budgets are per worker because their rhythms differ by four
+	// orders of magnitude: the bot proves itself every minute, the poller once
+	// a day. A single global budget would either cry wolf over the idle poller
+	// or never notice a wedged bot.
+	//
+	// Each budget is a small multiple of the worker's own cycle, so one missed
+	// cycle is tolerated and a genuinely stuck worker is not.
+	healthReg := health.NewRegistry()
+	healthReg.AddProbe("database", pool.Ping)
+
+	if bot != nil {
+		botHealth := healthReg.Register("bot", 5*time.Minute)
+		bot.ReportProgressTo(botHealth.Beat)
+	}
+	pollerHealth := healthReg.Register("poller", 26*time.Hour)
+	releasePoller.ReportProgressTo(pollerHealth.Beat)
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpx.New(pool, log).Routes(),
+		Handler:           httpx.New(pool, healthReg, log).Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
@@ -160,7 +179,17 @@ func run() error {
 		channels,
 		log,
 	)
+	notifierHealth := healthReg.Register("notifier", 5*time.Minute)
+	deliveries.ReportProgressTo(notifierHealth.Beat)
 	g.Go(func() error { return deliveries.Run(gctx) })
+
+	// The dead-man's switch. It pings only while every worker above is inside
+	// its budget, so silence — from a crash, a wedge, or an unreachable
+	// database — is what raises the alarm. This is the one piece that could
+	// have caught the 14-hour outage on 29.08.2026, because it lives outside
+	// the process it watches.
+	beat := health.NewHeartbeat(cfg.HeartbeatURL, cfg.HeartbeatInterval, healthReg, log)
+	g.Go(func() error { return beat.Run(gctx) })
 
 	// Shut the HTTP server down when anything else asks us to stop; without
 	// this, ListenAndServe would keep the group waiting forever.

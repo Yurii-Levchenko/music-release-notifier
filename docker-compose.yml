@@ -33,6 +33,8 @@ services:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       USER_AGENT: ${USER_AGENT:-ReleaseRadar/0.1 ( unset@example.com )}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      HEARTBEAT_URL: ${HEARTBEAT_URL:-}
+      HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL:-5m}
     ports:
       # Host port 8090, not 8080. 8080 is the most contended port on any dev
       # machine, and losing the race for it on a host restart kills the

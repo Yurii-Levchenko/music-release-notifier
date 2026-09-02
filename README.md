@@ -8,8 +8,8 @@ message when a new album, single or EP lands.
 
 **Go · PostgreSQL · ListenBrainz / MusicBrainz**
 
-> Status: **S5 complete** — the bot now sends on its own. First unprompted
-> message delivered 2 Sep 2026. Next is S6: production and observability.
+> Status: **S5 complete**, S6 in progress — the bot sends on its own, and an
+> external dead-man's switch now watches whether it still can.
 
 ---
 
@@ -104,7 +104,7 @@ behind. Without `TEST_DATABASE_URL` they skip rather than fail, keeping
 | ✅ S3 | Subscriptions, `/list`, `/stop` |
 | ✅ S4 | Release detection |
 | ✅ S5 | Delivery: outbox drain, pacing, failure classification |
-| ⬜ S6 | Production: VPS, backups, and observability — **v1 done** |
+| 🔄 S6 | Production: dead-man's switch ✅, metrics, logs, VPS — **v1 done** |
 | ⬜ S11 | Rank search results by metadata completeness, not score |
 | ⬜ S12 | Dead-letter handling for poison messages (with the v2 broker) |
 | ⬜ S8–S10 | Extension: linking API, subscribe from Spotify, publish |
@@ -117,6 +117,7 @@ internal/config/       environment parsing and validation
 internal/storage/      pool, migration runner, schema, invariant tests
 internal/notify/       the channel boundary — no Telegram types allowed here
 internal/notifier/     drains the outbox; decides what a failure costs
+internal/health/       worker liveness and the external dead-man's switch
 internal/httpx/        HTTP surface (health now, extension API in S8)
 spike/                 throwaway proof-of-concept; delete after S8
 SPEC.md                source of truth: requirements, constraints, decisions
