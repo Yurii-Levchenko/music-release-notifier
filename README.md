@@ -8,8 +8,8 @@ message when a new album, single or EP lands.
 
 **Go · PostgreSQL · ListenBrainz / MusicBrainz**
 
-> Status: **S4 complete** — releases are detected and queued. Delivery is
-> next (S5), and then the bot finally sends something on its own.
+> Status: **S5 complete** — the bot now sends on its own. First unprompted
+> message delivered 2 Sep 2026. Next is S6: production and observability.
 
 ---
 
@@ -23,7 +23,11 @@ than assuming. The full reasoning, with ~35 verified constraints, is in
 app owner to hold an active Premium subscription as of February 2026, and its
 Extended Quota tier is closed to individuals. ListenBrainz's `fresh-releases`
 endpoint needs no auth and returns the whole ecosystem's window in **one request
-per day** — so cost does not grow with the number of tracked artists. Spotify's
+per day**, whether the database tracks ten artists or ten thousand. Only the
+*external* cost is flat, to be exact — matching and outbox fan-out still grow
+with the artists in the response and the subscribers per release. Both are
+linear SQL over a local table, which is why the flat part is the one that
+matters. Spotify's
 developer policy also forbids forwarding Spotify content to another service,
 which a Telegram bot plainly does; MusicBrainz data is CC0 and carries no such
 restriction.
@@ -99,7 +103,7 @@ behind. Without `TEST_DATABASE_URL` they skip rather than fail, keeping
 | ✅ S2 | Artist search via MusicBrainz, paginated picker card |
 | ✅ S3 | Subscriptions, `/list`, `/stop` |
 | ✅ S4 | Release detection |
-| ⬜ S5 | Delivery: outbox drain, pacing, failure classification |
+| ✅ S5 | Delivery: outbox drain, pacing, failure classification |
 | ⬜ S6 | Production: VPS, backups, and observability — **v1 done** |
 | ⬜ S11 | Rank search results by metadata completeness, not score |
 | ⬜ S12 | Dead-letter handling for poison messages (with the v2 broker) |
@@ -112,6 +116,7 @@ cmd/releaseradar/      entrypoint: config, migrations, HTTP, shutdown
 internal/config/       environment parsing and validation
 internal/storage/      pool, migration runner, schema, invariant tests
 internal/notify/       the channel boundary — no Telegram types allowed here
+internal/notifier/     drains the outbox; decides what a failure costs
 internal/httpx/        HTTP surface (health now, extension API in S8)
 spike/                 throwaway proof-of-concept; delete after S8
 SPEC.md                source of truth: requirements, constraints, decisions
