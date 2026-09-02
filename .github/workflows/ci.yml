@@ -145,6 +145,26 @@ jobs:
         # Proves the Dockerfile still works, which `go build` alone does not.
         run: docker build -t releaseradar:ci .
 
+  # Alert rules are code and can be wrong in silence: a rule that fails to
+  # parse leaves Prometheus running with the rest of the file loaded and that
+  # alert simply never firing. Cheaper to find here than during the incident it
+  # was written for.
+  alerts:
+    name: Alert rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: promtool check rules
+        run: |
+          docker run --rm -v "$PWD/deploy/prometheus:/rules:ro"             --entrypoint promtool prom/prometheus:v3.7.3             check rules /rules/alerts.yml
+
+      - name: promtool check config
+        # Also validates that alerts.yml is actually referenced by
+        # prometheus.yml — a rules file nobody loads is worse than none.
+        run: |
+          docker run --rm -v "$PWD/deploy/prometheus:/etc/prometheus:ro"             --entrypoint promtool prom/prometheus:v3.7.3             check config /etc/prometheus/prometheus.yml
+
   # The spike is a separate module and deliberately excluded from the main
   # build; check it still compiles so it does not rot before S8 deletes it.
   spike:
