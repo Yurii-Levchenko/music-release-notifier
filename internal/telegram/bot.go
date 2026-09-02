@@ -12,6 +12,8 @@ import (
 
 	"github.com/mymmrac/telego"
 
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/metrics"
+
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/notify"
 )
 
@@ -39,7 +41,8 @@ type Bot struct {
 
 	// beat reports that the bot is still working, for the health registry.
 	// A no-op by default so the bot runs unmonitored in tests.
-	beat func()
+	beat    func()
+	metrics *metrics.Metrics
 }
 
 func NewBot(
@@ -52,13 +55,24 @@ func NewBot(
 ) *Bot {
 	return &Bot{
 		client: c, users: users, search: search, cache: cache, subs: subs, log: log,
-		beat: func() {},
+		beat: func() {}, metrics: metrics.Nop(),
 	}
 }
 
 // botAliveInterval is how often an idle bot reports that it is still listening.
 // Comfortably inside the health budget so one missed tick is not an alert.
 const botAliveInterval = time.Minute
+
+// WithMetrics attaches collectors. Separate from the constructor because the
+// bot already takes six dependencies, and metrics are not one of them in the
+// sense that matters — the bot works identically without them.
+func (b *Bot) WithMetrics(m *metrics.Metrics) *Bot {
+	if m != nil {
+		b.metrics = m
+		b.client.metrics = m
+	}
+	return b
+}
 
 // ReportProgressTo registers a callback the bot invokes whenever it proves it
 // is still working. Passing a plain func keeps this package independent of the
@@ -140,11 +154,19 @@ func (b *Bot) consume(ctx context.Context, updates <-chan telego.Update) error {
 func (b *Bot) handle(ctx context.Context, u *telego.Update) {
 	switch {
 	case u.Message != nil:
+		b.metrics.BotUpdates.WithLabelValues("message").Inc()
 		b.handleMessage(ctx, u.Message)
 	case u.MyChatMember != nil:
+		b.metrics.BotUpdates.WithLabelValues("my_chat_member").Inc()
 		b.handleMyChatMember(ctx, u.MyChatMember)
 	case u.CallbackQuery != nil:
+		b.metrics.BotUpdates.WithLabelValues("callback_query").Inc()
 		b.handleCallback(ctx, u.CallbackQuery)
+	default:
+		// An update kind we did not ask for in allowed_updates. Counted rather
+		// than dropped silently, because a rising "other" is the signal that
+		// Telegram started sending something new.
+		b.metrics.BotUpdates.WithLabelValues("other").Inc()
 	}
 }
 

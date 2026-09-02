@@ -12,14 +12,17 @@ import (
 
 	"github.com/mymmrac/telego"
 
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/metrics"
+
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/notify"
 )
 
 // Client is a thin wrapper over the Bot API. It exists so the notifier and the
 // bot worker can share one connection and one error-classification path.
 type Client struct {
-	api *telego.Bot
-	log *slog.Logger
+	api     *telego.Bot
+	log     *slog.Logger
+	metrics *metrics.Metrics
 	// self is filled by Init and used for logging and deep links.
 	self *telego.User
 }
@@ -31,7 +34,7 @@ func NewClient(token string, log *slog.Logger) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create telegram bot: %w", err)
 	}
-	return &Client{api: api, log: log}, nil
+	return &Client{api: api, log: log, metrics: metrics.Nop()}, nil
 }
 
 // Init verifies the token and caches the bot's own identity. Called once at
@@ -69,7 +72,7 @@ func (c *Client) SendHTML(ctx context.Context, chatID int64, text string) error 
 			IsDisabled: true,
 		},
 	})
-	return wrap(err)
+	return c.observe(err)
 }
 
 // SendPhotoHTML sends a photo by URL with an HTML caption. Telegram fetches the
@@ -81,7 +84,7 @@ func (c *Client) SendPhotoHTML(ctx context.Context, chatID int64, photoURL, capt
 		Caption:   caption,
 		ParseMode: telego.ModeHTML,
 	})
-	return wrap(err)
+	return c.observe(err)
 }
 
 // SetCommands registers the command list so it shows up in the client's menu.
@@ -94,7 +97,7 @@ func (c *Client) SetCommands(ctx context.Context) error {
 			{Command: "stop", Description: "Відписатися від усього і видалити дані"},
 		},
 	})
-	return wrap(err)
+	return c.observe(err)
 }
 
 // Notifier adapts Client to notify.Notifier. Kept separate so the domain

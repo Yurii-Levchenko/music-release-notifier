@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -15,10 +16,15 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/config"
+
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/health"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/httpx"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/listenbrainz"
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/metrics"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/musicbrainz"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/notifier"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/notify"
@@ -80,6 +86,23 @@ func run() error {
 		return err
 	}
 
+	// A private registry rather than prometheus.DefaultRegisterer. The default
+	// one is global state that any imported library can write to, and the Go
+	// runtime collectors are added explicitly below so the set is exactly what
+	// this binary chose to publish.
+	promReg := prometheus.NewRegistry()
+	promReg.MustRegister(collectors.NewGoCollector())
+	promReg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	appMetrics := metrics.New(promReg)
+
+	outbox := storage.NewNotifications(pool, claimLease, maxDeliveryAttempts)
+	if err := appMetrics.RegisterQueue(promReg, outbox); err != nil {
+		return fmt.Errorf("register queue metrics: %w", err)
+	}
+	if err := appMetrics.RegisterPollState(promReg, storage.NewReleases(pool)); err != nil {
+		return fmt.Errorf("register poll state metrics: %w", err)
+	}
+
 	// D13: delivery channels are plugins. The registry is what the notifier
 	// worker will resolve against in S5; nothing above it knows about Telegram.
 	var channels *notify.Registry
@@ -106,6 +129,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
+		mb.WithMetrics(appMetrics)
 		channels = notify.NewRegistry(telegram.NewNotifier(client))
 		bot = telegram.NewBot(
 			client,
@@ -141,13 +165,15 @@ func run() error {
 	if bot != nil {
 		botHealth := healthReg.Register("bot", 5*time.Minute)
 		bot.ReportProgressTo(botHealth.Beat)
+		bot.WithMetrics(appMetrics)
 	}
 	pollerHealth := healthReg.Register("poller", 26*time.Hour)
 	releasePoller.ReportProgressTo(pollerHealth.Beat)
+	releasePoller.WithMetrics(appMetrics)
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpx.New(pool, healthReg, log).Routes(),
+		Handler:           httpx.New(pool, healthReg, promReg, log).Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
@@ -174,11 +200,7 @@ func run() error {
 	// The notifier drains whatever the poller queued. It starts even with no
 	// channels configured, so that "the queue is filling and nobody is draining
 	// it" is a log line rather than a discovery weeks later.
-	deliveries := notifier.New(
-		storage.NewNotifications(pool, claimLease, maxDeliveryAttempts),
-		channels,
-		log,
-	)
+	deliveries := notifier.New(outbox, channels, log).WithMetrics(appMetrics)
 	notifierHealth := healthReg.Register("notifier", 5*time.Minute)
 	deliveries.ReportProgressTo(notifierHealth.Beat)
 	g.Go(func() error { return deliveries.Run(gctx) })

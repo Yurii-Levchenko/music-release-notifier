@@ -10,24 +10,38 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/health"
 )
 
 type Server struct {
-	pool   *pgxpool.Pool
-	health *health.Registry
-	log    *slog.Logger
+	pool    *pgxpool.Pool
+	health  *health.Registry
+	metrics prometheus.Gatherer
+	log     *slog.Logger
 }
 
-func New(pool *pgxpool.Pool, registry *health.Registry, log *slog.Logger) *Server {
-	return &Server{pool: pool, health: registry, log: log}
+func New(pool *pgxpool.Pool, registry *health.Registry, gatherer prometheus.Gatherer, log *slog.Logger) *Server {
+	return &Server{pool: pool, health: registry, metrics: gatherer, log: log}
 }
 
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("GET /status", s.status)
+
+	// /metrics is deliberately not on the public internet in the deployment:
+	// it is scraped over the compose network. Exposing it would hand out chat
+	// volumes and queue depths to anyone who asked.
+	if s.metrics != nil {
+		mux.Handle("GET /metrics", promhttp.HandlerFor(s.metrics, promhttp.HandlerOpts{
+			// A collector that fails must not take the whole scrape with it:
+			// one unreadable queue should not blind every other metric.
+			ErrorHandling: promhttp.ContinueOnError,
+		}))
+	}
 	return s.withLogging(mux)
 }
 

@@ -41,5 +41,40 @@ services:
       # container before it runs — see the note in CLAUDE.md.
       - "8090:8080"
 
+  # Observability lives behind a profile, so `docker compose up` stays two
+  # containers on a dev machine. Start it with:
+  #   docker compose --profile observability up -d
+  prometheus:
+    image: prom/prometheus:v3.7.3
+    profiles: ["observability"]
+    restart: unless-stopped
+    volumes:
+      - ./deploy/prometheus:/etc/prometheus:ro
+      - promdata:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=30d
+    ports:
+      - "9091:9090"
+
+  grafana:
+    image: grafana/grafana:12.3.1
+    profiles: ["observability"]
+    restart: unless-stopped
+    depends_on: [prometheus]
+    environment:
+      # Anonymous read-only viewing: this is a single-operator deployment, and
+      # a password nobody remembers is a dashboard nobody opens.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "3001:3000"
+
 volumes:
   pgdata:
+  promdata:
+  grafanadata:

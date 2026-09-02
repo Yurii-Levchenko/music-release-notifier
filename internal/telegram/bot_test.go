@@ -11,11 +11,12 @@ import (
 	"github.com/mymmrac/telego"
 )
 
+// loopOnlyBot goes through the real constructor with nil dependencies. The
+// update loop touches none of them, and building the struct literally instead
+// would let the test drift from NewBot — which it did: a new field defaulted in
+// the constructor was nil here, and the loop panicked on the first update.
 func loopOnlyBot() *Bot {
-	return &Bot{
-		log:  slog.New(slog.NewTextHandler(io.Discard, nil)),
-		beat: func() {},
-	}
+	return NewBot(nil, nil, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 // The failure this whole health story exists for. When telego's long polling

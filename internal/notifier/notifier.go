@@ -14,6 +14,7 @@ import (
 
 	"golang.org/x/time/rate"
 
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/metrics"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/notify"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/storage"
 )
@@ -82,7 +83,8 @@ type Notifier struct {
 	sleep func(context.Context, time.Duration) error
 
 	// beat reports that the drain loop is running, for the health registry.
-	beat func()
+	beat    func()
+	metrics *metrics.Metrics
 }
 
 func New(queue Queue, channels *notify.Registry, log *slog.Logger) *Notifier {
@@ -95,6 +97,7 @@ func New(queue Queue, channels *notify.Registry, log *slog.Logger) *Notifier {
 		now:      time.Now,
 		sleep:    sleepCtx,
 		beat:     func() {},
+		metrics:  metrics.Nop(),
 	}
 }
 
@@ -110,6 +113,14 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+// WithMetrics attaches collectors.
+func (n *Notifier) WithMetrics(m *metrics.Metrics) *Notifier {
+	if m != nil {
+		n.metrics = m
+	}
+	return n
 }
 
 // ReportProgressTo registers a callback invoked after each drain attempt. An
@@ -211,6 +222,7 @@ func (n *Notifier) drainOnce(ctx context.Context) (int, error) {
 			// one 429 per remaining row and escalate to a much longer lockout —
 			// the exact behavior honoring retry_after is meant to avoid. The
 			// remaining rows keep their leases and come back on their own.
+			n.metrics.BatchesAbandoned.Inc()
 			n.log.Warn("upstream asked us to slow down; abandoning the rest of this batch",
 				"delivered", i, "abandoned", len(batch)-i-1)
 			return i, nil
@@ -256,6 +268,7 @@ func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) outcome {
 		return outcomeDone
 	}
 
+	start := n.now()
 	sendErr := channel.Send(ctx, notify.Recipient{
 		UserID:  p.UserID,
 		Kind:    channel.Kind(),
@@ -270,8 +283,10 @@ func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) outcome {
 		InfoURL:     p.InfoURL,
 	})
 	n.lastSent[p.ChatID] = n.now()
+	n.metrics.DeliverySeconds.Observe(n.now().Sub(start).Seconds())
 
 	if sendErr == nil {
+		n.metrics.Notifications.WithLabelValues("sent").Inc()
 		if err := n.queue.MarkSent(ctx, p.ID); err != nil {
 			// The message went out. Failing to record that means it will be sent
 			// again when the lease expires — worth an error, not a retry.
@@ -285,6 +300,7 @@ func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) outcome {
 	disposition, retryAfter := notify.DispositionOf(sendErr)
 	switch disposition {
 	case notify.Permanent:
+		n.metrics.Notifications.WithLabelValues("permanent").Inc()
 		// The chat is gone for good. Drop the subscriptions rather than
 		// rediscovering this on every release for the rest of time.
 		log.Info("recipient is unreachable, dropping subscriptions", "err", sendErr)
@@ -297,6 +313,7 @@ func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) outcome {
 		return outcomeDropped
 
 	case notify.BadMessage:
+		n.metrics.Notifications.WithLabelValues("bad_message").Inc()
 		// Our bug, not their fault. The subscription stays: a malformed caption
 		// must not cost somebody the artists they follow.
 		log.Error("message rejected, dropping this notification only", "err", sendErr)
@@ -306,6 +323,7 @@ func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) outcome {
 		return outcomeDone
 
 	default: // notify.Transient
+		n.metrics.Notifications.WithLabelValues("transient").Inc()
 		gaveUp, err := n.queue.Retry(ctx, p.ID, p.Attempts, retryAfter, sendErr.Error())
 		if err != nil {
 			log.Error("could not reschedule", "err", err)

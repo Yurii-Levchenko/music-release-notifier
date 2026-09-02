@@ -20,6 +20,8 @@ import (
 	"unicode"
 
 	"golang.org/x/time/rate"
+
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/metrics"
 )
 
 const (
@@ -76,6 +78,7 @@ type Client struct {
 	userAgent  string
 	limiter    *rate.Limiter
 	log        *slog.Logger
+	metrics    *metrics.Metrics
 }
 
 // ErrNoUserAgent means the client was built without an identifying User-Agent.
@@ -102,6 +105,7 @@ func New(userAgent string, log *slog.Logger) (*Client, error) {
 		userAgent:  ua,
 		limiter:    rate.NewLimiter(rate.Limit(requestsPerSecond), 1),
 		log:        log,
+		metrics:    metrics.Nop(),
 	}, nil
 }
 
@@ -240,10 +244,18 @@ func (c *Client) doOnce(ctx context.Context, endpoint string) (body []byte, retr
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		// Timeouts and connection resets are worth another go.
+		// Timeouts and connection resets are worth another go. Counted as
+		// "transport" rather than a status, because the request may never have
+		// reached MusicBrainz at all.
+		c.metrics.MusicBrainzRequests.WithLabelValues("transport").Inc()
 		return nil, true, fmt.Errorf("musicbrainz: request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+
+	// Bucketed, not the raw code: an unbounded label fed from an upstream is
+	// how a metrics backend gets a cardinality explosion. The 503 share is the
+	// number that matters here (C25c).
+	c.metrics.MusicBrainzRequests.WithLabelValues(statusLabel(resp.StatusCode)).Inc()
 
 	switch {
 	case resp.StatusCode == http.StatusOK:
@@ -401,4 +413,32 @@ func escapeLucene(s string) string {
 		wroteAny = true
 	}
 	return b.String()
+}
+
+// statusLabel buckets an HTTP status into a bounded label set.
+func statusLabel(code int) string {
+	switch {
+	case code == http.StatusOK:
+		return "200"
+	case code == http.StatusServiceUnavailable:
+		return "503"
+	case code == http.StatusTooManyRequests:
+		return "429"
+	case code == http.StatusForbidden:
+		return "403"
+	case code >= 500:
+		return "5xx"
+	case code >= 400:
+		return "4xx"
+	default:
+		return "other"
+	}
+}
+
+// WithMetrics attaches collectors.
+func (c *Client) WithMetrics(m *metrics.Metrics) *Client {
+	if m != nil {
+		c.metrics = m
+	}
+	return c
 }

@@ -241,3 +241,18 @@ func (r *Releases) RecordPoll(ctx context.Context, source string, pollErr error)
 	}
 	return nil
 }
+
+// LastSuccessfulPoll reports when the release poller last completed without an
+// error. Read by the metrics collector at scrape time, so the answer survives
+// restarts — an in-memory timestamp would reset on every deploy and make a
+// fresh container look like a poller that has never run.
+func (r *Releases) LastSuccessfulPoll(ctx context.Context) (time.Time, bool, error) {
+	st, found, err := r.PollState(ctx, "listenbrainz")
+	if err != nil || !found {
+		return time.Time{}, false, err
+	}
+	if st.LastOKAt.IsZero() {
+		return time.Time{}, false, nil
+	}
+	return st.LastOKAt, true, nil
+}

@@ -73,6 +73,27 @@ curl localhost:8090/healthz
 The database is published on host port **5433**, not 5432, to stay out of the
 way of a locally installed PostgreSQL.
 
+### Observability
+
+```bash
+docker compose --profile observability up -d
+```
+
+Prometheus on **9091**, Grafana on **3001** (anonymous viewer). The app's
+`/metrics` is scraped over the compose network and never published to the host:
+it carries queue depths and chat volumes.
+
+Two collectors read Postgres when Prometheus scrapes rather than tracking a
+number in memory. That is not incidental — a gauge set from the drain loop is
+only correct at the instant of a drain, so during an incident, when the drain
+loop is the thing that stopped, the graph would sit at its last healthy value
+and look fine. And an unreadable queue publishes `queue_readable 0` with *no*
+depth sample, because a zero depth reads as an empty queue and would silence
+the alert that should be firing.
+
+`/status` shows what each worker is doing; `/healthz` stays liveness for the
+container.
+
 ```bash
 make run        # run against a local Go toolchain instead
 make test       # unit tests; database tests skip without TEST_DATABASE_URL
@@ -104,7 +125,7 @@ behind. Without `TEST_DATABASE_URL` they skip rather than fail, keeping
 | ✅ S3 | Subscriptions, `/list`, `/stop` |
 | ✅ S4 | Release detection |
 | ✅ S5 | Delivery: outbox drain, pacing, failure classification |
-| 🔄 S6 | Production: dead-man's switch ✅, metrics, logs, VPS — **v1 done** |
+| 🔄 S6 | Production: dead-man's switch ✅, metrics ✅, logs, VPS — **v1 done** |
 | ⬜ S11 | Rank search results by metadata completeness, not score |
 | ⬜ S12 | Dead-letter handling for poison messages (with the v2 broker) |
 | ⬜ S8–S10 | Extension: linking API, subscribe from Spotify, publish |
@@ -118,6 +139,8 @@ internal/storage/      pool, migration runner, schema, invariant tests
 internal/notify/       the channel boundary — no Telegram types allowed here
 internal/notifier/     drains the outbox; decides what a failure costs
 internal/health/       worker liveness and the external dead-man's switch
+internal/metrics/      Prometheus collectors; two of them read at scrape time
+deploy/                Prometheus scrape config, alert rules, Grafana datasource
 internal/httpx/        HTTP surface (health now, extension API in S8)
 spike/                 throwaway proof-of-concept; delete after S8
 SPEC.md                source of truth: requirements, constraints, decisions

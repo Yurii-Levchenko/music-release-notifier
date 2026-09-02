@@ -270,6 +270,11 @@ func (b *Bot) finish(ctx context.Context, chatID int64, placeholder int, text st
 
 // logSearch emits the one line per search that makes cache behavior visible.
 func (b *Bot) logSearch(log *slog.Logger, query, source string, results int, started time.Time) {
+	// The same place the log line is emitted, so the metric cannot disagree
+	// with the logs about where an answer came from. `source` is one of a
+	// fixed set defined in this package, so the label stays bounded.
+	b.metrics.SearchCache.WithLabelValues(source).Inc()
+
 	log.Info("artist search",
 		"query", query,
 		"source", source,

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/listenbrainz"
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/metrics"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/storage"
 )
 
@@ -58,7 +59,8 @@ type Poller struct {
 	now func() time.Time
 
 	// beat reports that the poll loop is running, for the health registry.
-	beat func()
+	beat    func()
+	metrics *metrics.Metrics
 }
 
 func New(feed Feed, store Store, interval time.Duration, log *slog.Logger) *Poller {
@@ -67,7 +69,7 @@ func New(feed Feed, store Store, interval time.Duration, log *slog.Logger) *Poll
 	}
 	return &Poller{
 		feed: feed, store: store, interval: interval, log: log,
-		now: time.Now, beat: func() {},
+		now: time.Now, beat: func() {}, metrics: metrics.Nop(),
 	}
 }
 
@@ -149,8 +151,27 @@ func (p *Poller) initialDelay(ctx context.Context) time.Duration {
 
 // PollOnce reads the feed and records what it finds. Exported so it can be
 // triggered deliberately rather than only by the clock.
+// WithMetrics attaches collectors.
+func (p *Poller) WithMetrics(m *metrics.Metrics) *Poller {
+	if m != nil {
+		p.metrics = m
+	}
+	return p
+}
+
 func (p *Poller) PollOnce(ctx context.Context) (Stats, error) {
+	start := p.now()
 	stats, err := p.poll(ctx)
+
+	// Duration is recorded even for a failed poll: a poll that failed after
+	// two minutes and one that failed instantly are different problems.
+	p.metrics.PollSeconds.Observe(p.now().Sub(start).Seconds())
+	p.metrics.ReleasesFound.Add(float64(stats.Fetched))
+	p.metrics.ReleasesMatched.Add(float64(stats.Matched))
+	if err != nil {
+		p.metrics.PollFailures.Inc()
+	}
+
 	// Record the attempt either way: the gap between last_polled_at and
 	// last_ok_at is how an alert learns the poller has been failing.
 	if recErr := p.store.RecordPoll(ctx, sourceName, err); recErr != nil {
