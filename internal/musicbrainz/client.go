@@ -442,3 +442,116 @@ func (c *Client) WithMetrics(m *metrics.Metrics) *Client {
 	}
 	return c
 }
+
+// Links are the external destinations worth putting in a notification.
+//
+// Curated hard on purpose. A lookup returns everything MusicBrainz knows —
+// 49 relations for Drake, including three Discogs entries, VIAF, WorldCat and
+// two lyrics sites. A message with all of that is unreadable, and the reader
+// wants exactly one thing: somewhere to press play.
+type Links struct {
+	Spotify    string `json:"spotify,omitempty"`
+	YouTube    string `json:"youtube,omitempty"`
+	AppleMusic string `json:"apple_music,omitempty"`
+}
+
+// Empty reports whether nothing usable was found.
+func (l Links) Empty() bool {
+	return l.Spotify == "" && l.YouTube == "" && l.AppleMusic == ""
+}
+
+// ArtistLinks looks up one artist's external URLs.
+//
+// This is a second request, not part of the search: the artist *index* carries
+// no relationships at all — verified live, `inc=url-rels` is silently ignored
+// on a search and the response has no relations key. At one request a second
+// that makes links something to fetch once per artist and store, never
+// something to resolve while rendering a card.
+func (c *Client) ArtistLinks(ctx context.Context, mbid string) (Links, error) {
+	if !isMBID(mbid) {
+		// Also keeps anything but a UUID out of the request path.
+		return Links{}, fmt.Errorf("musicbrainz: %q is not an mbid", mbid)
+	}
+
+	body, err := c.get(ctx, c.baseURL+"/artist/"+mbid+"?inc=url-rels&fmt=json")
+	if err != nil {
+		return Links{}, err
+	}
+
+	var payload struct {
+		Relations []linkRelation `json:"relations"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return Links{}, fmt.Errorf("musicbrainz: decode artist links: %w", err)
+	}
+
+	return pickLinks(payload.Relations), nil
+}
+
+// linkRelation is one url-rel, named rather than anonymous so the selection
+// logic can be tested without an HTTP round trip.
+type linkRelation struct {
+	Type  string `json:"type"`
+	Ended bool   `json:"ended"`
+	URL   struct {
+		Resource string `json:"resource"`
+	} `json:"url"`
+}
+
+// pickLinks chooses one URL per service from MusicBrainz's relation list.
+//
+// Two things it has to get right.
+//
+// **Ended relations are skipped.** Snoop Dogg's list includes a Google+
+// profile and a dead iTunes page, both flagged ended. Handing somebody a link
+// to Google+ is worse than showing no link at all.
+//
+// **Duplicates resolve to the first live match.** An artist can have several
+// YouTube channels or Apple Music pages and MusicBrainz returns them in no
+// meaningful order, so this is arbitrary-but-stable rather than correct. Good
+// enough for "go listen"; not good enough to present as canonical.
+//
+// Matching is on host as well as relation type, because "free streaming"
+// covers Spotify, Deezer and Pandora alike, and "streaming" covers Apple,
+// Tidal, Amazon and Qobuz.
+func pickLinks(relations []linkRelation) Links {
+	var l Links
+
+	for _, r := range relations {
+		if r.Ended {
+			continue
+		}
+		resource := r.URL.Resource
+
+		switch {
+		case l.Spotify == "" && strings.Contains(resource, "open.spotify.com/artist/"):
+			l.Spotify = resource
+		case l.YouTube == "" && r.Type == "youtube":
+			l.YouTube = resource
+		case l.AppleMusic == "" && strings.Contains(resource, "music.apple.com/"):
+			l.AppleMusic = resource
+		}
+	}
+	return l
+}
+
+// isMBID reports whether s is shaped like a MusicBrainz UUID.
+func isMBID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, r := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if r != '-' {
+				return false
+			}
+		default:
+			isHex := (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')
+			if !isHex {
+				return false
+			}
+		}
+	}
+	return true
+}

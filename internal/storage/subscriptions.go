@@ -2,8 +2,10 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -172,4 +174,83 @@ func (s *Subscriptions) Forget(ctx context.Context, chatID int64) (existed bool,
 		return false, fmt.Errorf("forget chat=%d: %w", chatID, err)
 	}
 	return tag.RowsAffected() > 0, nil
+}
+
+// ArtistLinks are the external destinations shown in a notification.
+type ArtistLinks struct {
+	Spotify    string `json:"spotify,omitempty"`
+	YouTube    string `json:"youtube,omitempty"`
+	AppleMusic string `json:"apple_music,omitempty"`
+}
+
+// SetArtistLinks records the lookup result, including an empty one.
+//
+// Storing the empty case is the point: links_fetched_at is what separates "we
+// have never looked" from "we looked and there is nothing", and without that
+// distinction every subscribe would re-fetch the artists that have no links —
+// forever, and against an API limited to one request a second.
+func (s *Subscriptions) SetArtistLinks(ctx context.Context, mbid string, links ArtistLinks) error {
+	payload, err := json.Marshal(links)
+	if err != nil {
+		return fmt.Errorf("encode links for %s: %w", mbid, err)
+	}
+
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE artists
+		SET links = $2::jsonb, links_fetched_at = now()
+		WHERE mbid = $1`, mbid, string(payload)); err != nil {
+		return fmt.Errorf("store links for %s: %w", mbid, err)
+	}
+	return nil
+}
+
+// NeedsLinks reports whether this artist has never had a link lookup.
+//
+// A missing artist row answers false: there is nothing to attach links to, and
+// the caller has a worse problem than missing links.
+func (s *Subscriptions) NeedsLinks(ctx context.Context, mbid string) (bool, error) {
+	var fetched *time.Time
+	err := s.pool.QueryRow(ctx,
+		`SELECT links_fetched_at FROM artists WHERE mbid = $1`, mbid).Scan(&fetched)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read link state for %s: %w", mbid, err)
+	}
+	return fetched == nil, nil
+}
+
+// ArtistsMissingLinks returns tracked artists that have never had a link
+// lookup, oldest subscription first.
+//
+// Only artists somebody is actually subscribed to: looking up links for an
+// artist nobody follows would spend a rate-limited request on a row that will
+// never appear in a notification.
+func (s *Subscriptions) ArtistsMissingLinks(ctx context.Context, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT a.mbid
+		FROM artists a
+		WHERE a.links_fetched_at IS NULL
+		  AND EXISTS (SELECT 1 FROM subscriptions s WHERE s.artist_mbid = a.mbid)
+		ORDER BY a.created_at
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("find artists missing links: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var mbid string
+		if err := rows.Scan(&mbid); err != nil {
+			return nil, fmt.Errorf("scan artist mbid: %w", err)
+		}
+		out = append(out, mbid)
+	}
+	return out, rows.Err()
 }

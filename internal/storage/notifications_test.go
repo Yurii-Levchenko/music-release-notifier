@@ -418,3 +418,97 @@ func TestQueueDepthCountsPendingWork(t *testing.T) {
 		t.Fatalf("depth = %d after sending, want back to %d", sentDepth, before)
 	}
 }
+
+// The links have to survive the whole way from the artist row to a claimed
+// notification, because the notifier does no lookups of its own — the same
+// property cover_url has (D14). A join that silently returns nothing would
+// leave every notification without its listen row and nothing would fail.
+func TestClaimCarriesTheArtistsListenLinks(t *testing.T) {
+	ctx, tx := testTx(t)
+	f := outboxFixtures(ctx, t, tx, -999000120,
+		"aaaa1111-0000-4000-8000-000000000120", "bbbb1111-0000-4000-8000-000000000120")
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE artists
+		SET links = $2::jsonb, links_fetched_at = now()
+		WHERE mbid = $1`, f.artist,
+		`{"spotify":"https://open.spotify.com/artist/S","youtube":"https://youtube.com/channel/Y"}`,
+	); err != nil {
+		t.Fatalf("set links: %v", err)
+	}
+
+	outbox := storage.NewNotifications(tx, 5*time.Minute, 5)
+	batch, err := outbox.Claim(ctx, outboxLimit)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	got := find(batch, f.notifID)
+	if got == nil {
+		t.Fatalf("claim missed notification %d", f.notifID)
+	}
+
+	if got.Spotify != "https://open.spotify.com/artist/S" {
+		t.Errorf("Spotify = %q", got.Spotify)
+	}
+	if got.YouTube != "https://youtube.com/channel/Y" {
+		t.Errorf("YouTube = %q", got.YouTube)
+	}
+	// Absent in the jsonb, so it must come back empty rather than as "null".
+	if got.AppleMusic != "" {
+		t.Errorf("AppleMusic = %q, want empty for a key that is not there", got.AppleMusic)
+	}
+}
+
+// An artist with no links must still be claimable. The join is the only path
+// notifications take, so a missing key must not drop the row.
+func TestClaimWorksForAnArtistWithNoLinks(t *testing.T) {
+	ctx, tx := testTx(t)
+	f := outboxFixtures(ctx, t, tx, -999000121,
+		"aaaa1111-0000-4000-8000-000000000121", "bbbb1111-0000-4000-8000-000000000121")
+
+	outbox := storage.NewNotifications(tx, 5*time.Minute, 5)
+	batch, err := outbox.Claim(ctx, outboxLimit)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	got := find(batch, f.notifID)
+	if got == nil {
+		t.Fatal("an artist with no links lost its notification entirely")
+	}
+	if got.Spotify != "" || got.YouTube != "" || got.AppleMusic != "" {
+		t.Errorf("links invented from an empty jsonb: %+v", got)
+	}
+}
+
+// The distinction that stops an endless re-fetch: '{}' means two different
+// things, and only links_fetched_at tells them apart.
+func TestLinkFetchStateSeparatesNeverLookedFromNoneFound(t *testing.T) {
+	ctx, tx := testTx(t)
+	f := outboxFixtures(ctx, t, tx, -999000122,
+		"aaaa1111-0000-4000-8000-000000000122", "bbbb1111-0000-4000-8000-000000000122")
+
+	var fetched *time.Time
+	if err := tx.QueryRow(ctx,
+		`SELECT links_fetched_at FROM artists WHERE mbid = $1`, f.artist).Scan(&fetched); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if fetched != nil {
+		t.Fatal("a fresh artist is marked as already looked up")
+	}
+
+	// An artist that genuinely has none: empty links, but recorded as looked
+	// at. Without this the lookup would repeat on every subscribe forever.
+	if _, err := tx.Exec(ctx, `
+		UPDATE artists SET links = '{}'::jsonb, links_fetched_at = now()
+		WHERE mbid = $1`, f.artist); err != nil {
+		t.Fatalf("mark fetched: %v", err)
+	}
+
+	if err := tx.QueryRow(ctx,
+		`SELECT links_fetched_at FROM artists WHERE mbid = $1`, f.artist).Scan(&fetched); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if fetched == nil {
+		t.Fatal("an artist with no links is indistinguishable from one never checked")
+	}
+}

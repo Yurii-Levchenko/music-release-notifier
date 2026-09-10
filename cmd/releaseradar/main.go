@@ -103,6 +103,18 @@ func run() error {
 		return fmt.Errorf("register poll state metrics: %w", err)
 	}
 
+	// Built here rather than inside the Telegram branch, because the poller's
+	// link backfill needs it whether or not a bot token is configured.
+	//
+	// Refuses to build without a User-Agent carrying a contact address:
+	// MusicBrainz answers an anonymous client with 403 and a generic one with
+	// 503, and neither improves on retry.
+	mb, err := musicbrainz.New(cfg.UserAgent, log)
+	if err != nil {
+		return err
+	}
+	mb.WithMetrics(appMetrics)
+
 	// D13: delivery channels are plugins. The registry is what the notifier
 	// worker will resolve against in S5; nothing above it knows about Telegram.
 	var channels *notify.Registry
@@ -122,14 +134,6 @@ func run() error {
 		if err := client.Init(ctx); err != nil {
 			return err
 		}
-		// Refuses to build without a User-Agent carrying a contact address:
-		// MusicBrainz answers an anonymous client with 403 and a generic one
-		// with 503, and neither improves on retry.
-		mb, err := musicbrainz.New(cfg.UserAgent, log)
-		if err != nil {
-			return err
-		}
-		mb.WithMetrics(appMetrics)
 		channels = notify.NewRegistry(telegram.NewNotifier(client))
 		bot = telegram.NewBot(
 			client,
@@ -170,6 +174,10 @@ func run() error {
 	pollerHealth := healthReg.Register("poller", 26*time.Hour)
 	releasePoller.ReportProgressTo(pollerHealth.Beat)
 	releasePoller.WithMetrics(appMetrics)
+	releasePoller.WithLinkBackfill(linkBackfill{
+		Subscriptions: storage.NewSubscriptions(pool),
+		Client:        mb,
+	})
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
@@ -234,4 +242,15 @@ func run() error {
 	}
 	log.Info("stopped cleanly")
 	return nil
+}
+
+// linkBackfill satisfies poller.LinkBackfill by combining the two things that
+// own half of the job each: the database knows which artists are missing
+// links, and MusicBrainz knows what they are.
+//
+// Embedding rather than three forwarding methods, because there is nothing to
+// add — any logic here would belong in the poller, where it is tested.
+type linkBackfill struct {
+	*storage.Subscriptions
+	*musicbrainz.Client
 }

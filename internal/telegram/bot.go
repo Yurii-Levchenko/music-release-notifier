@@ -43,6 +43,10 @@ type Bot struct {
 	// A no-op by default so the bot runs unmonitored in tests.
 	beat    func()
 	metrics *metrics.Metrics
+
+	// now is injectable because the artist card shows an age, and a fact that
+	// changes with the calendar must be testable without waiting a year.
+	now func() time.Time
 }
 
 func NewBot(
@@ -55,7 +59,7 @@ func NewBot(
 ) *Bot {
 	return &Bot{
 		client: c, users: users, search: search, cache: cache, subs: subs, log: log,
-		beat: func() {}, metrics: metrics.Nop(),
+		beat: func() {}, metrics: metrics.Nop(), now: time.Now,
 	}
 }
 

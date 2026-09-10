@@ -215,6 +215,17 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 
 // formatRelease builds the message body. Every value that came from an external
 // API is escaped — artist and album titles routinely contain &, < and >.
+// maxTitleRunes bounds the release title in a notification.
+//
+// A photo caption is limited to 1024 characters and a message to 4096, and
+// MusicBrainz titles are not bounded at all — box sets and classical works run
+// long. Exceeding the caption limit is survivable (the photo path degrades to
+// text) but it would cost the artwork over something as avoidable as a title,
+// and exceeding the message limit would cost the notification.
+//
+// 180 runes is well inside both and already longer than anyone reads in a chat.
+const maxTitleRunes = 180
+
 func formatRelease(rel notify.Release) string {
 	var b strings.Builder
 	b.WriteString("🎵 <b>")
@@ -225,11 +236,11 @@ func formatRelease(rel notify.Release) string {
 		b.WriteString(`<a href="`)
 		b.WriteString(html.EscapeString(rel.InfoURL))
 		b.WriteString(`">`)
-		b.WriteString(html.EscapeString(rel.Title))
+		b.WriteString(html.EscapeString(trimRunes(rel.Title, maxTitleRunes)))
 		b.WriteString("</a>")
 	} else {
 		b.WriteString("<b>")
-		b.WriteString(html.EscapeString(rel.Title))
+		b.WriteString(html.EscapeString(trimRunes(rel.Title, maxTitleRunes)))
 		b.WriteString("</b>")
 	}
 
@@ -239,7 +250,48 @@ func formatRelease(rel notify.Release) string {
 		b.WriteString(" · ")
 		b.WriteString(rel.ReleaseDate.Format("02.01.2006"))
 	}
+
+	if listen := listenRow(rel.Listen); listen != "" {
+		b.WriteString("\n\n")
+		b.WriteString(listen)
+	}
 	return b.String()
+}
+
+// listenRow is the "go press play" line.
+//
+// It exists because the only link in a notification used to be MusicBrainz,
+// which is a metadata site. Somebody who has just been told their artist
+// released an album wants to listen, not to read a database entry.
+//
+// The URLs point at each service's own web player and were read from
+// MusicBrainz, which is CC0. Nothing here comes from Spotify's API, so the
+// restriction that ruled Spotify out as a data source — ToS §III.9, forwarding
+// Spotify content to another service — does not apply to a hyperlink.
+func listenRow(l notify.ListenLinks) string {
+	if !l.Any() {
+		// Normal, not exceptional: an artist subscribed to before link lookups
+		// existed has none, and some artists genuinely have none.
+		return ""
+	}
+
+	var parts []string
+	// Spotify first. This project exists because Spotify does not reliably
+	// tell you about releases, so that is where most readers will want to go.
+	if l.Spotify != "" {
+		parts = append(parts, link(l.Spotify, "Spotify"))
+	}
+	if l.YouTube != "" {
+		parts = append(parts, link(l.YouTube, "YouTube"))
+	}
+	if l.AppleMusic != "" {
+		parts = append(parts, link(l.AppleMusic, "Apple Music"))
+	}
+	return "▶️ " + strings.Join(parts, " · ")
+}
+
+func link(href, label string) string {
+	return `<a href="` + html.EscapeString(href) + `">` + html.EscapeString(label) + `</a>`
 }
 
 func releaseTypeLabel(t string) string {
@@ -253,4 +305,16 @@ func releaseTypeLabel(t string) string {
 	default:
 		return t
 	}
+}
+
+// trimRunes shortens s to at most n runes, counting runes rather than bytes
+// because Telegram's limits are in characters and half of this project's data
+// is Japanese and Cyrillic — a byte-based cut would both truncate too early
+// and be able to split a character in half.
+func trimRunes(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n-1]) + "…"
 }

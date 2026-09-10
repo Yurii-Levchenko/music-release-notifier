@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/listenbrainz"
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/musicbrainz"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/storage"
 )
 
@@ -420,4 +421,144 @@ func TestInitialDelayIsZeroWhenOverdueOrUnknown(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- link backfill ----------------------------------------------------------
+
+type fakeBackfill struct {
+	pending []string
+	links   map[string]musicbrainz.Links
+	stored  map[string]storage.ArtistLinks
+	lookups []string
+
+	listErr   error
+	lookupErr error
+}
+
+func (f *fakeBackfill) ArtistsMissingLinks(_ context.Context, limit int) ([]string, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	if len(f.pending) > limit {
+		return f.pending[:limit], nil
+	}
+	return f.pending, nil
+}
+
+func (f *fakeBackfill) ArtistLinks(_ context.Context, mbid string) (musicbrainz.Links, error) {
+	f.lookups = append(f.lookups, mbid)
+	if f.lookupErr != nil {
+		return musicbrainz.Links{}, f.lookupErr
+	}
+	return f.links[mbid], nil
+}
+
+func (f *fakeBackfill) SetArtistLinks(_ context.Context, mbid string, l storage.ArtistLinks) error {
+	if f.stored == nil {
+		f.stored = map[string]storage.ArtistLinks{}
+	}
+	f.stored[mbid] = l
+	return nil
+}
+
+// Links are fetched at subscribe time, which leaves every artist subscribed to
+// before the feature existed permanently without them. The backfill is what
+// makes it a whole feature rather than half of one.
+func TestBackfillFillsArtistsThatNeverHadALookup(t *testing.T) {
+	b := &fakeBackfill{
+		pending: []string{"mbid-a", "mbid-b"},
+		links: map[string]musicbrainz.Links{
+			"mbid-a": {Spotify: "https://open.spotify.com/artist/A"},
+			"mbid-b": {YouTube: "https://youtube.com/channel/B"},
+		},
+	}
+	p := bareTestPoller().WithLinkBackfill(b)
+
+	p.backfillLinks(context.Background())
+
+	if len(b.stored) != 2 {
+		t.Fatalf("stored %d, want 2", len(b.stored))
+	}
+	if b.stored["mbid-a"].Spotify != "https://open.spotify.com/artist/A" {
+		t.Errorf("mbid-a = %+v", b.stored["mbid-a"])
+	}
+}
+
+// An artist with no links must still be recorded as looked at, or the lookup
+// repeats every poll forever against a one-request-a-second API.
+func TestBackfillRecordsAnEmptyResult(t *testing.T) {
+	b := &fakeBackfill{
+		pending: []string{"mbid-none"},
+		links:   map[string]musicbrainz.Links{"mbid-none": {}},
+	}
+	p := bareTestPoller().WithLinkBackfill(b)
+
+	p.backfillLinks(context.Background())
+
+	if _, recorded := b.stored["mbid-none"]; !recorded {
+		t.Fatal("an artist with no links was not recorded as checked; it will be retried forever")
+	}
+}
+
+// A failed lookup must not be recorded, so the next poll tries again.
+func TestBackfillLeavesAFailedLookupUnrecorded(t *testing.T) {
+	b := &fakeBackfill{
+		pending:   []string{"mbid-x"},
+		lookupErr: errors.New("503 service unavailable"),
+	}
+	p := bareTestPoller().WithLinkBackfill(b)
+
+	p.backfillLinks(context.Background())
+
+	if len(b.stored) != 0 {
+		t.Fatalf("a failed lookup was recorded as done: %+v", b.stored)
+	}
+}
+
+// The backfill is housekeeping. A MusicBrainz outage must not be able to make
+// a successful poll look failed.
+func TestBackfillFailureIsNotFatal(t *testing.T) {
+	b := &fakeBackfill{listErr: errors.New("database unreachable")}
+	p := bareTestPoller().WithLinkBackfill(b)
+
+	p.backfillLinks(context.Background()) // must not panic
+
+	if len(b.lookups) != 0 {
+		t.Fatal("looked up artists it could not list")
+	}
+}
+
+// Without a backfill configured the poller must behave exactly as before —
+// nil is the normal state for every existing deployment and every other test.
+func TestPollerWithoutBackfillIsInert(t *testing.T) {
+	p := bareTestPoller()
+
+	// A nil dependency must be a no-op, not a nil dereference: the poll loop
+	// calls this on every cycle.
+	p.backfillLinks(context.Background())
+
+	if p.links != nil {
+		t.Fatal("a backfill appeared without being configured")
+	}
+}
+
+// Cancellation has to stop the loop rather than working through the batch.
+func TestBackfillStopsOnCancellation(t *testing.T) {
+	b := &fakeBackfill{pending: []string{"a", "b", "c"}, links: map[string]musicbrainz.Links{}}
+	p := bareTestPoller().WithLinkBackfill(b)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	p.backfillLinks(ctx)
+
+	if len(b.lookups) != 0 {
+		t.Fatalf("performed %d lookups after cancellation", len(b.lookups))
+	}
+}
+
+// bareTestPoller builds a poller with no feed or store: the backfill touches
+// neither, and supplying fakes for them would only obscure what is under test.
+func bareTestPoller() *Poller {
+	return New(nil, nil, time.Hour, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }

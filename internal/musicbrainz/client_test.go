@@ -392,3 +392,96 @@ func TestTopTagsKeepsRealGenres(t *testing.T) {
 		}
 	}
 }
+
+func rel(kind, url string, ended bool) linkRelation {
+	var r linkRelation
+	r.Type = kind
+	r.Ended = ended
+	r.URL.Resource = url
+	return r
+}
+
+// Ended relations point at dead services. Snoop Dogg's real list carries a
+// Google+ profile and a retired iTunes page, both flagged ended — handing
+// somebody a link to Google+ is worse than showing no link at all.
+func TestEndedRelationsAreSkipped(t *testing.T) {
+	got := pickLinks([]linkRelation{
+		rel("social network", "https://plus.google.com/+SnoopDogg", true),
+		rel("purchase for download", "https://itunes.apple.com/us/artist/id21769", true),
+		rel("youtube", "https://www.youtube.com/channel/DEAD", true),
+		rel("youtube", "https://www.youtube.com/channel/LIVE", false),
+	})
+
+	if got.YouTube != "https://www.youtube.com/channel/LIVE" {
+		t.Fatalf("YouTube = %q, want the live channel", got.YouTube)
+	}
+	if got.AppleMusic != "" {
+		t.Fatalf("AppleMusic = %q, want nothing — the only entry was retired", got.AppleMusic)
+	}
+}
+
+// "free streaming" covers Spotify, Deezer and Pandora alike, so the relation
+// type alone cannot pick Spotify out.
+func TestSpotifyIsMatchedByHostNotByRelationType(t *testing.T) {
+	got := pickLinks([]linkRelation{
+		rel("free streaming", "https://www.deezer.com/artist/246791", false),
+		rel("free streaming", "http://www.pandora.com/drake", false),
+		rel("free streaming", "https://open.spotify.com/artist/3TVXtAsR1Inumwj472S9r4", false),
+	})
+
+	if got.Spotify != "https://open.spotify.com/artist/3TVXtAsR1Inumwj472S9r4" {
+		t.Fatalf("Spotify = %q", got.Spotify)
+	}
+}
+
+// Likewise "streaming" covers Apple, Tidal, Amazon and Qobuz.
+func TestAppleMusicIsMatchedByHost(t *testing.T) {
+	got := pickLinks([]linkRelation{
+		rel("streaming", "https://tidal.com/artist/8914", false),
+		rel("streaming", "https://music.amazon.com/artists/B001Q5D8PW", false),
+		rel("streaming", "https://music.apple.com/us/artist/21769", false),
+	})
+
+	if got.AppleMusic != "https://music.apple.com/us/artist/21769" {
+		t.Fatalf("AppleMusic = %q", got.AppleMusic)
+	}
+}
+
+// An artist can have several YouTube channels; the first live one wins and
+// nothing later overwrites it.
+func TestFirstLiveMatchWins(t *testing.T) {
+	got := pickLinks([]linkRelation{
+		rel("youtube", "https://www.youtube.com/channel/FIRST", false),
+		rel("youtube", "https://www.youtube.com/channel/SECOND", false),
+	})
+
+	if got.YouTube != "https://www.youtube.com/channel/FIRST" {
+		t.Fatalf("YouTube = %q, want the first", got.YouTube)
+	}
+}
+
+// An artist with nothing usable must produce an empty result rather than a
+// partly-filled one, so the caller can tell there is no row to render.
+func TestNoUsableLinksIsEmpty(t *testing.T) {
+	got := pickLinks([]linkRelation{
+		rel("discogs", "https://www.discogs.com/artist/151199", false),
+		rel("wikidata", "https://www.wikidata.org/wiki/Q33240", false),
+		rel("VIAF", "http://viaf.org/viaf/106753132", false),
+	})
+
+	if !got.Empty() {
+		t.Fatalf("links = %+v, want empty", got)
+	}
+}
+
+func TestArtistLinksRejectsANonMBID(t *testing.T) {
+	c, err := New("ReleaseRadar/test ( t@example.com )", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+
+	// Would otherwise be pasted straight into the request path.
+	if _, err := c.ArtistLinks(context.Background(), "../release-group?query=x"); err == nil {
+		t.Fatal("a non-mbid reached the request path")
+	}
+}

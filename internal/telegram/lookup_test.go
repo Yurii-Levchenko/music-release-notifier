@@ -19,6 +19,11 @@ type fakeSearcher struct {
 	err     error
 }
 
+// ArtistLinks is not exercised by the search tests; the links path has its own.
+func (f *fakeSearcher) ArtistLinks(context.Context, string) (musicbrainz.Links, error) {
+	return musicbrainz.Links{}, nil
+}
+
 func (f *fakeSearcher) SearchArtist(context.Context, string, int) ([]musicbrainz.Artist, error) {
 	f.calls++
 	return f.artists, f.err

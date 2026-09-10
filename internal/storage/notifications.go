@@ -61,6 +61,12 @@ type Pending struct {
 	ReleaseDate time.Time
 	CoverURL    string
 	InfoURL     string
+
+	// Streaming links, joined from the artist. Empty when the artist was
+	// subscribed to before link lookups existed.
+	Spotify    string
+	YouTube    string
+	AppleMusic string
 }
 
 // Claim leases up to limit due notifications for this worker.
@@ -110,7 +116,10 @@ func (n *Notifications) Claim(ctx context.Context, limit int) ([]Pending, error)
 		  AND a.mbid = r.artist_mbid
 		RETURNING n.id, n.user_id, u.telegram_chat_id, n.attempts,
 		          r.id, r.artist_mbid, a.name, r.title, r.primary_type,
-		          r.release_date, coalesce(r.cover_url, '')`,
+		          r.release_date, coalesce(r.cover_url, ''),
+		          coalesce(a.links->>'spotify', ''),
+		          coalesce(a.links->>'youtube', ''),
+		          coalesce(a.links->>'apple_music', '')`,
 		limit, n.lease.Seconds())
 	if err != nil {
 		return nil, fmt.Errorf("claim notifications: %w", err)
@@ -122,7 +131,8 @@ func (n *Notifications) Claim(ctx context.Context, limit int) ([]Pending, error)
 		var p Pending
 		if err := rows.Scan(&p.ID, &p.UserID, &p.ChatID, &p.Attempts,
 			&p.ReleaseID, &p.ArtistMBID, &p.ArtistName, &p.Title, &p.PrimaryType,
-			&p.ReleaseDate, &p.CoverURL); err != nil {
+			&p.ReleaseDate, &p.CoverURL,
+			&p.Spotify, &p.YouTube, &p.AppleMusic); err != nil {
 			return nil, fmt.Errorf("scan claimed notification: %w", err)
 		}
 		p.InfoURL = "https://musicbrainz.org/artist/" + p.ArtistMBID

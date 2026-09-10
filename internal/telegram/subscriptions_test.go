@@ -34,7 +34,7 @@ func TestSubscriptionCallbackDataFitsLimit(t *testing.T) {
 	}
 
 	// And through the real renderers, since those are what actually ship.
-	_, markup := renderCandidate("q", []musicbrainz.Artist{{MBID: mbid, Name: "X"}}, 0, hash, false)
+	_, markup := renderCandidate("q", []musicbrainz.Artist{{MBID: mbid, Name: "X"}}, 0, hash, false, testClock)
 	assertCallbackBudget(t, markup.InlineKeyboard)
 
 	items := make([]storage.Subscription, listPageSize)
@@ -77,7 +77,7 @@ func TestRenderCandidateRendersTheActionButton(t *testing.T) {
 		{false, cbSubscribe + ":", "Підписатись"},
 		{true, cbUnsubscribe + ":", "Відписатись"},
 	} {
-		text, markup := renderCandidate("radiohead", candidates, 0, "abcdef123456", tc.subscribed)
+		text, markup := renderCandidate("radiohead", candidates, 0, "abcdef123456", tc.subscribed, testClock)
 
 		var found bool
 		for _, row := range markup.InlineKeyboard {

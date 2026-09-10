@@ -36,6 +36,8 @@ type SubscriptionStore interface {
 	IsSubscribed(ctx context.Context, chatID int64, mbid string) (bool, error)
 	List(ctx context.Context, chatID int64, limit, offset int) (items []storage.Subscription, total int, err error)
 	Forget(ctx context.Context, chatID int64) (existed bool, err error)
+	NeedsLinks(ctx context.Context, mbid string) (bool, error)
+	SetArtistLinks(ctx context.Context, mbid string, links storage.ArtistLinks) error
 }
 
 // handleSubscribe is the Subscribe button on a search card.
@@ -67,6 +69,48 @@ func (b *Bot) handleSubscribe(ctx context.Context, cq *telego.CallbackQuery, has
 		b.answerCallback(ctx, cq.ID, "Ти вже підписаний на "+artist.Name, log)
 	}
 	b.refreshCard(ctx, cq, query, candidates, index, hash, true, log)
+
+	// Deliberately after the card is updated. The lookup is rate limited to
+	// one request a second and shared with search, so doing it first would
+	// make the button feel slow for something the user cannot see yet.
+	b.ensureArtistLinks(ctx, artist.MBID, log)
+}
+
+// ensureArtistLinks fetches the artist's streaming links once, if they have
+// never been looked up.
+//
+// Best effort by design. A failure here costs the "listen on" row in future
+// notifications and nothing else, so it must not turn a successful
+// subscription into an error the user sees. links_fetched_at stays null on
+// failure, so the next subscribe to the same artist tries again.
+func (b *Bot) ensureArtistLinks(ctx context.Context, mbid string, log *slog.Logger) {
+	needed, err := b.subs.NeedsLinks(ctx, mbid)
+	if err != nil {
+		log.Warn("could not check artist links", "mbid", mbid, "err", err)
+		return
+	}
+	if !needed {
+		return
+	}
+
+	links, err := b.search.ArtistLinks(ctx, mbid)
+	if err != nil {
+		log.Warn("artist link lookup failed", "mbid", mbid, "err", err)
+		return
+	}
+
+	if err := b.subs.SetArtistLinks(ctx, mbid, storage.ArtistLinks{
+		Spotify:    links.Spotify,
+		YouTube:    links.YouTube,
+		AppleMusic: links.AppleMusic,
+	}); err != nil {
+		log.Warn("could not store artist links", "mbid", mbid, "err", err)
+		return
+	}
+
+	log.Info("artist links stored", "mbid", mbid,
+		"spotify", links.Spotify != "", "youtube", links.YouTube != "",
+		"apple_music", links.AppleMusic != "")
 }
 
 // handleUnsubscribeFromCard is the Unsubscribe button on a search card.
@@ -324,7 +368,7 @@ func (b *Bot) refreshCard(ctx context.Context, cq *telego.CallbackQuery, query s
 	if msg == nil {
 		return
 	}
-	text, markup := renderCandidate(query, candidates, index, hash, subscribed)
+	text, markup := renderCandidate(query, candidates, index, hash, subscribed, b.now())
 	if _, err := b.client.api.EditMessageText(ctx, &telego.EditMessageTextParams{
 		ChatID:             telego.ChatID{ID: msg.Chat.ID},
 		MessageID:          msg.MessageID,

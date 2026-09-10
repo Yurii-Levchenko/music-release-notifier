@@ -149,6 +149,11 @@ spike/                 throwaway proof-of-concept; delete after S8
 SPEC.md                source of truth: requirements, constraints, decisions
 ```
 
+A release notification carries where to listen — Spotify, YouTube, Apple
+Music — resolved once per artist and stored in `artists.links`, never looked up
+while sending. Same reason `cover_url` works that way: resolving at send time
+would mean one lookup per subscriber instead of one per artist, ever.
+
 `SPEC.md` is updated in the same commit as the code it describes. A spec that
 has fallen behind the code is worse than no spec, because it lies with a
 straight face.

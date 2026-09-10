@@ -27,6 +27,27 @@ type Release struct {
 	// channel needs a no-image path. Not a rare edge case.
 	CoverURL string
 	InfoURL  string
+
+	// Listen is where to actually go and play the thing. Empty is normal: the
+	// links are looked up once per artist and an artist subscribed to before
+	// that lookup existed has none. A channel must render fine without them.
+	Listen ListenLinks
+}
+
+// ListenLinks are the streaming destinations for an artist.
+//
+// They live on the domain release rather than being resolved by a channel,
+// for the same reason CoverURL does (D14): resolving at send time would mean
+// one lookup per subscriber instead of one per artist, ever.
+type ListenLinks struct {
+	Spotify    string
+	YouTube    string
+	AppleMusic string
+}
+
+// Any reports whether there is anywhere to send the reader.
+func (l ListenLinks) Any() bool {
+	return l.Spotify != "" || l.YouTube != "" || l.AppleMusic != ""
 }
 
 // Recipient says where to deliver without saying how. Address is opaque to the

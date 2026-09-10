@@ -15,6 +15,7 @@ import (
 
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/listenbrainz"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/metrics"
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/musicbrainz"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/storage"
 )
 
@@ -61,6 +62,9 @@ type Poller struct {
 	// beat reports that the poll loop is running, for the health registry.
 	beat    func()
 	metrics *metrics.Metrics
+
+	// links is optional; nil disables the backfill.
+	links LinkBackfill
 }
 
 func New(feed Feed, store Store, interval time.Duration, log *slog.Logger) *Poller {
@@ -103,6 +107,13 @@ func (p *Poller) Run(ctx context.Context) error {
 	if delay > 0 {
 		p.log.Info("poller waiting for the next due time", "delay", delay.Round(time.Minute))
 	}
+
+	// Once at startup, and not only on the poll cycle. The backfill does not
+	// touch the release feed, so there is no reason to make it wait out a
+	// day-long interval — a deploy that adds links should show them, not show
+	// them tomorrow. Bounded by linksPerPoll and by links_fetched_at, so a
+	// restart loop cannot turn this into a burst.
+	p.backfillLinks(ctx)
 
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
@@ -151,6 +162,75 @@ func (p *Poller) initialDelay(ctx context.Context) time.Duration {
 
 // PollOnce reads the feed and records what it finds. Exported so it can be
 // triggered deliberately rather than only by the clock.
+// LinkBackfill fills in artist streaming links that were never looked up.
+//
+// This exists because links are fetched at subscribe time, which leaves every
+// artist subscribed to before the feature existed permanently without them —
+// a feature that only works for future subscriptions is half a feature. The
+// poller is the right home: it is the worker whose whole job is periodic
+// maintenance against a rate-limited upstream.
+type LinkBackfill interface {
+	ArtistsMissingLinks(ctx context.Context, limit int) ([]string, error)
+	SetArtistLinks(ctx context.Context, mbid string, links storage.ArtistLinks) error
+	ArtistLinks(ctx context.Context, mbid string) (musicbrainz.Links, error)
+}
+
+// linksPerPoll bounds the backfill. MusicBrainz allows one request a second,
+// and this work is never urgent: a missing link costs a row in a message, not
+// the message. Small and daily beats a burst that competes with somebody's
+// search.
+const linksPerPoll = 5
+
+// WithLinkBackfill enables the backfill. Optional: without it the poller
+// behaves exactly as before, which is what keeps every existing poller test
+// unchanged.
+func (p *Poller) WithLinkBackfill(b LinkBackfill) *Poller {
+	p.links = b
+	return p
+}
+
+// backfillLinks looks up a few artists' links. Never fatal: this runs after
+// the poll that actually matters, and a MusicBrainz outage must not make a
+// successful poll look failed.
+func (p *Poller) backfillLinks(ctx context.Context) {
+	if p.links == nil {
+		return
+	}
+
+	pending, err := p.links.ArtistsMissingLinks(ctx, linksPerPoll)
+	if err != nil {
+		p.log.Warn("could not list artists missing links", "err", err)
+		return
+	}
+	if len(pending) == 0 {
+		return
+	}
+
+	p.log.Info("backfilling artist links", "artists", len(pending))
+
+	for _, mbid := range pending {
+		if ctx.Err() != nil {
+			return
+		}
+
+		links, err := p.links.ArtistLinks(ctx, mbid)
+		if err != nil {
+			// Leaves links_fetched_at null, so the next poll tries again.
+			p.log.Warn("link lookup failed", "mbid", mbid, "err", err)
+			continue
+		}
+		if err := p.links.SetArtistLinks(ctx, mbid, storage.ArtistLinks{
+			Spotify:    links.Spotify,
+			YouTube:    links.YouTube,
+			AppleMusic: links.AppleMusic,
+		}); err != nil {
+			p.log.Warn("could not store links", "mbid", mbid, "err", err)
+			continue
+		}
+		p.log.Info("artist links stored", "mbid", mbid, "found", !links.Empty())
+	}
+}
+
 // WithMetrics attaches collectors.
 func (p *Poller) WithMetrics(m *metrics.Metrics) *Poller {
 	if m != nil {
@@ -171,6 +251,10 @@ func (p *Poller) PollOnce(ctx context.Context) (Stats, error) {
 	if err != nil {
 		p.metrics.PollFailures.Inc()
 	}
+
+	// After the poll, never instead of it: detecting releases is the job, and
+	// filling in links is housekeeping.
+	p.backfillLinks(ctx)
 
 	// Record the attempt either way: the gap between last_polled_at and
 	// last_ok_at is how an alert learns the poller has been failing.

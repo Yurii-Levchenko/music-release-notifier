@@ -101,3 +101,83 @@ func TestParseChatID(t *testing.T) {
 		t.Fatal("parseChatID(empty) should fail")
 	}
 }
+
+// The notification used to link only to MusicBrainz, a metadata site. Somebody
+// just told their artist released an album wants to press play.
+func TestNotificationCarriesListenLinks(t *testing.T) {
+	got := formatRelease(notify.Release{
+		ArtistName: "Drake", Title: "For All The Dogs", PrimaryType: "Album",
+		ReleaseDate: time.Date(2026, 9, 9, 0, 0, 0, 0, time.UTC),
+		Listen: notify.ListenLinks{
+			Spotify:    "https://open.spotify.com/artist/3TVXtAsR1Inumwj472S9r4",
+			YouTube:    "https://www.youtube.com/channel/UCByOQJjav0CUDwxCk-jVNRQ",
+			AppleMusic: "https://music.apple.com/ca/artist/271256",
+		},
+	})
+
+	for _, want := range []string{"Spotify", "YouTube", "Apple Music", "open.spotify.com"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("message is missing %q:\n%s", want, got)
+		}
+	}
+	// Spotify first: this project exists because Spotify does not reliably
+	// tell you about releases, so that is where most readers will go.
+	if strings.Index(got, "Spotify") > strings.Index(got, "YouTube") {
+		t.Errorf("YouTube came before Spotify:\n%s", got)
+	}
+}
+
+// An artist subscribed to before link lookups existed has none, and some
+// artists simply have none. That is normal operation, not an edge case.
+func TestNotificationWithoutLinksHasNoEmptyRow(t *testing.T) {
+	got := formatRelease(notify.Release{
+		ArtistName: "あいみょん", Title: "Sleepy", PrimaryType: "Single",
+	})
+
+	if strings.Contains(got, "▶") {
+		t.Fatalf("an empty listen row was rendered:\n%s", got)
+	}
+}
+
+// Only the services actually present may appear.
+func TestOnlyKnownLinksAreRendered(t *testing.T) {
+	got := formatRelease(notify.Release{
+		ArtistName: "X", Title: "Y",
+		Listen: notify.ListenLinks{YouTube: "https://www.youtube.com/channel/Z"},
+	})
+
+	if !strings.Contains(got, "YouTube") {
+		t.Fatalf("YouTube missing:\n%s", got)
+	}
+	if strings.Contains(got, "Spotify") || strings.Contains(got, "Apple") {
+		t.Fatalf("a service with no link was rendered:\n%s", got)
+	}
+}
+
+// A photo caption is capped at 1024 characters and MusicBrainz titles are not
+// capped at all. Exceeding it costs the artwork; exceeding the message limit
+// would cost the notification.
+func TestAbsurdlyLongTitleIsTrimmed(t *testing.T) {
+	got := formatRelease(notify.Release{
+		ArtistName: "X", Title: strings.Repeat("а", 5000), PrimaryType: "Album",
+	})
+
+	if len([]rune(got)) > 1024 {
+		t.Fatalf("message is %d runes, over the photo caption limit", len([]rune(got)))
+	}
+	if !strings.Contains(got, "…") {
+		t.Fatal("the title was cut without saying so")
+	}
+}
+
+// Counting bytes instead of runes would cut a Japanese title to a third of its
+// length and could split a character in half.
+func TestTrimCountsRunesNotBytes(t *testing.T) {
+	title := strings.Repeat("唇", 100) // 300 bytes, 100 runes
+
+	got := formatRelease(notify.Release{ArtistName: "X", Title: title})
+
+	if !strings.Contains(got, title) {
+		t.Fatalf("a 100-rune title was trimmed as if it were 300 characters:\n%s", got)
+	}
+}
