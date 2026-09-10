@@ -26,6 +26,9 @@ func NewSubscriptions(pool *pgxpool.Pool) *Subscriptions { return &Subscriptions
 type Subscription struct {
 	MBID string
 	Name string
+	// SubscribedAt is what the list is ordered by, and is returned so a caller
+	// can show it without a second query.
+	SubscribedAt time.Time
 }
 
 // ArtistRef is the minimum needed to subscribe. Deliberately not
@@ -114,8 +117,16 @@ func (s *Subscriptions) IsSubscribed(ctx context.Context, chatID int64, mbid str
 
 // List returns one page of a user's subscriptions plus the total count.
 //
-// Sorted by name so the order is stable between pages; sorting by created_at
-// would shuffle the list every time someone subscribes mid-browse.
+// Ordered by when the subscription was made, newest first.
+//
+// This replaces alphabetical order, and the comment that used to be here
+// argued against it: a new subscription inserts at position 1 and shifts
+// everything after it, so subscribing mid-browse can repeat one row on the
+// next page. That is true, and it is a smaller problem than it sounds — the
+// page holds 20, subscribing happens from a search card rather than from the
+// list, and OFFSET pagination has the same flaw under any order that a new row
+// can land in front of. Keyset pagination would fix it properly and is more
+// machinery than a list of this size has ever needed.
 func (s *Subscriptions) List(ctx context.Context, chatID int64, limit, offset int) (items []Subscription, total int, err error) {
 	if limit <= 0 {
 		limit = 20
@@ -135,12 +146,22 @@ func (s *Subscriptions) List(ctx context.Context, chatID int64, limit, offset in
 		return nil, 0, nil
 	}
 
+	// Newest subscription first, not alphabetical.
+	//
+	// The list is paginated and its buttons unsubscribe by position, so what
+	// belongs on the first page is what the reader most likely came for: the
+	// artist they just added, usually because they want to undo it. Alphabetical
+	// order buries a fresh mistake somewhere in the middle.
+	//
+	// a.mbid breaks ties. Two subscriptions can share a created_at — the
+	// extension will add several at once in S9 — and an ORDER BY that is not
+	// total lets the same row appear on two pages, or on neither.
 	rows, err := s.pool.Query(ctx, `
-		SELECT a.mbid, a.name
+		SELECT a.mbid, a.name, s.created_at
 		FROM subscriptions s
 		JOIN artists a ON a.mbid = s.artist_mbid
 		WHERE s.user_id = (SELECT id FROM users WHERE telegram_chat_id = $1)
-		ORDER BY a.name, a.mbid
+		ORDER BY s.created_at DESC, a.mbid
 		LIMIT $2 OFFSET $3`,
 		chatID, limit, offset)
 	if err != nil {
@@ -150,7 +171,7 @@ func (s *Subscriptions) List(ctx context.Context, chatID int64, limit, offset in
 
 	for rows.Next() {
 		var sub Subscription
-		if err := rows.Scan(&sub.MBID, &sub.Name); err != nil {
+		if err := rows.Scan(&sub.MBID, &sub.Name, &sub.SubscribedAt); err != nil {
 			return nil, 0, fmt.Errorf("scan subscription: %w", err)
 		}
 		items = append(items, sub)

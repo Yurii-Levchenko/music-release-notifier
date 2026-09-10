@@ -192,12 +192,18 @@ func TestIsSubscribed(t *testing.T) {
 func TestListPagination(t *testing.T) {
 	ctx, subs := testSubs(t)
 
-	for mbid, name := range map[string]string{
-		mbidA: "Charlie", mbidB: "Alice", mbidC: "Bob",
+	// A slice, not a map: the order these are created in is exactly what the
+	// list is now sorted by, and ranging a map would make the expectation
+	// depend on Go's hash seed. The previous version of this test asserted
+	// alphabetical order, which hid that.
+	for _, sub := range []struct{ mbid, name string }{
+		{mbidA, "Charlie"}, // subscribed first, so listed last
+		{mbidB, "Alice"},
+		{mbidC, "Bob"}, // subscribed last, so listed first
 	} {
 		if _, err := subs.Subscribe(ctx, testChatID,
-			storage.ArtistRef{MBID: mbid, Name: name}, "bot"); err != nil {
-			t.Fatalf("subscribe %s: %v", name, err)
+			storage.ArtistRef{MBID: sub.mbid, Name: sub.name}, "bot"); err != nil {
+			t.Fatalf("subscribe %s: %v", sub.name, err)
 		}
 	}
 
@@ -208,8 +214,16 @@ func TestListPagination(t *testing.T) {
 	if total != 3 {
 		t.Fatalf("total = %d, want 3", total)
 	}
-	if len(page1) != 2 || page1[0].Name != "Alice" || page1[1].Name != "Bob" {
-		t.Fatalf("page 1 = %+v, want Alice then Bob", page1)
+	// Newest first: the artist just added is what somebody opening the list
+	// most likely came for.
+	if len(page1) != 2 || page1[0].Name != "Bob" || page1[1].Name != "Alice" {
+		t.Fatalf("page 1 = %+v, want Bob then Alice", page1)
+	}
+	if page1[0].SubscribedAt.Before(page1[1].SubscribedAt) {
+		t.Fatalf("page 1 is not in descending subscription order: %+v", page1)
+	}
+	if page1[0].SubscribedAt.IsZero() {
+		t.Fatal("SubscribedAt was not returned")
 	}
 
 	page2, _, err := subs.List(ctx, testChatID, 2, 2)
