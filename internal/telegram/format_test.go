@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -76,8 +77,11 @@ func TestFormatReleaseWithoutURL(t *testing.T) {
 		Title:       "Selected Ambient Works",
 		PrimaryType: "EP",
 	})
-	if strings.Contains(out, "<a href") {
-		t.Fatalf("link rendered without an URL:\n%s", out)
+	// The title must not be a link without an URL to point at. The listen row
+	// below it legitimately is one, so this checks the title's own line.
+	title := strings.Split(out, nlChar)[2]
+	if strings.Contains(title, "<a href") {
+		t.Fatalf("the title was linked without an URL:\n%s", out)
 	}
 	if !strings.Contains(out, "EP") {
 		t.Fatalf("release type missing:\n%s", out)
@@ -102,40 +106,95 @@ func TestParseChatID(t *testing.T) {
 	}
 }
 
-// The notification used to link only to MusicBrainz, a metadata site. Somebody
-// just told their artist released an album wants to press play.
-func TestNotificationCarriesListenLinks(t *testing.T) {
+// A link to the release itself does not exist — MusicBrainz carries streaming
+// links for artists only (C46) — so the row links to a search for the release
+// on each platform. When the release is there the search lands on it; when it
+// is not, the empty result answers the question that three artist-page links
+// left open.
+func TestListenRowSearchesForTheRelease(t *testing.T) {
 	got := formatRelease(notify.Release{
-		ArtistName: "Drake", Title: "For All The Dogs", PrimaryType: "Album",
-		ReleaseDate: time.Date(2026, 9, 9, 0, 0, 0, 0, time.UTC),
+		ArtistName: "Ariana Grande", Title: "eternal sunshine", PrimaryType: "Album",
 		Links: notify.ArtistLinks{
-			Spotify:    "https://open.spotify.com/artist/3TVXtAsR1Inumwj472S9r4",
-			YouTube:    "https://www.youtube.com/channel/UCByOQJjav0CUDwxCk-jVNRQ",
-			AppleMusic: "https://music.apple.com/ca/artist/271256",
+			Spotify:    "https://open.spotify.com/artist/66CXWjxzNUsdJxJ2JdwvnR",
+			YouTube:    "https://www.youtube.com/channel/UC0VOyT2OCBKdQhF3BAbZ-1g",
+			AppleMusic: "https://music.apple.com/us/artist/412778295",
 		},
 	})
 
-	for _, want := range []string{"Spotify", "YouTube", "Apple Music", "open.spotify.com"} {
+	// The release title has to be in every query, or the link is no better
+	// than the artist page it replaced.
+	for _, want := range []string{
+		"open.spotify.com/search/",
+		"youtube.com/results?search_query=",
+		"music.apple.com/search?term=",
+	} {
 		if !strings.Contains(got, want) {
-			t.Errorf("message is missing %q:\n%s", want, got)
+			t.Errorf("missing %q:\n%s", want, got)
 		}
 	}
+	if strings.Contains(got, "open.spotify.com/artist/") {
+		t.Errorf("still linking to the artist page:\n%s", got)
+	}
+	if !strings.Contains(got, "eternal") {
+		t.Errorf("the release title is not in the search query:\n%s", got)
+	}
 	// Spotify first: this project exists because Spotify does not reliably
-	// tell you about releases, so that is where most readers will go.
+	// tell you about releases.
 	if strings.Index(got, "Spotify") > strings.Index(got, "YouTube") {
 		t.Errorf("YouTube came before Spotify:\n%s", got)
 	}
 }
 
-// An artist subscribed to before link lookups existed has none, and some
-// artists simply have none. That is normal operation, not an edge case.
-func TestNotificationWithoutLinksHasNoEmptyRow(t *testing.T) {
+// Most of the feed is obscure artists. Offering an Apple Music search for an
+// artist MusicBrainz says has no Apple presence is the same dead end this
+// change removes.
+func TestOnlyPlatformsTheArtistIsKnownOnAreOffered(t *testing.T) {
 	got := formatRelease(notify.Release{
-		ArtistName: "あいみょん", Title: "Sleepy", PrimaryType: "Single",
+		ArtistName: "LATERNO", Title: "Briefly",
+		Links: notify.ArtistLinks{Spotify: "https://open.spotify.com/artist/X"},
 	})
 
+	if !strings.Contains(got, "Spotify") {
+		t.Fatalf("Spotify missing:\n%s", got)
+	}
+	if strings.Contains(got, "YouTube") || strings.Contains(got, "Apple") {
+		t.Fatalf("a platform the artist is not known on was offered:\n%s", got)
+	}
+}
+
+// Absent data is not evidence of absence: MusicBrainz coverage is patchy, so
+// knowing nothing about an artist must not mean offering nothing.
+func TestAllPlatformsWhenNothingIsKnown(t *testing.T) {
+	got := formatRelease(notify.Release{ArtistName: "Soft Vein", Title: "All We Have Known"})
+
+	for _, want := range []string{"Spotify", "YouTube", "Apple Music"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q for an artist with no known links:\n%s", want, got)
+		}
+	}
+}
+
+// An unbounded title must not become an unbounded URL, three times over.
+func TestSearchQueryIsBounded(t *testing.T) {
+	got := searchQuery("Artist", strings.Repeat("а", 5000))
+
+	if n := len([]rune(got)); n > maxQueryRunes {
+		t.Fatalf("query is %d runes, want at most %d", n, maxQueryRunes)
+	}
+	// No ellipsis: it is a character the search would try to match.
+	if strings.Contains(got, "…") {
+		t.Fatalf("the query carries an ellipsis: %q", got)
+	}
+}
+
+// A release with no title has nothing to search for, which is the only case
+// where the row is genuinely empty. An artist with no *known* links is not
+// that case — see TestAllPlatformsWhenNothingIsKnown.
+func TestNoTitleMeansNoListenRow(t *testing.T) {
+	got := formatRelease(notify.Release{PrimaryType: "Single"})
+
 	if strings.Contains(got, "▶") {
-		t.Fatalf("an empty listen row was rendered:\n%s", got)
+		t.Fatalf("a listen row was rendered with nothing to search for:\n%s", got)
 	}
 }
 
@@ -162,8 +221,12 @@ func TestAbsurdlyLongTitleIsTrimmed(t *testing.T) {
 		ArtistName: "X", Title: strings.Repeat("а", 5000), PrimaryType: "Album",
 	})
 
-	if len([]rune(got)) > 1024 {
-		t.Fatalf("message is %d runes, over the photo caption limit", len([]rune(got)))
+	// Telegram counts a caption after entity parsing, so URLs inside href
+	// attributes do not count — the earlier version of this test measured the
+	// raw HTML and only passed by accident, before three search URLs were
+	// added to it.
+	if n := len([]rune(visibleText(got))); n > 1024 {
+		t.Fatalf("caption text is %d characters, over the 1024 limit:\n%s", n, got)
 	}
 	if !strings.Contains(got, "…") {
 		t.Fatal("the title was cut without saying so")
@@ -203,18 +266,22 @@ func TestInstagramHandleIsInTheHeader(t *testing.T) {
 	}
 }
 
-// Instagram alone must not produce a "listen" row: there is nothing to play.
-func TestInstagramAloneIsNotAListenRow(t *testing.T) {
+// Knowing only the artist's Instagram says nothing about their streaming
+// presence, so all three searches are still offered — and the handle still
+// belongs in the header.
+func TestInstagramAloneStillOffersSearches(t *testing.T) {
 	got := formatRelease(notify.Release{
 		ArtistName: "X", Title: "Y",
 		Links: notify.ArtistLinks{Instagram: "https://www.instagram.com/x/"},
 	})
 
-	if strings.Contains(got, "▶") {
-		t.Fatalf("a listen row was rendered with nowhere to listen:\n%s", got)
-	}
 	if !strings.Contains(got, "@x") {
 		t.Fatalf("the handle is missing:\n%s", got)
+	}
+	for _, want := range []string{"Spotify", "YouTube", "Apple Music"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q:\n%s", want, got)
+		}
 	}
 }
 
@@ -228,4 +295,14 @@ func TestNonProfileInstagramURLRendersNothing(t *testing.T) {
 	if strings.Contains(got, "@") {
 		t.Fatalf("a post URL was rendered as a handle:\n%s", got)
 	}
+}
+
+// nlChar is a newline, named so a test can split on it without embedding one
+// in a format string.
+const nlChar = "\n"
+
+// visibleText strips HTML tags, leaving what Telegram counts against the
+// caption and message limits.
+func visibleText(html string) string {
+	return regexp.MustCompile(`<[^>]*>`).ReplaceAllString(html, "")
 }

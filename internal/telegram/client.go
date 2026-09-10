@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"html"
 	"log/slog"
+	"net/url"
 	"strings"
 	"time"
 
@@ -262,7 +263,7 @@ func formatRelease(rel notify.Release) string {
 		b.WriteString(rel.ReleaseDate.Format("02.01.2006"))
 	}
 
-	if listen := listenRow(rel.Links); listen != "" {
+	if listen := listenRow(rel); listen != "" {
 		b.WriteString("\n\n")
 		b.WriteString(listen)
 	}
@@ -271,34 +272,88 @@ func formatRelease(rel notify.Release) string {
 
 // listenRow is the "go press play" line.
 //
-// It exists because the only link in a notification used to be MusicBrainz,
-// which is a metadata site. Somebody who has just been told their artist
-// released an album wants to listen, not to read a database entry.
+// It links to a *search* for the release on each platform, not to the release
+// itself, because a link to the release does not exist. MusicBrainz carries
+// streaming links for artists only: a canonical 2014 album's release group has
+// thirteen relations — allmusic, discogs, genius, last.fm, rateyourmusic,
+// wikidata — and zero streaming ones, and ten random fresh release groups from
+// the feed had none either (SPEC C46). Spotify's own API could answer this and
+// is ruled out for the same reasons it is not the release source (D2).
 //
-// The URLs point at each service's own web player and were read from
-// MusicBrainz, which is CC0. Nothing here comes from Spotify's API, so the
-// restriction that ruled Spotify out as a data source — ToS §III.9, forwarding
-// Spotify content to another service — does not apply to a hyperlink.
-func listenRow(l notify.ArtistLinks) string {
-	if !l.Listenable() {
-		// Normal, not exceptional: an artist subscribed to before link lookups
-		// existed has none, and some artists genuinely have none.
+// A search link is honest in a way an artist link is not. When the release is
+// on the platform it lands on it; when it is not, the empty result says so —
+// which is exactly the question that went unanswered when a Brazil-only
+// compilation arrived with three links to artist pages (C48).
+func listenRow(rel notify.Release) string {
+	query := searchQuery(rel.ArtistName, rel.Title)
+	if query == "" {
 		return ""
 	}
 
+	// Which platforms to offer. Where MusicBrainz says the artist is present,
+	// only those; where it says nothing at all, all three.
+	//
+	// The gate matters because most of this feed is obscure artists — sending
+	// somebody to Apple Music search for an artist with no Apple presence is
+	// the same dead end this change is meant to remove. But absent data is not
+	// evidence of absence, and MusicBrainz's coverage is patchy, so "we know
+	// nothing about this artist" must not mean "we offer nothing".
+	l := rel.Links
+	showAll := !l.Listenable()
+
 	var parts []string
-	// Spotify first. This project exists because Spotify does not reliably
-	// tell you about releases, so that is where most readers will want to go.
-	if l.Spotify != "" {
-		parts = append(parts, link(l.Spotify, "Spotify"))
+	// Spotify first: this project exists because Spotify does not reliably tell
+	// you about releases, so that is where most readers will want to go.
+	if showAll || l.Spotify != "" {
+		parts = append(parts, link(spotifySearchURL(query), "Spotify"))
 	}
-	if l.YouTube != "" {
-		parts = append(parts, link(l.YouTube, "YouTube"))
+	if showAll || l.YouTube != "" {
+		parts = append(parts, link(youTubeSearchURL(query), "YouTube"))
 	}
-	if l.AppleMusic != "" {
-		parts = append(parts, link(l.AppleMusic, "Apple Music"))
+	if showAll || l.AppleMusic != "" {
+		parts = append(parts, link(appleMusicSearchURL(query), "Apple Music"))
+	}
+	if len(parts) == 0 {
+		return ""
 	}
 	return "▶️ " + strings.Join(parts, " · ")
+}
+
+// maxQueryRunes bounds the search query. Release titles are unbounded
+// upstream, and a 5000-character title would otherwise become a 15 KB URL in
+// three places. No search engine reads that far anyway.
+const maxQueryRunes = 120
+
+// searchQuery builds "artist title", cut to a length a search box can use.
+//
+// Cut without an ellipsis, unlike the displayed title: "…" is a character the
+// search would try to match.
+func searchQuery(artist, title string) string {
+	query := strings.TrimSpace(artist + " " + title)
+	runes := []rune(query)
+	if len(runes) > maxQueryRunes {
+		query = strings.TrimSpace(string(runes[:maxQueryRunes]))
+	}
+	return query
+}
+
+// Search entry points on each platform's own site. Plain URLs, no API: nothing
+// here comes from Spotify's API, so the restriction that ruled it out as a
+// data source (ToS §III.9, forwarding Spotify content) does not apply.
+func spotifySearchURL(query string) string {
+	// Path segment, not a query parameter — that is the shape of Spotify's
+	// search route, and it opens the app rather than the web player on mobile.
+	return "https://open.spotify.com/search/" + url.PathEscape(query)
+}
+
+func youTubeSearchURL(query string) string {
+	return "https://www.youtube.com/results?search_query=" + url.QueryEscape(query)
+}
+
+func appleMusicSearchURL(query string) string {
+	// Apple answers this with a 301 to the viewer's regional store, which is
+	// the correct destination and not something to hardcode.
+	return "https://music.apple.com/search?term=" + url.QueryEscape(query)
 }
 
 func link(href, label string) string {
