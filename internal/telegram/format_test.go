@@ -108,7 +108,7 @@ func TestNotificationCarriesListenLinks(t *testing.T) {
 	got := formatRelease(notify.Release{
 		ArtistName: "Drake", Title: "For All The Dogs", PrimaryType: "Album",
 		ReleaseDate: time.Date(2026, 9, 9, 0, 0, 0, 0, time.UTC),
-		Listen: notify.ListenLinks{
+		Links: notify.ArtistLinks{
 			Spotify:    "https://open.spotify.com/artist/3TVXtAsR1Inumwj472S9r4",
 			YouTube:    "https://www.youtube.com/channel/UCByOQJjav0CUDwxCk-jVNRQ",
 			AppleMusic: "https://music.apple.com/ca/artist/271256",
@@ -143,7 +143,7 @@ func TestNotificationWithoutLinksHasNoEmptyRow(t *testing.T) {
 func TestOnlyKnownLinksAreRendered(t *testing.T) {
 	got := formatRelease(notify.Release{
 		ArtistName: "X", Title: "Y",
-		Listen: notify.ListenLinks{YouTube: "https://www.youtube.com/channel/Z"},
+		Links: notify.ArtistLinks{YouTube: "https://www.youtube.com/channel/Z"},
 	})
 
 	if !strings.Contains(got, "YouTube") {
@@ -179,5 +179,53 @@ func TestTrimCountsRunesNotBytes(t *testing.T) {
 
 	if !strings.Contains(got, title) {
 		t.Fatalf("a 100-rune title was trimmed as if it were 300 characters:\n%s", got)
+	}
+}
+
+// The handle goes in the header rather than with the streaming links, because
+// it answers a different question: those are "where do I play this", this is
+// "who is this".
+func TestInstagramHandleIsInTheHeader(t *testing.T) {
+	got := formatRelease(notify.Release{
+		ArtistName: "あいみょん", Title: "Sleepy", PrimaryType: "Single",
+		Links: notify.ArtistLinks{
+			Instagram: "https://www.instagram.com/aimyon36/",
+			Spotify:   "https://open.spotify.com/artist/X",
+		},
+	})
+
+	header := strings.SplitN(got, "\n", 2)[0]
+	if !strings.Contains(header, "@aimyon36") {
+		t.Fatalf("header = %q, want the handle", header)
+	}
+	if !strings.Contains(header, "instagram.com/aimyon36") {
+		t.Fatalf("the handle is not a link: %q", header)
+	}
+}
+
+// Instagram alone must not produce a "listen" row: there is nothing to play.
+func TestInstagramAloneIsNotAListenRow(t *testing.T) {
+	got := formatRelease(notify.Release{
+		ArtistName: "X", Title: "Y",
+		Links: notify.ArtistLinks{Instagram: "https://www.instagram.com/x/"},
+	})
+
+	if strings.Contains(got, "▶") {
+		t.Fatalf("a listen row was rendered with nowhere to listen:\n%s", got)
+	}
+	if !strings.Contains(got, "@x") {
+		t.Fatalf("the handle is missing:\n%s", got)
+	}
+}
+
+// A URL that is not a profile must render nothing rather than "@".
+func TestNonProfileInstagramURLRendersNothing(t *testing.T) {
+	got := formatRelease(notify.Release{
+		ArtistName: "X", Title: "Y",
+		Links: notify.ArtistLinks{Instagram: "https://www.instagram.com/p/Cabcdef/"},
+	})
+
+	if strings.Contains(got, "@") {
+		t.Fatalf("a post URL was rendered as a handle:\n%s", got)
 	}
 }

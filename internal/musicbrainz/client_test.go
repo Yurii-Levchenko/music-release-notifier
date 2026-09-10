@@ -410,7 +410,7 @@ func TestEndedRelationsAreSkipped(t *testing.T) {
 		rel("purchase for download", "https://itunes.apple.com/us/artist/id21769", true),
 		rel("youtube", "https://www.youtube.com/channel/DEAD", true),
 		rel("youtube", "https://www.youtube.com/channel/LIVE", false),
-	})
+	}, "Test Artist")
 
 	if got.YouTube != "https://www.youtube.com/channel/LIVE" {
 		t.Fatalf("YouTube = %q, want the live channel", got.YouTube)
@@ -427,7 +427,7 @@ func TestSpotifyIsMatchedByHostNotByRelationType(t *testing.T) {
 		rel("free streaming", "https://www.deezer.com/artist/246791", false),
 		rel("free streaming", "http://www.pandora.com/drake", false),
 		rel("free streaming", "https://open.spotify.com/artist/3TVXtAsR1Inumwj472S9r4", false),
-	})
+	}, "Test Artist")
 
 	if got.Spotify != "https://open.spotify.com/artist/3TVXtAsR1Inumwj472S9r4" {
 		t.Fatalf("Spotify = %q", got.Spotify)
@@ -440,7 +440,7 @@ func TestAppleMusicIsMatchedByHost(t *testing.T) {
 		rel("streaming", "https://tidal.com/artist/8914", false),
 		rel("streaming", "https://music.amazon.com/artists/B001Q5D8PW", false),
 		rel("streaming", "https://music.apple.com/us/artist/21769", false),
-	})
+	}, "Test Artist")
 
 	if got.AppleMusic != "https://music.apple.com/us/artist/21769" {
 		t.Fatalf("AppleMusic = %q", got.AppleMusic)
@@ -453,7 +453,7 @@ func TestFirstLiveMatchWins(t *testing.T) {
 	got := pickLinks([]linkRelation{
 		rel("youtube", "https://www.youtube.com/channel/FIRST", false),
 		rel("youtube", "https://www.youtube.com/channel/SECOND", false),
-	})
+	}, "Test Artist")
 
 	if got.YouTube != "https://www.youtube.com/channel/FIRST" {
 		t.Fatalf("YouTube = %q, want the first", got.YouTube)
@@ -467,7 +467,7 @@ func TestNoUsableLinksIsEmpty(t *testing.T) {
 		rel("discogs", "https://www.discogs.com/artist/151199", false),
 		rel("wikidata", "https://www.wikidata.org/wiki/Q33240", false),
 		rel("VIAF", "http://viaf.org/viaf/106753132", false),
-	})
+	}, "Test Artist")
 
 	if !got.Empty() {
 		t.Fatalf("links = %+v, want empty", got)
@@ -483,5 +483,77 @@ func TestArtistLinksRejectsANonMBID(t *testing.T) {
 	// Would otherwise be pasted straight into the request path.
 	if _, err := c.ArtistLinks(context.Background(), "../release-group?query=x"); err == nil {
 		t.Fatal("a non-mbid reached the request path")
+	}
+}
+
+// The case that makes "first match wins" wrong. Kendrick Lamar has two live
+// `social network` relations — instagram.com/jojoruski and
+// instagram.com/kendricklamar — and nothing in the API separates them: same
+// type, neither ended, no attributes, no begin dates. Taking the first would
+// put a stranger's handle in his release notifications.
+func TestInstagramPrefersTheHandleMatchingTheArtist(t *testing.T) {
+	got := pickLinks([]linkRelation{
+		rel("social network", "https://twitter.com/kendricklamar", false),
+		rel("social network", "https://www.instagram.com/jojoruski/", false),
+		rel("social network", "https://www.instagram.com/kendricklamar/", false),
+	}, "Kendrick Lamar")
+
+	if got.Instagram != "https://www.instagram.com/kendricklamar/" {
+		t.Fatalf("Instagram = %q, want the account matching the artist", got.Instagram)
+	}
+}
+
+// When nothing matches, the first is the best available guess rather than a
+// correct answer: Drake's account is @champagnepapi.
+func TestInstagramFallsBackToTheOnlyCandidate(t *testing.T) {
+	got := pickLinks([]linkRelation{
+		rel("social network", "https://www.instagram.com/champagnepapi/", false),
+	}, "Drake")
+
+	if got.Instagram != "https://www.instagram.com/champagnepapi/" {
+		t.Fatalf("Instagram = %q", got.Instagram)
+	}
+}
+
+// A handle in a different script from the name cannot match, and must not be
+// discarded for it.
+func TestInstagramSurvivesANameInAnotherScript(t *testing.T) {
+	got := pickLinks([]linkRelation{
+		rel("social network", "https://www.instagram.com/aimyon36/", false),
+	}, "あいみょん")
+
+	if got.Instagram != "https://www.instagram.com/aimyon36/" {
+		t.Fatalf("Instagram = %q", got.Instagram)
+	}
+}
+
+// An ended account must not be chosen even when it is the one whose handle
+// matches — a dead link with the right name is still a dead link.
+func TestEndedInstagramIsSkippedEvenWhenItMatches(t *testing.T) {
+	got := pickLinks([]linkRelation{
+		rel("social network", "https://www.instagram.com/kendricklamar/", true),
+		rel("social network", "https://www.instagram.com/jojoruski/", false),
+	}, "Kendrick Lamar")
+
+	if got.Instagram != "https://www.instagram.com/jojoruski/" {
+		t.Fatalf("Instagram = %q, want the live account", got.Instagram)
+	}
+}
+
+func TestInstagramHandleExtraction(t *testing.T) {
+	cases := map[string]string{
+		"https://www.instagram.com/champagnepapi/":   "champagnepapi",
+		"https://instagram.com/aimyon36":             "aimyon36",
+		"https://www.instagram.com/snoopdogg/?hl=en": "snoopdogg",
+		"https://www.instagram.com/p/Cabcdef123/":    "", // a post, not an account
+		"https://www.instagram.com/x/reel/1/":        "", // deeper still
+		"https://www.instagram.com/":                 "",
+		"https://twitter.com/drake":                  "",
+		"":                                           "",
+	}
+	for in, want := range cases {
+		if got := InstagramHandle(in); got != want {
+			t.Errorf("InstagramHandle(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

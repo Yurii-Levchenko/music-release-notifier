@@ -14,6 +14,7 @@ import (
 	"github.com/mymmrac/telego"
 
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/metrics"
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/musicbrainz"
 
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/notify"
 )
@@ -230,7 +231,17 @@ func formatRelease(rel notify.Release) string {
 	var b strings.Builder
 	b.WriteString("🎵 <b>")
 	b.WriteString(html.EscapeString(rel.ArtistName))
-	b.WriteString("</b> — новий реліз\n\n")
+	b.WriteString("</b> — новий реліз")
+
+	// The Instagram handle goes in the header rather than with the streaming
+	// links, because it answers a different question: those are "where do I
+	// play this", this is "who is this".
+	if handle := musicbrainz.InstagramHandle(rel.Links.Instagram); handle != "" {
+		b.WriteString(" ")
+		b.WriteString(link(rel.Links.Instagram, "@"+handle))
+	}
+
+	b.WriteString("\n\n")
 
 	if rel.InfoURL != "" {
 		b.WriteString(`<a href="`)
@@ -251,7 +262,7 @@ func formatRelease(rel notify.Release) string {
 		b.WriteString(rel.ReleaseDate.Format("02.01.2006"))
 	}
 
-	if listen := listenRow(rel.Listen); listen != "" {
+	if listen := listenRow(rel.Links); listen != "" {
 		b.WriteString("\n\n")
 		b.WriteString(listen)
 	}
@@ -268,8 +279,8 @@ func formatRelease(rel notify.Release) string {
 // MusicBrainz, which is CC0. Nothing here comes from Spotify's API, so the
 // restriction that ruled Spotify out as a data source — ToS §III.9, forwarding
 // Spotify content to another service — does not apply to a hyperlink.
-func listenRow(l notify.ListenLinks) string {
-	if !l.Any() {
+func listenRow(l notify.ArtistLinks) string {
+	if !l.Listenable() {
 		// Normal, not exceptional: an artist subscribed to before link lookups
 		// existed has none, and some artists genuinely have none.
 		return ""

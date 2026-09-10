@@ -433,9 +433,13 @@ type fakeBackfill struct {
 
 	listErr   error
 	lookupErr error
+
+	askedVersion  int
+	storedVersion int
 }
 
-func (f *fakeBackfill) ArtistsMissingLinks(_ context.Context, limit int) ([]string, error) {
+func (f *fakeBackfill) ArtistsMissingLinks(_ context.Context, limit, version int) ([]string, error) {
+	f.askedVersion = version
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
@@ -453,7 +457,8 @@ func (f *fakeBackfill) ArtistLinks(_ context.Context, mbid string) (musicbrainz.
 	return f.links[mbid], nil
 }
 
-func (f *fakeBackfill) SetArtistLinks(_ context.Context, mbid string, l storage.ArtistLinks) error {
+func (f *fakeBackfill) SetArtistLinks(_ context.Context, mbid string, l storage.ArtistLinks, version int) error {
+	f.storedVersion = version
 	if f.stored == nil {
 		f.stored = map[string]storage.ArtistLinks{}
 	}
@@ -468,7 +473,12 @@ func TestBackfillFillsArtistsThatNeverHadALookup(t *testing.T) {
 	b := &fakeBackfill{
 		pending: []string{"mbid-a", "mbid-b"},
 		links: map[string]musicbrainz.Links{
-			"mbid-a": {Spotify: "https://open.spotify.com/artist/A"},
+			"mbid-a": {
+				Spotify:    "https://open.spotify.com/artist/A",
+				YouTube:    "https://youtube.com/channel/A",
+				AppleMusic: "https://music.apple.com/us/artist/1",
+				Instagram:  "https://www.instagram.com/a/",
+			},
 			"mbid-b": {YouTube: "https://youtube.com/channel/B"},
 		},
 	}
@@ -479,8 +489,20 @@ func TestBackfillFillsArtistsThatNeverHadALookup(t *testing.T) {
 	if len(b.stored) != 2 {
 		t.Fatalf("stored %d, want 2", len(b.stored))
 	}
-	if b.stored["mbid-a"].Spotify != "https://open.spotify.com/artist/A" {
-		t.Errorf("mbid-a = %+v", b.stored["mbid-a"])
+
+	// Every field, not just one. Asserting only Spotify let a missing
+	// Instagram field ship: the mapping to storage.ArtistLinks is written out
+	// by hand, so a new link kind is exactly the thing that gets forgotten in
+	// one of the two call sites.
+	got := b.stored["mbid-a"]
+	want := storage.ArtistLinks{
+		Spotify:    "https://open.spotify.com/artist/A",
+		YouTube:    "https://youtube.com/channel/A",
+		AppleMusic: "https://music.apple.com/us/artist/1",
+		Instagram:  "https://www.instagram.com/a/",
+	}
+	if got != want {
+		t.Errorf("stored = %+v, want %+v", got, want)
 	}
 }
 
@@ -561,4 +583,25 @@ func TestBackfillStopsOnCancellation(t *testing.T) {
 // neither, and supplying fakes for them would only obscure what is under test.
 func bareTestPoller() *Poller {
 	return New(nil, nil, time.Hour, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+// A row must be stamped with the version it was resolved against, or the
+// backfill cannot tell "resolved against an older set of link kinds" from
+// "resolved, and has none" — and one of those has to be re-resolved while the
+// other must never be.
+func TestBackfillStampsTheLinksVersion(t *testing.T) {
+	b := &fakeBackfill{
+		pending: []string{"mbid-a"},
+		links:   map[string]musicbrainz.Links{"mbid-a": {Spotify: "https://open.spotify.com/artist/A"}},
+	}
+	p := bareTestPoller().WithLinkBackfill(b)
+
+	p.backfillLinks(context.Background())
+
+	if b.askedVersion != musicbrainz.LinksVersion {
+		t.Errorf("asked for version %d, want %d", b.askedVersion, musicbrainz.LinksVersion)
+	}
+	if b.storedVersion != musicbrainz.LinksVersion {
+		t.Errorf("stored version %d, want %d", b.storedVersion, musicbrainz.LinksVersion)
+	}
 }

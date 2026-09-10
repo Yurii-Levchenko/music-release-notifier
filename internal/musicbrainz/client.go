@@ -28,8 +28,34 @@ const (
 	defaultBaseURL = "https://musicbrainz.org/ws/2"
 
 	// MusicBrainz allows one request per second per IP and returns 503 when you
-	// exceed it (SPEC.md C25). 1.0 with a burst of 1 keeps us just inside.
-	requestsPerSecond = 1.0
+	// exceed it (SPEC.md C25).
+	//
+	// One request every 1.1 seconds rather than exactly one per second. "Just
+	// inside" turned out to mean "on the boundary": their limiter counts a
+	// window, so a burst pinned to exactly 1/s lands two requests inside one
+	// of their seconds often enough to matter. Measured 10.09.2026 — four
+	// lookups spaced 1.5 s still collected 503s, and the app's own backfill
+	// spent three minutes on work worth thirty seconds.
+	//
+	// The 10% costs nothing: nothing here is interactive except search, and a
+	// search waits on one request, not on the interval.
+	requestInterval = 1100 * time.Millisecond
+
+	// searchAttemptTimeout bounds one interactive request. A human is watching
+	// a "Шукаю…" placeholder, and there is a stale-cache fallback behind this.
+	searchAttemptTimeout = 20 * time.Second
+
+	// lookupAttemptTimeout bounds one background request, and is deliberately
+	// far larger.
+	//
+	// The artist lookup with `inc=url-rels` is expensive on their side: TTFB
+	// was measured at 8.7 s for a cold one, against 0.13 s once warm, and
+	// identical from the host and from inside Docker — so it is their compute,
+	// not our network. Against a 20 s budget that produced
+	// "Client.Timeout exceeded while awaiting headers", five retries, and a
+	// lookup that eventually succeeded anyway. Nobody is waiting on this, so
+	// waiting is cheaper than retrying.
+	lookupAttemptTimeout = 60 * time.Second
 
 	// 503 is returned for rate limiting, for a missing User-Agent, and for
 	// genuine server load — all with the same generic "server is currently
@@ -100,10 +126,14 @@ func New(userAgent string, log *slog.Logger) (*Client, error) {
 		return nil, fmt.Errorf("%w (got %q)", ErrNoUserAgent, userAgent)
 	}
 	return &Client{
-		httpClient: &http.Client{Timeout: 20 * time.Second},
+		// No Timeout on the client: it would cap every call at one value, and
+		// an interactive search and a background lookup want very different
+		// budgets. The deadline is applied per attempt instead, so a retry
+		// gets a full budget rather than the remains of a shared one.
+		httpClient: &http.Client{},
 		baseURL:    defaultBaseURL,
 		userAgent:  ua,
-		limiter:    rate.NewLimiter(rate.Limit(requestsPerSecond), 1),
+		limiter:    rate.NewLimiter(rate.Every(requestInterval), 1),
 		log:        log,
 		metrics:    metrics.Nop(),
 	}, nil
@@ -150,7 +180,7 @@ func (c *Client) SearchArtist(ctx context.Context, query string, limit int) ([]A
 	q.Set("limit", fmt.Sprint(limit))
 	endpoint := c.baseURL + "/artist?" + q.Encode()
 
-	body, err := c.get(ctx, endpoint)
+	body, err := c.get(ctx, endpoint, searchAttemptTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -181,7 +211,7 @@ func (c *Client) SearchArtist(ctx context.Context, query string, limit int) ([]A
 }
 
 // get performs one rate-limited request, retrying 503 and 5xx with backoff.
-func (c *Client) get(ctx context.Context, endpoint string) ([]byte, error) {
+func (c *Client) get(ctx context.Context, endpoint string, attemptTimeout time.Duration) ([]byte, error) {
 	var lastErr error
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -190,7 +220,7 @@ func (c *Client) get(ctx context.Context, endpoint string) ([]byte, error) {
 			return nil, fmt.Errorf("musicbrainz: wait for rate limiter: %w", err)
 		}
 
-		body, retryable, err := c.doOnce(ctx, endpoint)
+		body, retryable, err := c.doOnce(ctx, endpoint, attemptTimeout)
 		if err == nil {
 			return body, nil
 		}
@@ -233,7 +263,13 @@ func jitter(d time.Duration) time.Duration {
 }
 
 // doOnce reports whether the failure is worth retrying.
-func (c *Client) doOnce(ctx context.Context, endpoint string) (body []byte, retryable bool, err error) {
+func (c *Client) doOnce(ctx context.Context, endpoint string, timeout time.Duration) (body []byte, retryable bool, err error) {
+	// Per attempt, so a retry after a stall gets its own full budget. A
+	// deadline on the whole call would give the last attempt whatever the
+	// earlier ones left, which is the opposite of what a retry is for.
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
 	if err != nil {
 		return nil, false, fmt.Errorf("musicbrainz: build request: %w", err)
@@ -443,6 +479,14 @@ func (c *Client) WithMetrics(m *metrics.Metrics) *Client {
 	return c
 }
 
+// LinksVersion identifies the set of link kinds pickLinks collects.
+//
+// Bump it when a kind is added or removed. The backfill re-resolves anything
+// stored against an older version, which is what makes adding a kind a
+// one-line change rather than a data migration — and what stops a new field
+// from only ever appearing for artists subscribed to afterwards.
+const LinksVersion = 1
+
 // Links are the external destinations worth putting in a notification.
 //
 // Curated hard on purpose. A lookup returns everything MusicBrainz knows —
@@ -453,11 +497,14 @@ type Links struct {
 	Spotify    string `json:"spotify,omitempty"`
 	YouTube    string `json:"youtube,omitempty"`
 	AppleMusic string `json:"apple_music,omitempty"`
+	// Instagram is stored as the full URL rather than the handle, so there is
+	// one source of truth; the handle is derived for display.
+	Instagram string `json:"instagram,omitempty"`
 }
 
 // Empty reports whether nothing usable was found.
 func (l Links) Empty() bool {
-	return l.Spotify == "" && l.YouTube == "" && l.AppleMusic == ""
+	return l.Spotify == "" && l.YouTube == "" && l.AppleMusic == "" && l.Instagram == ""
 }
 
 // ArtistLinks looks up one artist's external URLs.
@@ -473,19 +520,22 @@ func (c *Client) ArtistLinks(ctx context.Context, mbid string) (Links, error) {
 		return Links{}, fmt.Errorf("musicbrainz: %q is not an mbid", mbid)
 	}
 
-	body, err := c.get(ctx, c.baseURL+"/artist/"+mbid+"?inc=url-rels&fmt=json")
+	body, err := c.get(ctx, c.baseURL+"/artist/"+mbid+"?inc=url-rels&fmt=json", lookupAttemptTimeout)
 	if err != nil {
 		return Links{}, err
 	}
 
 	var payload struct {
+		// The name comes from the same response, so choosing between several
+		// Instagram accounts needs no extra parameter from the caller.
+		Name      string         `json:"name"`
 		Relations []linkRelation `json:"relations"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return Links{}, fmt.Errorf("musicbrainz: decode artist links: %w", err)
 	}
 
-	return pickLinks(payload.Relations), nil
+	return pickLinks(payload.Relations, payload.Name), nil
 }
 
 // linkRelation is one url-rel, named rather than anonymous so the selection
@@ -514,8 +564,9 @@ type linkRelation struct {
 // Matching is on host as well as relation type, because "free streaming"
 // covers Spotify, Deezer and Pandora alike, and "streaming" covers Apple,
 // Tidal, Amazon and Qobuz.
-func pickLinks(relations []linkRelation) Links {
+func pickLinks(relations []linkRelation, artistName string) Links {
 	var l Links
+	var instagram []string
 
 	for _, r := range relations {
 		if r.Ended {
@@ -530,9 +581,87 @@ func pickLinks(relations []linkRelation) Links {
 			l.YouTube = resource
 		case l.AppleMusic == "" && strings.Contains(resource, "music.apple.com/"):
 			l.AppleMusic = resource
+		case strings.Contains(resource, "instagram.com/"):
+			// Collected rather than taken, because an artist can have several
+			// and the first is not necessarily theirs. See pickInstagram.
+			instagram = append(instagram, resource)
 		}
 	}
+
+	l.Instagram = pickInstagram(instagram, artistName)
 	return l
+}
+
+// pickInstagram chooses between several Instagram accounts on one artist.
+//
+// "First match wins" is wrong here, and provably so: Kendrick Lamar has two
+// live `social network` relations, instagram.com/jojoruski and
+// instagram.com/kendricklamar, and nothing in the API separates them — same
+// type, neither ended, no attributes, no begin dates. Taking the first would
+// have put a stranger's handle in his release notifications.
+//
+// So the only available signal is the handle itself: prefer one that matches
+// the artist's name once both are reduced to letters and digits. When nothing
+// matches — Drake's account is @champagnepapi, and あいみょん's handle is not
+// even in the same script as her name — the first is used, which is the best
+// available guess rather than a correct answer.
+func pickInstagram(candidates []string, artistName string) string {
+	if len(candidates) == 0 {
+		return ""
+	}
+
+	want := normalizeHandle(artistName)
+	if want != "" {
+		for _, url := range candidates {
+			handle := normalizeHandle(InstagramHandle(url))
+			if handle == "" {
+				continue
+			}
+			if handle == want || strings.Contains(handle, want) || strings.Contains(want, handle) {
+				return url
+			}
+		}
+	}
+	return candidates[0]
+}
+
+// InstagramHandle extracts the account name from an Instagram profile URL.
+// Returns "" for anything that is not a plain profile link.
+func InstagramHandle(rawURL string) string {
+	const marker = "instagram.com/"
+	i := strings.Index(rawURL, marker)
+	if i < 0 {
+		return ""
+	}
+
+	handle := rawURL[i+len(marker):]
+
+	// Query and fragment first, then slashes. The other order rejects
+	// ".../snoopdogg/?hl=en" as a multi-segment path, which it is not — caught
+	// by its own test.
+	if cut := strings.IndexAny(handle, "?#"); cut >= 0 {
+		handle = handle[:cut]
+	}
+	handle = strings.Trim(handle, "/")
+
+	// A profile URL has exactly one path segment. Anything deeper is a post, a
+	// reel or a story, none of which is an account.
+	if handle == "" || strings.Contains(handle, "/") {
+		return ""
+	}
+	return handle
+}
+
+// normalizeHandle reduces a name or handle to comparable letters and digits,
+// so "Kendrick Lamar" and "kendricklamar" match and "jojoruski" does not.
+func normalizeHandle(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // isMBID reports whether s is shaped like a MusicBrainz UUID.

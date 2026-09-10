@@ -36,8 +36,8 @@ type SubscriptionStore interface {
 	IsSubscribed(ctx context.Context, chatID int64, mbid string) (bool, error)
 	List(ctx context.Context, chatID int64, limit, offset int) (items []storage.Subscription, total int, err error)
 	Forget(ctx context.Context, chatID int64) (existed bool, err error)
-	NeedsLinks(ctx context.Context, mbid string) (bool, error)
-	SetArtistLinks(ctx context.Context, mbid string, links storage.ArtistLinks) error
+	NeedsLinks(ctx context.Context, mbid string, version int) (bool, error)
+	SetArtistLinks(ctx context.Context, mbid string, links storage.ArtistLinks, version int) error
 }
 
 // handleSubscribe is the Subscribe button on a search card.
@@ -84,7 +84,7 @@ func (b *Bot) handleSubscribe(ctx context.Context, cq *telego.CallbackQuery, has
 // subscription into an error the user sees. links_fetched_at stays null on
 // failure, so the next subscribe to the same artist tries again.
 func (b *Bot) ensureArtistLinks(ctx context.Context, mbid string, log *slog.Logger) {
-	needed, err := b.subs.NeedsLinks(ctx, mbid)
+	needed, err := b.subs.NeedsLinks(ctx, mbid, musicbrainz.LinksVersion)
 	if err != nil {
 		log.Warn("could not check artist links", "mbid", mbid, "err", err)
 		return
@@ -103,7 +103,8 @@ func (b *Bot) ensureArtistLinks(ctx context.Context, mbid string, log *slog.Logg
 		Spotify:    links.Spotify,
 		YouTube:    links.YouTube,
 		AppleMusic: links.AppleMusic,
-	}); err != nil {
+		Instagram:  links.Instagram,
+	}, musicbrainz.LinksVersion); err != nil {
 		log.Warn("could not store artist links", "mbid", mbid, "err", err)
 		return
 	}

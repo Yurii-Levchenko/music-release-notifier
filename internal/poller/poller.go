@@ -170,8 +170,8 @@ func (p *Poller) initialDelay(ctx context.Context) time.Duration {
 // poller is the right home: it is the worker whose whole job is periodic
 // maintenance against a rate-limited upstream.
 type LinkBackfill interface {
-	ArtistsMissingLinks(ctx context.Context, limit int) ([]string, error)
-	SetArtistLinks(ctx context.Context, mbid string, links storage.ArtistLinks) error
+	ArtistsMissingLinks(ctx context.Context, limit, version int) ([]string, error)
+	SetArtistLinks(ctx context.Context, mbid string, links storage.ArtistLinks, version int) error
 	ArtistLinks(ctx context.Context, mbid string) (musicbrainz.Links, error)
 }
 
@@ -197,7 +197,7 @@ func (p *Poller) backfillLinks(ctx context.Context) {
 		return
 	}
 
-	pending, err := p.links.ArtistsMissingLinks(ctx, linksPerPoll)
+	pending, err := p.links.ArtistsMissingLinks(ctx, linksPerPoll, musicbrainz.LinksVersion)
 	if err != nil {
 		p.log.Warn("could not list artists missing links", "err", err)
 		return
@@ -223,7 +223,8 @@ func (p *Poller) backfillLinks(ctx context.Context) {
 			Spotify:    links.Spotify,
 			YouTube:    links.YouTube,
 			AppleMusic: links.AppleMusic,
-		}); err != nil {
+			Instagram:  links.Instagram,
+		}, musicbrainz.LinksVersion); err != nil {
 			p.log.Warn("could not store links", "mbid", mbid, "err", err)
 			continue
 		}

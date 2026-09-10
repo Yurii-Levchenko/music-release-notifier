@@ -18,10 +18,11 @@ func TestPreview(t *testing.T) {
 		PrimaryType: "Album",
 		ReleaseDate: time.Date(2026, 9, 9, 0, 0, 0, 0, time.UTC),
 		InfoURL:     "https://musicbrainz.org/artist/908d9ac2-5187-4b9e-b281-601c6afb0791",
-		Listen: notify.ListenLinks{
+		Links: notify.ArtistLinks{
 			Spotify:    "https://open.spotify.com/artist/5kVZa4lFUmAQlBogl1fkd6",
 			YouTube:    "https://www.youtube.com/channel/UCQVhrypJhw1HxuRV4gX6hoQ",
 			AppleMusic: "https://music.apple.com/jp/artist/1165017710",
+			Instagram:  "https://www.instagram.com/aimyon36/",
 		},
 	}))
 

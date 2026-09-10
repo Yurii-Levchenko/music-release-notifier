@@ -281,10 +281,11 @@ func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) outcome {
 		ReleaseDate: p.ReleaseDate,
 		CoverURL:    p.CoverURL,
 		InfoURL:     p.InfoURL,
-		Listen: notify.ListenLinks{
+		Links: notify.ArtistLinks{
 			Spotify:    p.Spotify,
 			YouTube:    p.YouTube,
 			AppleMusic: p.AppleMusic,
+			Instagram:  p.Instagram,
 		},
 	})
 	n.lastSent[p.ChatID] = n.now()

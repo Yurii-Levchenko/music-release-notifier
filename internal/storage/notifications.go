@@ -67,6 +67,7 @@ type Pending struct {
 	Spotify    string
 	YouTube    string
 	AppleMusic string
+	Instagram  string
 }
 
 // Claim leases up to limit due notifications for this worker.
@@ -119,7 +120,8 @@ func (n *Notifications) Claim(ctx context.Context, limit int) ([]Pending, error)
 		          r.release_date, coalesce(r.cover_url, ''),
 		          coalesce(a.links->>'spotify', ''),
 		          coalesce(a.links->>'youtube', ''),
-		          coalesce(a.links->>'apple_music', '')`,
+		          coalesce(a.links->>'apple_music', ''),
+		          coalesce(a.links->>'instagram', '')`,
 		limit, n.lease.Seconds())
 	if err != nil {
 		return nil, fmt.Errorf("claim notifications: %w", err)
@@ -132,7 +134,7 @@ func (n *Notifications) Claim(ctx context.Context, limit int) ([]Pending, error)
 		if err := rows.Scan(&p.ID, &p.UserID, &p.ChatID, &p.Attempts,
 			&p.ReleaseID, &p.ArtistMBID, &p.ArtistName, &p.Title, &p.PrimaryType,
 			&p.ReleaseDate, &p.CoverURL,
-			&p.Spotify, &p.YouTube, &p.AppleMusic); err != nil {
+			&p.Spotify, &p.YouTube, &p.AppleMusic, &p.Instagram); err != nil {
 			return nil, fmt.Errorf("scan claimed notification: %w", err)
 		}
 		p.InfoURL = "https://musicbrainz.org/artist/" + p.ArtistMBID

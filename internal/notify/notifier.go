@@ -28,25 +28,29 @@ type Release struct {
 	CoverURL string
 	InfoURL  string
 
-	// Listen is where to actually go and play the thing. Empty is normal: the
-	// links are looked up once per artist and an artist subscribed to before
-	// that lookup existed has none. A channel must render fine without them.
-	Listen ListenLinks
+	// Links are the artist's own destinations. Empty is normal: they are
+	// looked up once per artist, and an artist subscribed to before that
+	// lookup existed has none. A channel must render fine without them.
+	Links ArtistLinks
 }
 
-// ListenLinks are the streaming destinations for an artist.
+// ArtistLinks are an artist's external destinations.
 //
-// They live on the domain release rather than being resolved by a channel,
-// for the same reason CoverURL does (D14): resolving at send time would mean
-// one lookup per subscriber instead of one per artist, ever.
-type ListenLinks struct {
+// They live on the domain release rather than being resolved by a channel, for
+// the same reason CoverURL does (D14): resolving at send time would mean one
+// lookup per subscriber instead of one per artist, ever.
+type ArtistLinks struct {
 	Spotify    string
 	YouTube    string
 	AppleMusic string
+	// Instagram is the profile URL. Not a place to listen, which is why this
+	// type is not called ListenLinks — it was, briefly, and the name became a
+	// lie the moment a social account joined it.
+	Instagram string
 }
 
-// Any reports whether there is anywhere to send the reader.
-func (l ListenLinks) Any() bool {
+// Listenable reports whether there is anywhere to go and play the thing.
+func (l ArtistLinks) Listenable() bool {
 	return l.Spotify != "" || l.YouTube != "" || l.AppleMusic != ""
 }
 

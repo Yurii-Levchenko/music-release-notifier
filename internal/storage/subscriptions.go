@@ -181,6 +181,7 @@ type ArtistLinks struct {
 	Spotify    string `json:"spotify,omitempty"`
 	YouTube    string `json:"youtube,omitempty"`
 	AppleMusic string `json:"apple_music,omitempty"`
+	Instagram  string `json:"instagram,omitempty"`
 }
 
 // SetArtistLinks records the lookup result, including an empty one.
@@ -189,7 +190,7 @@ type ArtistLinks struct {
 // have never looked" from "we looked and there is nothing", and without that
 // distinction every subscribe would re-fetch the artists that have no links —
 // forever, and against an API limited to one request a second.
-func (s *Subscriptions) SetArtistLinks(ctx context.Context, mbid string, links ArtistLinks) error {
+func (s *Subscriptions) SetArtistLinks(ctx context.Context, mbid string, links ArtistLinks, version int) error {
 	payload, err := json.Marshal(links)
 	if err != nil {
 		return fmt.Errorf("encode links for %s: %w", mbid, err)
@@ -197,8 +198,8 @@ func (s *Subscriptions) SetArtistLinks(ctx context.Context, mbid string, links A
 
 	if _, err := s.pool.Exec(ctx, `
 		UPDATE artists
-		SET links = $2::jsonb, links_fetched_at = now()
-		WHERE mbid = $1`, mbid, string(payload)); err != nil {
+		SET links = $2::jsonb, links_fetched_at = now(), links_version = $3
+		WHERE mbid = $1`, mbid, string(payload), version); err != nil {
 		return fmt.Errorf("store links for %s: %w", mbid, err)
 	}
 	return nil
@@ -208,17 +209,20 @@ func (s *Subscriptions) SetArtistLinks(ctx context.Context, mbid string, links A
 //
 // A missing artist row answers false: there is nothing to attach links to, and
 // the caller has a worse problem than missing links.
-func (s *Subscriptions) NeedsLinks(ctx context.Context, mbid string) (bool, error) {
+func (s *Subscriptions) NeedsLinks(ctx context.Context, mbid string, version int) (bool, error) {
 	var fetched *time.Time
+	var stored int
 	err := s.pool.QueryRow(ctx,
-		`SELECT links_fetched_at FROM artists WHERE mbid = $1`, mbid).Scan(&fetched)
+		`SELECT links_fetched_at, links_version FROM artists WHERE mbid = $1`, mbid).
+		Scan(&fetched, &stored)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("read link state for %s: %w", mbid, err)
 	}
-	return fetched == nil, nil
+	// Never resolved, or resolved against an older set of link kinds.
+	return fetched == nil || stored < version, nil
 }
 
 // ArtistsMissingLinks returns tracked artists that have never had a link
@@ -227,7 +231,7 @@ func (s *Subscriptions) NeedsLinks(ctx context.Context, mbid string) (bool, erro
 // Only artists somebody is actually subscribed to: looking up links for an
 // artist nobody follows would spend a rate-limited request on a row that will
 // never appear in a notification.
-func (s *Subscriptions) ArtistsMissingLinks(ctx context.Context, limit int) ([]string, error) {
+func (s *Subscriptions) ArtistsMissingLinks(ctx context.Context, limit, version int) ([]string, error) {
 	if limit <= 0 {
 		limit = 5
 	}
@@ -235,10 +239,10 @@ func (s *Subscriptions) ArtistsMissingLinks(ctx context.Context, limit int) ([]s
 	rows, err := s.pool.Query(ctx, `
 		SELECT a.mbid
 		FROM artists a
-		WHERE a.links_fetched_at IS NULL
+		WHERE (a.links_fetched_at IS NULL OR a.links_version < $2)
 		  AND EXISTS (SELECT 1 FROM subscriptions s WHERE s.artist_mbid = a.mbid)
 		ORDER BY a.created_at
-		LIMIT $1`, limit)
+		LIMIT $1`, limit, version)
 	if err != nil {
 		return nil, fmt.Errorf("find artists missing links: %w", err)
 	}
