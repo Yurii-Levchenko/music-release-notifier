@@ -53,14 +53,15 @@ type Pending struct {
 	ChatID   int64
 	Attempts int
 
-	ReleaseID   int64
-	ArtistMBID  string
-	ArtistName  string
-	Title       string
-	PrimaryType string
-	ReleaseDate time.Time
-	CoverURL    string
-	InfoURL     string
+	ReleaseID        int64
+	ReleaseGroupMBID string
+	ArtistMBID       string
+	ArtistName       string
+	Title            string
+	PrimaryType      string
+	ReleaseDate      time.Time
+	CoverURL         string
+	InfoURL          string
 
 	// Streaming links, joined from the artist. Empty when the artist was
 	// subscribed to before link lookups existed.
@@ -116,7 +117,7 @@ func (n *Notifications) Claim(ctx context.Context, limit int) ([]Pending, error)
 		  AND r.id = n.release_id
 		  AND a.mbid = r.artist_mbid
 		RETURNING n.id, n.user_id, u.telegram_chat_id, n.attempts,
-		          r.id, r.artist_mbid, a.name, r.title, r.primary_type,
+		          r.id, r.release_group_mbid, r.artist_mbid, a.name, r.title, r.primary_type,
 		          r.release_date, coalesce(r.cover_url, ''),
 		          coalesce(a.links->>'spotify', ''),
 		          coalesce(a.links->>'youtube', ''),
@@ -132,12 +133,19 @@ func (n *Notifications) Claim(ctx context.Context, limit int) ([]Pending, error)
 	for rows.Next() {
 		var p Pending
 		if err := rows.Scan(&p.ID, &p.UserID, &p.ChatID, &p.Attempts,
-			&p.ReleaseID, &p.ArtistMBID, &p.ArtistName, &p.Title, &p.PrimaryType,
+			&p.ReleaseID, &p.ReleaseGroupMBID, &p.ArtistMBID, &p.ArtistName, &p.Title, &p.PrimaryType,
 			&p.ReleaseDate, &p.CoverURL,
 			&p.Spotify, &p.YouTube, &p.AppleMusic, &p.Instagram); err != nil {
 			return nil, fmt.Errorf("scan claimed notification: %w", err)
 		}
-		p.InfoURL = "https://musicbrainz.org/artist/" + p.ArtistMBID
+		// The release group, not the artist. The title in a notification is the
+		// title of the release, and linking it to the artist page was simply
+		// wrong — somebody who taps a release name expects that release.
+		//
+		// The release group rather than the release: the group is what the
+		// dedup key is built on (D7), and it is the page that lists every
+		// edition, which is the useful one when a release is region-specific.
+		p.InfoURL = "https://musicbrainz.org/release-group/" + p.ReleaseGroupMBID
 		out = append(out, p)
 	}
 	if err := rows.Err(); err != nil {

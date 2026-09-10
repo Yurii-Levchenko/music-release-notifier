@@ -49,7 +49,20 @@ type Release struct {
 	// PrimaryType is Album, Single, EP — or Broadcast, Other, or empty. The feed
 	// carries all of them; filtering is the caller's job.
 	PrimaryType string
-	ReleaseDate time.Time
+	// SecondaryType qualifies the primary one: Compilation, Live, Remix,
+	// Soundtrack, Demo, Mixtape/Street, DJ-mix, Interview, Audiobook,
+	// Spokenword — or empty, which is the usual case.
+	//
+	// The field is absent from most entries rather than null, which is how it
+	// went unnoticed: a dump of one release's keys does not show it. Present on
+	// 9.7% of what the primary-type filter accepts (measured 10.09.2026 over a
+	// 1660-release window).
+	//
+	// Singular, unlike MusicBrainz's own array. The feed flattens it, so a
+	// "Live Compilation" arrives as one of the two. Accepted: either value is
+	// enough to make the decision this drives.
+	SecondaryType string
+	ReleaseDate   time.Time
 	// CoverURL is built from the response, never fetched. Empty for roughly a
 	// quarter of releases (SPEC.md C27b).
 	CoverURL string
@@ -90,6 +103,7 @@ type freshReleasesResponse struct {
 			ReleaseMBID    string `json:"release_mbid"`
 			ReleaseName    string `json:"release_name"`
 			PrimaryType    string `json:"release_group_primary_type"`
+			SecondaryType  string `json:"release_group_secondary_type"`
 		} `json:"releases"`
 	} `json:"payload"`
 }
@@ -143,6 +157,7 @@ func (c *Client) FreshReleases(ctx context.Context, days int) ([]Release, error)
 			ArtistName:       r.ArtistCreditName,
 			Title:            r.ReleaseName,
 			PrimaryType:      r.PrimaryType,
+			SecondaryType:    r.SecondaryType,
 			ReleaseDate:      date,
 			CoverURL:         coverURL(r.CAAReleaseMBID, r.CAAID),
 		})

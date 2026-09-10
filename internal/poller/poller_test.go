@@ -605,3 +605,72 @@ func TestBackfillStampsTheLinksVersion(t *testing.T) {
 		t.Errorf("stored version %d, want %d", b.storedVersion, musicbrainz.LinksVersion)
 	}
 }
+
+// --- secondary types -------------------------------------------------------
+
+// The release that prompted this. "the unreleased collection vol.01" is an
+// Official, Brazil-only Album whose release group is a Compilation — so it
+// passed a filter that looked only at the primary type and was announced as a
+// new album, while existing on no streaming service the subscriber could find.
+// SPEC D3 excluded compilations from the start; the poller was not honoring it.
+func TestCompilationsAreNotNotified(t *testing.T) {
+	tracked := "aaaa1111-0000-4000-8000-000000000001"
+	feed := &fakeFeed{releases: []listenbrainz.Release{{
+		ReleaseGroupMBID: "rg-compilation",
+		ArtistMBIDs:      []string{tracked},
+		ArtistName:       "Ariana Grande",
+		Title:            "the unreleased collection vol.01",
+		PrimaryType:      "Album",
+		SecondaryType:    "Compilation",
+		ReleaseDate:      fixedNow.Add(-24 * time.Hour),
+	}}}
+	// stateFound with a past LastOKAt: not a first run, so a match would be
+	// notified rather than seeded — which is what makes the skip meaningful.
+	store := &fakeStore{
+		tracked:    map[string]struct{}{tracked: {}},
+		stateFound: true,
+		state:      storage.PollState{LastOKAt: fixedNow.Add(-24 * time.Hour)},
+	}
+
+	stats, err := testPoller(feed, store).PollOnce(context.Background())
+	if err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+
+	if stats.Recorded != 0 || stats.Notified != 0 {
+		t.Fatalf("a compilation was recorded/notified: %+v", stats)
+	}
+	if stats.SkippedByType != 1 {
+		t.Fatalf("SkippedByType = %d, want 1 — the skip must be visible in the summary",
+			stats.SkippedByType)
+	}
+}
+
+// Every excluded kind, so adding one to the list cannot silently do nothing.
+func TestExcludedSecondaryTypes(t *testing.T) {
+	for _, kind := range []string{"Compilation", "Demo", "Interview", "Audiobook", "Spokenword", "DJ-mix"} {
+		if notifiableSecondary(kind) {
+			t.Errorf("%q is notifiable; it is meant to be excluded", kind)
+		}
+	}
+}
+
+// The kept ones matter as much as the excluded ones: each is a real release
+// somebody following the artist wants to hear about, and quietly dropping a
+// live album or a mixtape would be worse than the noise this filter removes.
+func TestKeptSecondaryTypes(t *testing.T) {
+	for _, kind := range []string{"", "Live", "Remix", "Soundtrack", "Mixtape/Street"} {
+		if !notifiableSecondary(kind) {
+			t.Errorf("%q was filtered out; it is meant to be kept", kind)
+		}
+	}
+}
+
+// An unfamiliar value must pass. The feed's vocabulary is MusicBrainz's, which
+// grows, and defaulting to "drop" would make a new qualifier silently swallow
+// releases.
+func TestUnknownSecondaryTypePasses(t *testing.T) {
+	if !notifiableSecondary("Something MusicBrainz Added Later") {
+		t.Fatal("an unrecognized secondary type was dropped")
+	}
+}

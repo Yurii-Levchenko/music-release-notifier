@@ -2,6 +2,7 @@ package storage_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,12 +28,13 @@ type outboxFixture struct {
 	releaseID int64
 	notifID   int64
 	artist    string
+	group     string
 }
 
 func outboxFixtures(ctx context.Context, t *testing.T, tx pgx.Tx, chatID int64, mbid, group string) outboxFixture {
 	t.Helper()
 
-	f := outboxFixture{chatID: chatID, artist: mbid}
+	f := outboxFixture{chatID: chatID, artist: mbid, group: group}
 
 	if err := tx.QueryRow(ctx,
 		`INSERT INTO users (telegram_chat_id) VALUES ($1) RETURNING id`, chatID).
@@ -127,8 +129,13 @@ func TestClaimReturnsTheJoinedMessage(t *testing.T) {
 	if got.PrimaryType != "Album" || got.CoverURL == "" {
 		t.Errorf("type = %q, cover = %q", got.PrimaryType, got.CoverURL)
 	}
-	if got.InfoURL != "https://musicbrainz.org/artist/"+f.artist {
-		t.Errorf("InfoURL = %q", got.InfoURL)
+	// The release group, not the artist: the title in a notification is the
+	// release's title, so tapping it must land on that release.
+	if got.InfoURL != "https://musicbrainz.org/release-group/"+f.group {
+		t.Errorf("InfoURL = %q, want the release group", got.InfoURL)
+	}
+	if strings.Contains(got.InfoURL, "/artist/") {
+		t.Errorf("the release title still links to the artist page: %q", got.InfoURL)
 	}
 	// Claim counts the attempt it is handing out, so the first claim is 1.
 	if got.Attempts != 1 {

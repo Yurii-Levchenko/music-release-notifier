@@ -85,6 +85,10 @@ type Stats struct {
 	Notified  int  // notifications queued
 	Seeded    bool // first run: recorded a baseline without notifying
 	TrackedBy int  // how many distinct artists are followed
+	// SkippedByType counts entries dropped for their secondary type, so the
+	// filter's effect is visible in the poll summary rather than only in a
+	// debug log nobody has enabled.
+	SkippedByType int
 }
 
 // Run polls on a schedule until ctx is canceled.
@@ -137,6 +141,7 @@ func (p *Poller) Run(ctx context.Context) error {
 				"fetched", stats.Fetched,
 				"tracked_artists", stats.TrackedBy,
 				"matched", stats.Matched,
+				"skipped_by_type", stats.SkippedByType,
 				"recorded", stats.Recorded,
 				"notified", stats.Notified,
 				"seeded", stats.Seeded)
@@ -310,6 +315,16 @@ func (p *Poller) poll(ctx context.Context) (Stats, error) {
 		if !notifiableType(rel.PrimaryType) {
 			continue
 		}
+		if !notifiableSecondary(rel.SecondaryType) {
+			// Logged rather than dropped silently: this filter is a judgment
+			// call, and the only way to find out it is wrong is to be able to
+			// see what it removed.
+			p.log.Debug("skipping a release by secondary type",
+				"release_group", rel.ReleaseGroupMBID, "title", rel.Title,
+				"secondary_type", rel.SecondaryType)
+			stats.SkippedByType++
+			continue
+		}
 		// future=false should have handled this upstream; keep the assert,
 		// because announcing an album before it exists is the one mistake a
 		// release bot cannot walk back (SPEC.md FR-2.5).
@@ -366,6 +381,41 @@ func (p *Poller) poll(ctx context.Context) (Stats, error) {
 
 func notifiableType(t string) bool {
 	return t == typeAlbum || t == typeSingle || t == typeEP
+}
+
+// excludedSecondaryTypes are release-group qualifiers that make something not
+// "new music by an artist you follow", whatever its primary type says.
+//
+// SPEC D3 already excluded compilations, and the poller was not honoring it:
+// the filter looked only at the primary type, so an official Brazil-only
+// compilation of unreleased Ariana Grande tracks was announced as a new album
+// on 10.09.2026. Measured over a 1660-release window, 9.7% of everything the
+// primary-type filter accepts carries a secondary type.
+//
+// What is excluded and what is kept is a taste decision, so it is a list
+// rather than a condition:
+//
+//   - Compilation, Demo — old material, repackaged or unfinished. D3.
+//   - Interview, Audiobook, Spokenword — not music.
+//   - DJ-mix — mostly other people's tracks.
+//
+// Deliberately kept, because each is a real release somebody following the
+// artist would want to hear about: Live (a new performance), Remix (official
+// new versions), Soundtrack (new work), Mixtape/Street (a primary release
+// format in hip-hop, not a lesser one).
+var excludedSecondaryTypes = map[string]bool{
+	"Compilation": true,
+	"Demo":        true,
+	"Interview":   true,
+	"Audiobook":   true,
+	"Spokenword":  true,
+	"DJ-mix":      true,
+}
+
+// notifiableSecondary reports whether a secondary type is worth a message.
+// Empty is the usual case and always passes.
+func notifiableSecondary(t string) bool {
+	return !excludedSecondaryTypes[t]
 }
 
 // firstTracked returns the first artist on the release that somebody follows.
