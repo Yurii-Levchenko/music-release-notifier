@@ -137,3 +137,28 @@ func TestDuplicateRegistrationStaysUsable(t *testing.T) {
 		t.Fatalf("gather after a duplicate registration: %v", err)
 	}
 }
+
+// A CounterVec publishes nothing until a label is used, so a dashboard reads
+// "No data" instead of zero until the first event — and for a dropped
+// recipient, the first event is the one you least want to discover from a
+// panel that was blank until then.
+func TestClosedLabelSetsExistFromStartup(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := New(reg)
+
+	if got := testutil.CollectAndCount(m.Notifications); got != 4 {
+		t.Errorf("notifications series at startup = %d, want 4", got)
+	}
+	if got := testutil.CollectAndCount(m.CoverSends); got != 3 {
+		t.Errorf("cover series at startup = %d, want 3", got)
+	}
+	if got := testutil.CollectAndCount(m.BotUpdates); got != 4 {
+		t.Errorf("bot update series at startup = %d, want 4", got)
+	}
+
+	// Status codes are deliberately not seeded: a row for a code that never
+	// occurred is a claim, not a zero.
+	if got := testutil.CollectAndCount(m.TelegramRequests); got != 0 {
+		t.Errorf("telegram code series at startup = %d, want none invented", got)
+	}
+}

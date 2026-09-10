@@ -9,6 +9,7 @@ import (
 	"html"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/mymmrac/telego"
 
@@ -129,19 +130,87 @@ func (n *Notifier) Send(ctx context.Context, to notify.Recipient, rel notify.Rel
 		return n.client.SendHTML(ctx, chatID, body)
 	}
 
-	err = n.client.SendPhotoHTML(ctx, chatID, rel.CoverURL, body)
+	return n.sendWithCover(ctx, chatID, rel, body)
+}
+
+// coverFetchRetryDelay is how long to wait before asking Telegram to fetch the
+// cover a second time.
+//
+// Telegram downloads the image itself (D14: we never fetch it), and Cover Art
+// Archive answers with a 307 to archive.org, which is occasionally slow enough
+// that Telegram gives up. Observed live on 09.09.2026: the URL that failed
+// served a 24 KB JPEG in 2.1 s when checked minutes later.
+const coverFetchRetryDelay = 3 * time.Second
+
+// sendWithCover sends the photo, and degrades to text only once that is
+// actually hopeless.
+//
+// The distinction that matters: "Telegram could not download our URL" and "our
+// URL is malformed" are both 400s and both classified BadMessage, but only the
+// first is worth another try. Treating them the same silently downgraded a
+// release to a text-only message because archive.org was slow for two seconds.
+func (n *Notifier) sendWithCover(ctx context.Context, chatID int64, rel notify.Release, body string) error {
+	err := n.client.SendPhotoHTML(ctx, chatID, rel.CoverURL, body)
 	if err == nil {
+		n.client.metrics.CoverSends.WithLabelValues("ok").Inc()
 		return nil
 	}
-	// A bad or unreachable image URL must not cost the user the notification.
-	// Fall back to text once, then let the real disposition stand.
+
 	var de *notify.DeliveryError
-	if ok := asDeliveryError(err, &de); ok && de.Disposition == notify.BadMessage {
-		n.client.log.Warn("photo send failed, falling back to text",
-			"release_id", rel.ID, "err", de.Err)
-		return n.client.SendHTML(ctx, chatID, body)
+	if ok := asDeliveryError(err, &de); !ok || de.Disposition != notify.BadMessage {
+		// Not a caption or image problem at all — a rate limit, an outage, a
+		// dead chat. That belongs to the outbox, which will retry the whole
+		// notification rather than quietly dropping the cover.
+		return err
 	}
-	return err
+
+	if isCoverFetchFailure(de.Err) {
+		n.client.log.Warn("telegram could not fetch the cover, retrying once",
+			"release_id", rel.ID, "err", de.Err)
+
+		if sleepErr := sleepCtx(ctx, coverFetchRetryDelay); sleepErr != nil {
+			return sleepErr
+		}
+
+		if retryErr := n.client.SendPhotoHTML(ctx, chatID, rel.CoverURL, body); retryErr == nil {
+			n.client.metrics.CoverSends.WithLabelValues("retried_ok").Inc()
+			return nil
+		}
+		n.client.log.Warn("cover still unavailable on the second try, sending text",
+			"release_id", rel.ID)
+	}
+
+	// A malformed URL, or a fetch that failed twice. The notification must not
+	// be lost over a missing picture.
+	n.client.metrics.CoverSends.WithLabelValues("degraded_to_text").Inc()
+	return n.client.SendHTML(ctx, chatID, body)
+}
+
+// isCoverFetchFailure reports whether Telegram failed to *download* the image,
+// as opposed to rejecting the URL itself. Only the former can succeed on a
+// retry; retrying a malformed URL just delays the text message.
+func isCoverFetchFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	desc := strings.ToLower(err.Error())
+	return contains(desc,
+		"failed to get http url content",
+		"webpage_curl_failed",
+		"image_process_failed",
+		"wrong type of the web page content")
+}
+
+// sleepCtx waits, or returns early if the context is canceled.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // formatRelease builds the message body. Every value that came from an external

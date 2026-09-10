@@ -79,9 +79,12 @@ way of a locally installed PostgreSQL.
 docker compose --profile observability up -d
 ```
 
-Prometheus on **9091**, Grafana on **3001** (anonymous viewer). The app's
-`/metrics` is scraped over the compose network and never published to the host:
-it carries queue depths and chat volumes.
+Grafana on **3001** (anonymous viewer). Neither Prometheus nor the app's
+`/metrics` is published to the host — Grafana reaches both over the compose
+network, `/metrics` carries queue depths and chat volumes, and every port not
+published is one fewer chance to lose a container to a bind race on startup.
+That is not hypothetical: Prometheus died that way on 9091 and stayed dead for
+six days.
 
 Two collectors read Postgres when Prometheus scrapes rather than tracking a
 number in memory. That is not incidental — a gauge set from the drain loop is

@@ -54,8 +54,23 @@ services:
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.retention.time=30d
-    ports:
-      - "9091:9090"
+    # No published port, on purpose. Grafana reaches Prometheus over the
+    # compose network, so publishing it bought nothing and cost a failure
+    # mode: on 04.09.2026 this container exited 255 with "Bind for
+    # 0.0.0.0:9091 failed: port is already allocated" and stayed dead for six
+    # days. The same race that killed the app on 8080 - the failure happens
+    # while Docker sets up networking, before the process starts, so
+    # restart: unless-stopped never applies. Every port not published is one
+    # fewer way for that to happen.
+    #
+    # To reach the Prometheus UI when you actually want it:
+    #   docker compose exec prometheus wget -qO- localhost:9090/api/v1/rules
+    # or query it through Grafana, which provisions it as the default source.
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
   grafana:
     image: grafana/grafana:12.3.1

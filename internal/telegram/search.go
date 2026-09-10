@@ -410,16 +410,64 @@ func artistFacts(a musicbrainz.Artist) string {
 		parts = append(parts, a.Country)
 	}
 
-	switch {
-	case a.Begin != "" && a.End != "":
-		parts = append(parts, a.Begin+"–"+a.End)
-	case a.Begin != "":
-		parts = append(parts, "з "+a.Begin)
-	case a.End != "":
-		parts = append(parts, "до "+a.End)
+	if span := lifeSpan(a); span != "" {
+		parts = append(parts, span)
 	}
 
 	return strings.Join(parts, " · ")
+}
+
+// lifeSpan labels MusicBrainz's life-span according to what the artist is.
+//
+// The same field means two different things: for a Group it is the date the
+// act formed, and for a Person it is a birth date. Labeling both "з" produced
+// "Drake · CA · з 1986-10-24", which reads as a career start and is his
+// birthday — he released his first mixtape in 2006.
+//
+// Career start is not available here. The artist index carries no such field,
+// and deriving it from the earliest release would cost one query per candidate
+// at search time, on an API limited to one request a second. The year an
+// artist was born is what MusicBrainz itself disambiguates people by, so it
+// earns its place on the card — it just has to be labeled honestly.
+func lifeSpan(a musicbrainz.Artist) string {
+	begin, end := year(a.Begin), year(a.End)
+
+	switch {
+	case begin != "" && end != "":
+		// A range needs no label: for a group it reads as the active period,
+		// for a person as a lifetime, and both are correct.
+		return begin + "–" + end
+	case begin != "" && a.Type == "Person":
+		return "нар. " + begin
+	case begin != "":
+		// Group, Orchestra, Choir — and an unknown type, where "formed" is the
+		// safer guess: an unlabeled year is less wrong than a birth date
+		// asserted about something that may not be a person.
+		return "з " + begin
+	case end != "":
+		return "до " + end
+	default:
+		return ""
+	}
+}
+
+// year keeps just the year from a MusicBrainz date, which arrives as
+// YYYY-MM-DD, YYYY-MM or YYYY.
+//
+// The day is dropped deliberately. It is never needed to tell two artists
+// apart, and printing a living person's full date of birth in a chat message
+// is more than this card has any reason to say.
+func year(date string) string {
+	if len(date) < 4 {
+		return ""
+	}
+	y := date[:4]
+	for _, r := range y {
+		if r < '0' || r > '9' {
+			return ""
+		}
+	}
+	return y
 }
 
 // candidateKeyboard renders the navigation row plus the subscribe toggle.

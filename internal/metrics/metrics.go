@@ -49,6 +49,12 @@ type Metrics struct {
 	TelegramRequests   *prometheus.CounterVec
 	TelegramRetryAfter prometheus.Histogram
 
+	// CoverSends tracks what happened to the release artwork: delivered,
+	// delivered after a retry, or given up on and sent as text. The
+	// degraded_to_text share is the number that says whether the covers are
+	// actually reaching people, which no other metric shows.
+	CoverSends *prometheus.CounterVec
+
 	// --- poller ---
 
 	// ReleasesFound counts what the feed returned; the Friday spike should be
@@ -72,7 +78,7 @@ type Metrics struct {
 func New(reg prometheus.Registerer) *Metrics {
 	factory := promauto{reg}
 
-	return &Metrics{
+	m := &Metrics{
 		DeliverySeconds: factory.histogram(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Name:      "notification_delivery_seconds",
@@ -104,6 +110,12 @@ func New(reg prometheus.Registerer) *Metrics {
 			Help:      "retry_after values Telegram asked us to honor.",
 			Buckets:   []float64{1, 5, 15, 30, 60, 300, 900},
 		}),
+
+		CoverSends: factory.counterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "cover_sends_total",
+			Help:      "Release artwork outcomes: ok, retried_ok, degraded_to_text.",
+		}, "outcome"),
 
 		ReleasesFound: factory.counter(prometheus.CounterOpts{
 			Namespace: namespace,
@@ -143,6 +155,31 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name:      "bot_updates_total",
 			Help:      "Telegram updates handled, by kind.",
 		}, "kind"),
+	}
+
+	m.initSeries()
+	return m
+}
+
+// initSeries creates the series for label sets that are fixed and known.
+//
+// A CounterVec publishes nothing until a label value is used, so a dashboard
+// panel reads "No data" rather than zero until the first event — and for
+// something like a dropped recipient, the first event is the one you least want
+// to learn about from a panel that was blank until then. rate() over a series
+// that does not exist yet returns nothing either.
+//
+// Only sets that are genuinely closed are seeded. Status codes are not: an
+// invented row for a code that never occurred is a claim, not a zero.
+func (m *Metrics) initSeries() {
+	for _, disposition := range []string{"sent", "transient", "permanent", "bad_message"} {
+		m.Notifications.WithLabelValues(disposition)
+	}
+	for _, outcome := range []string{"ok", "retried_ok", "degraded_to_text"} {
+		m.CoverSends.WithLabelValues(outcome)
+	}
+	for _, kind := range []string{"message", "callback_query", "my_chat_member", "other"} {
+		m.BotUpdates.WithLabelValues(kind)
 	}
 }
 

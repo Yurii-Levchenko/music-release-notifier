@@ -214,3 +214,70 @@ func TestRenderCandidateShowsPosition(t *testing.T) {
 		}
 	}
 }
+
+// Drake is a Person, so MusicBrainz's life-span begin is his birthday — not
+// the start of his career. Rendering it as "з 1986-10-24" claimed he had been
+// recording since he was born.
+func TestPersonLifeSpanIsLabeledAsBirth(t *testing.T) {
+	got := artistFacts(musicbrainz.Artist{
+		Type: "Person", Country: "CA", Begin: "1986-10-24",
+	})
+
+	if strings.Contains(got, "з 1986") {
+		t.Fatalf("a person's birth year is presented as a career start: %q", got)
+	}
+	if !strings.Contains(got, "нар. 1986") {
+		t.Fatalf("facts = %q, want a birth label", got)
+	}
+	if strings.Contains(got, "10-24") {
+		t.Fatalf("the full date of birth is on the card: %q", got)
+	}
+}
+
+// For a group the same field really is the formation date, so "з" is right.
+func TestGroupLifeSpanIsLabeledAsFormation(t *testing.T) {
+	got := artistFacts(musicbrainz.Artist{
+		Type: "Group", Country: "GB", Begin: "1985",
+	})
+
+	if !strings.Contains(got, "з 1985") {
+		t.Fatalf("facts = %q, want a formation label", got)
+	}
+}
+
+// An unknown type must not be asserted to be a person. "Formed in" is the
+// safer reading when we do not know what the act is.
+func TestUnknownTypeDoesNotClaimABirthDate(t *testing.T) {
+	got := artistFacts(musicbrainz.Artist{Begin: "1999"})
+
+	if strings.Contains(got, "нар.") {
+		t.Fatalf("a birth date was asserted about an artist of unknown type: %q", got)
+	}
+	if !strings.Contains(got, "з 1999") {
+		t.Fatalf("facts = %q", got)
+	}
+}
+
+// A closed range needs no label: it reads correctly as a lifetime for a person
+// and as an active period for a group.
+func TestClosedRangeNeedsNoLabel(t *testing.T) {
+	person := artistFacts(musicbrainz.Artist{Type: "Person", Begin: "1971-06-16", End: "1996-09-13"})
+	if !strings.Contains(person, "1971–1996") {
+		t.Fatalf("facts = %q, want a bare range", person)
+	}
+	if strings.Contains(person, "нар.") {
+		t.Fatalf("a closed range was also labeled as a birth: %q", person)
+	}
+}
+
+func TestMalformedDatesAreDropped(t *testing.T) {
+	for _, bad := range []string{"", "19", "unknown", "circa 1980"} {
+		got := artistFacts(musicbrainz.Artist{Type: "Group", Country: "US", Begin: bad})
+		if strings.Contains(got, bad) && bad != "" {
+			t.Errorf("unparseable date %q reached the card: %q", bad, got)
+		}
+		if !strings.Contains(got, "Гурт") {
+			t.Errorf("the rest of the facts were lost for %q: %q", bad, got)
+		}
+	}
+}
