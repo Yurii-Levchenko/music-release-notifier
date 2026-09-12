@@ -310,7 +310,7 @@ func (b *Bot) handleMessage(ctx context.Context, msg *telego.Message) {
 	case "/list":
 		b.handleList(ctx, chatID, log)
 	case "/stop":
-		b.handleStop(ctx, chatID, log)
+		b.handleStop(ctx, chatID, args, log)
 	case "":
 		// Plain text is the common case: people type a name, not a command.
 		b.handleSearch(ctx, chatID, args, log)

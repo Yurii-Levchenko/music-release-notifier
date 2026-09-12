@@ -101,8 +101,7 @@ func (b *Bot) catchUpOnRecentReleases(ctx context.Context, chatID int64, artist 
 		return
 	}
 	if queued == 0 {
-		// The common case, and deliberately silent: telling somebody "nothing
-		// recent" every time they subscribe is noise about a non-event.
+		// The common case, and deliberately silent: telling somebody "nothing\n// recent" every time they subscribe is noise about a non-event.
 		return
 	}
 	log.Info("queued recent releases for a new subscriber",
@@ -320,37 +319,133 @@ func renderList(items []storage.Subscription, total, page int) (string, *telego.
 
 // handleStop asks before deleting. /stop removes everything and cannot be
 // undone, so a single mistyped character should not cost someone their list.
-func (b *Bot) handleStop(ctx context.Context, chatID int64, log *slog.Logger) {
+// stopWord is what somebody has to type to delete everything.
+//
+// A typed word rather than a button, because the two are not equally safe for
+// this action. /stop sits in Telegram's command menu, so a mis-tap there
+// followed by a mis-tap on a confirm button was two taps away from destroying
+// twenty subscriptions somebody spent real time building — and the legitimate
+// use of /stop is approximately never. That asymmetry is what justifies making
+// it harder rather than faster.
+//
+// Latin capitals in the prompt, because on a Ukrainian keyboard that already
+// takes a deliberate layout switch. Matching is case-insensitive though: the
+// barrier is having to type a word at all, and refusing "delete" would only
+// make somebody who genuinely means it try three times.
+const stopWord = "DELETE"
+
+// maxFarewellList bounds the list handed back before deletion. Well inside
+// Telegram's 4096-character limit for any plausible number of subscriptions.
+const maxFarewellList = 200
+
+// isStopConfirmation reports whether the argument to /stop is the word.
+func isStopConfirmation(args string) bool {
+	return strings.EqualFold(strings.TrimSpace(args), stopWord)
+}
+
+// handleStop explains what deletion costs. It never deletes: that needs the
+// word.
+func (b *Bot) handleStop(ctx context.Context, chatID int64, args string, log *slog.Logger) {
+	if isStopConfirmation(args) {
+		b.deleteEverything(ctx, chatID, log)
+		return
+	}
+
 	_, total, err := b.subs.List(ctx, chatID, 1, 0)
 	if err != nil {
 		log.Error("list subscriptions failed", "err", err)
 		b.reply(ctx, chatID, "Не вдалося прочитати твої дані. Спробуй ще раз.", log)
 		return
 	}
+
+	var what string
 	if total == 0 {
-		// Still offer deletion: a user with no subscriptions may still want
-		// their row gone.
-		b.reply(ctx, chatID, "У тебе немає підписок. Видаляти нічого.", log)
+		// Still offered. Somebody with no subscriptions may still want their
+		// row gone, and Telegram's terms require honoring that (SPEC C30) —
+		// the previous version said "nothing to delete" and refused, which
+		// was the comment's intent inverted by the code.
+		what = "У тебе немає підписок, але твої дані все одно буде видалено."
+	} else {
+		what = fmt.Sprintf("Це видалить <b>усі %d підписок</b> і всі твої дані.", total)
+	}
+
+	b.reply(ctx, chatID, what+
+		"\n\nДію не можна скасувати. Перед видаленням я надішлю список твоїх підписок, "+
+		"щоб ти міг відновити їх вручну.\n\n"+
+		"Щоб підтвердити, надішли:\n<code>/stop "+stopWord+"</code>", log)
+}
+
+// deleteEverything hands back the list and then deletes.
+//
+// The list goes first, and that order is the point: deletion is irreversible
+// and Telegram's terms rule out a soft delete with a grace period (C30), so the
+// only way to make a mistake recoverable is to give somebody what they need to
+// rebuild it before it is gone. If the send fails, nothing is deleted.
+func (b *Bot) deleteEverything(ctx context.Context, chatID int64, log *slog.Logger) {
+	items, total, err := b.subs.List(ctx, chatID, maxFarewellList, 0)
+	if err != nil {
+		log.Error("list subscriptions before deletion failed", "err", err)
+		b.reply(ctx, chatID, "Не вдалося прочитати твої дані. Нічого не видалено.", log)
 		return
 	}
 
-	text := fmt.Sprintf(
-		"Це видалить <b>усі %d підписок</b> і всі твої дані.\n\nДію не можна скасувати.", total)
-	if _, err := b.client.api.SendMessage(ctx, &telego.SendMessageParams{
-		ChatID:    telego.ChatID{ID: chatID},
-		Text:      text,
-		ParseMode: telego.ModeHTML,
-		ReplyMarkup: &telego.InlineKeyboardMarkup{
-			InlineKeyboard: [][]telego.InlineKeyboardButton{{
-				{Text: "Видалити все", CallbackData: cbStop + ":yes"},
-				{Text: "Скасувати", CallbackData: cbStop + ":no"},
-			}},
-		},
-	}); err != nil {
-		b.handleSendError(ctx, chatID, err, log)
+	if total > 0 {
+		if !b.sendFarewellList(ctx, chatID, items, total, log) {
+			// Deliberately fatal to the deletion. Deleting after failing to
+			// hand back the list would remove the one thing that made the
+			// action recoverable.
+			b.reply(ctx, chatID, "Не вдалося надіслати список підписок. Нічого не видалено — спробуй ще раз.", log)
+			return
+		}
 	}
+
+	existed, err := b.subs.Forget(ctx, chatID)
+	if err != nil {
+		log.Error("forget user failed", "err", err)
+		b.reply(ctx, chatID, "Не вдалося видалити. Спробуй ще раз.", log)
+		return
+	}
+
+	log.Info("user data deleted", "existed", existed, "subscriptions", total)
+	b.reply(ctx, chatID,
+		"Усі твої дані видалені.\n\nЯкщо захочеш повернутись — просто напиши /start.", log)
 }
 
+// sendFarewellList sends the subscriptions as plain text, reporting success.
+func (b *Bot) sendFarewellList(ctx context.Context, chatID int64,
+	items []storage.Subscription, total int, log *slog.Logger,
+) bool {
+	if err := b.client.SendHTML(ctx, chatID, farewellList(items, total)); err != nil {
+		log.Error("could not send the farewell list", "err", err)
+		return false
+	}
+	return true
+}
+
+// farewellList renders the subscriptions handed back before deletion.
+//
+// Separate from the send so it can be tested. Once Forget runs this text is the
+// only copy of the data, and getting it wrong is not something a later message
+// can fix.
+func farewellList(items []storage.Subscription, total int) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Твої підписки перед видаленням — %d:\n\n", total)
+	for i, item := range items {
+		fmt.Fprintf(&sb, "%d. %s\n", i+1, html.EscapeString(item.Name))
+	}
+	if total > len(items) {
+		// The cap is generous, but saying nothing about the remainder would
+		// hand somebody an incomplete list that looks complete.
+		fmt.Fprintf(&sb, "\n…та ще %d.", total-len(items))
+	}
+	return sb.String()
+}
+
+// handleStopConfirm answers the buttons an older version of /stop drew.
+//
+// Kept so a stale message in somebody's history does something sensible rather
+// than nothing. It no longer deletes: there is one deletion path now, and it
+// needs the word.
 func (b *Bot) handleStopConfirm(ctx context.Context, cq *telego.CallbackQuery, answer string, log *slog.Logger) {
 	msg := callbackMessage(cq)
 
@@ -362,17 +457,10 @@ func (b *Bot) handleStopConfirm(ctx context.Context, cq *telego.CallbackQuery, a
 		return
 	}
 
-	existed, err := b.subs.Forget(ctx, cq.From.ID)
-	if err != nil {
-		log.Error("forget user failed", "err", err)
-		b.answerCallback(ctx, cq.ID, "Не вдалося видалити. Спробуй ще раз.", log)
-		return
-	}
-	log.Info("user data deleted", "existed", existed)
-	b.answerCallback(ctx, cq.ID, "Видалено", log)
+	b.answerCallback(ctx, cq.ID, "Тепер потрібне підтвердження текстом", log)
 	if msg != nil {
 		b.editText(ctx, msg,
-			"Усі твої дані видалені.\n\nЯкщо захочеш повернутись — просто напиши /start.", log)
+			"Ця кнопка більше не діє.\n\nЩоб видалити всі дані, надішли:\n<code>/stop "+stopWord+"</code>", log)
 	}
 }
 
