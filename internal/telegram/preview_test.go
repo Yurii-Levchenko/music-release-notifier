@@ -24,7 +24,7 @@ func TestPreview(t *testing.T) {
 			AppleMusic: "https://music.apple.com/jp/artist/1165017710",
 			Instagram:  "https://www.instagram.com/aimyon36/",
 		},
-	}))
+	}, testClock))
 
 	card, _ := renderCandidate("drake", []musicbrainz.Artist{{
 		MBID: "9fff2f8a-21e6-47de-a2b8-7f449929d43f", Name: "Drake",

@@ -89,11 +89,16 @@ func TestDispositionLabelsAreBounded(t *testing.T) {
 	m := New(reg)
 
 	for _, d := range []string{"sent", "transient", "permanent", "bad_message"} {
-		m.Notifications.WithLabelValues(d).Inc()
+		for _, kind := range []string{"release", "catch_up"} {
+			m.Notifications.WithLabelValues(d, kind).Inc()
+		}
 	}
 
-	if got := testutil.CollectAndCount(m.Notifications); got != 4 {
-		t.Fatalf("counted %d series, want 4", got)
+	// Four dispositions times two kinds, and no more: both label sets are
+	// closed, so the series count is a fixed number rather than something an
+	// upstream can grow.
+	if got := testutil.CollectAndCount(m.Notifications); got != 8 {
+		t.Fatalf("counted %d series, want 8", got)
 	}
 }
 
@@ -103,7 +108,7 @@ func TestNopMetricsAreSafeToUse(t *testing.T) {
 	m := Nop()
 
 	m.DeliverySeconds.Observe(0.5)
-	m.Notifications.WithLabelValues("sent").Inc()
+	m.Notifications.WithLabelValues("sent", "release").Inc()
 	m.BatchesAbandoned.Inc()
 	m.TelegramRequests.WithLabelValues("429").Inc()
 	m.TelegramRetryAfter.Observe(30)
@@ -128,9 +133,9 @@ func TestDuplicateRegistrationStaysUsable(t *testing.T) {
 	New(reg)
 	second := New(reg)
 
-	second.Notifications.WithLabelValues("sent").Inc()
+	second.Notifications.WithLabelValues("sent", "release").Inc()
 
-	if got := testutil.ToFloat64(second.Notifications.WithLabelValues("sent")); got != 1 {
+	if got := testutil.ToFloat64(second.Notifications.WithLabelValues("sent", "release")); got != 1 {
 		t.Fatalf("counter from the second Metrics recorded %v, want 1", got)
 	}
 	if _, err := reg.Gather(); err != nil {
@@ -146,8 +151,8 @@ func TestClosedLabelSetsExistFromStartup(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := New(reg)
 
-	if got := testutil.CollectAndCount(m.Notifications); got != 4 {
-		t.Errorf("notifications series at startup = %d, want 4", got)
+	if got := testutil.CollectAndCount(m.Notifications); got != 8 {
+		t.Errorf("notifications series at startup = %d, want 8", got)
 	}
 	if got := testutil.CollectAndCount(m.CoverSends); got != 3 {
 		t.Errorf("cover series at startup = %d, want 3", got)

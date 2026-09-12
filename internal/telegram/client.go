@@ -107,9 +107,13 @@ func (c *Client) SetCommands(ctx context.Context) error {
 // depends on the interface and never on this package.
 type Notifier struct {
 	client *Client
+	// now is injectable because the headline depends on how old the release is
+	// today, and a message whose wording changes with the calendar has to be
+	// testable without waiting for tomorrow.
+	now func() time.Time
 }
 
-func NewNotifier(c *Client) *Notifier { return &Notifier{client: c} }
+func NewNotifier(c *Client) *Notifier { return &Notifier{client: c, now: time.Now} }
 
 // Kind matches channels.kind in the database.
 func (n *Notifier) Kind() string { return "telegram" }
@@ -124,7 +128,7 @@ func (n *Notifier) Send(ctx context.Context, to notify.Recipient, rel notify.Rel
 		return &notify.DeliveryError{Disposition: notify.BadMessage, Err: err}
 	}
 
-	body := formatRelease(rel)
+	body := formatRelease(rel, n.now())
 
 	// Roughly a quarter of releases have no cover art (SPEC C27b), so the
 	// text-only path is normal operation, not a rare fallback.
@@ -228,18 +232,12 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 // 180 runes is well inside both and already longer than anyone reads in a chat.
 const maxTitleRunes = 180
 
-func formatRelease(rel notify.Release) string {
+func formatRelease(rel notify.Release, now time.Time) string {
 	var b strings.Builder
 	b.WriteString("🎵 <b>")
 	b.WriteString(html.EscapeString(rel.ArtistName))
-	// "recent", not "new", when the subscriber missed it. The release is days
-	// old and they can see the date two lines down; calling it new is the kind
-	// of small lie that makes somebody stop trusting the rest of the message.
-	if rel.CatchUp {
-		b.WriteString("</b> — недавній реліз")
-	} else {
-		b.WriteString("</b> — новий реліз")
-	}
+	b.WriteString("</b> — ")
+	b.WriteString(headline(rel.ReleaseDate, now))
 
 	// The Instagram handle goes in the header rather than with the streaming
 	// links, because it answers a different question: those are "where do I
@@ -390,4 +388,51 @@ func trimRunes(s string, n int) string {
 		return s
 	}
 	return string(runes[:n-1]) + "…"
+}
+
+// freshDays is how long a release still reads as "new".
+//
+// Two, not one. The poller runs daily, so a release announced the day after it
+// came out is the normal healthy path, not a late one.
+const freshDays = 2
+
+// headline says what kind of news this is.
+//
+// Driven by the release date rather than by how the notification came to be
+// queued, because those are different questions and only the first is the
+// reader's. The poll window is seven days wide and the feed filters on
+// release_date rather than on when a volunteer entered the record (C24c), so
+// the ordinary path routinely announces releases that are days old: measured
+// on live data, notifications have gone out 3, 5 and 7 days after the release
+// date, every one of them saying "new".
+//
+// The date is repeated on the line below. That is deliberate — this line is
+// what shows in a lock-screen preview, and "new" there when the record is five
+// days old is the part that misleads.
+func headline(released, now time.Time) string {
+	if released.IsZero() {
+		return "новий реліз"
+	}
+
+	days := int(now.UTC().Truncate(24*time.Hour).
+		Sub(released.UTC().Truncate(24*time.Hour)) / (24 * time.Hour))
+
+	if days < freshDays {
+		// Today or yesterday, and a future date lands here too: the poller
+		// guards against those, and if one slips through, "new" is the least
+		// wrong thing to call it.
+		return "новий реліз"
+	}
+	return "недавній реліз від " + dayAndMonth(released)
+}
+
+// monthsGenitive are the forms Ukrainian uses after a date: "від 7 вересня".
+var monthsGenitive = [...]string{
+	"січня", "лютого", "березня", "квітня", "травня", "червня",
+	"липня", "серпня", "вересня", "жовтня", "листопада", "грудня",
+}
+
+func dayAndMonth(t time.Time) string {
+	t = t.UTC()
+	return fmt.Sprintf("%d %s", t.Day(), monthsGenitive[t.Month()-1])
 }

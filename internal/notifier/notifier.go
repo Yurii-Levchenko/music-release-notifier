@@ -281,7 +281,6 @@ func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) outcome {
 		ReleaseDate: p.ReleaseDate,
 		CoverURL:    p.CoverURL,
 		InfoURL:     p.InfoURL,
-		CatchUp:     p.CatchUp,
 		Links: notify.ArtistLinks{
 			Spotify:    p.Spotify,
 			YouTube:    p.YouTube,
@@ -293,7 +292,7 @@ func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) outcome {
 	n.metrics.DeliverySeconds.Observe(n.now().Sub(start).Seconds())
 
 	if sendErr == nil {
-		n.metrics.Notifications.WithLabelValues("sent").Inc()
+		n.metrics.Notifications.WithLabelValues("sent", kindLabel(p)).Inc()
 		if err := n.queue.MarkSent(ctx, p.ID); err != nil {
 			// The message went out. Failing to record that means it will be sent
 			// again when the lease expires — worth an error, not a retry.
@@ -307,7 +306,7 @@ func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) outcome {
 	disposition, retryAfter := notify.DispositionOf(sendErr)
 	switch disposition {
 	case notify.Permanent:
-		n.metrics.Notifications.WithLabelValues("permanent").Inc()
+		n.metrics.Notifications.WithLabelValues("permanent", kindLabel(p)).Inc()
 		// The chat is gone for good. Drop the subscriptions rather than
 		// rediscovering this on every release for the rest of time.
 		log.Info("recipient is unreachable, dropping subscriptions", "err", sendErr)
@@ -320,7 +319,7 @@ func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) outcome {
 		return outcomeDropped
 
 	case notify.BadMessage:
-		n.metrics.Notifications.WithLabelValues("bad_message").Inc()
+		n.metrics.Notifications.WithLabelValues("bad_message", kindLabel(p)).Inc()
 		// Our bug, not their fault. The subscription stays: a malformed caption
 		// must not cost somebody the artists they follow.
 		log.Error("message rejected, dropping this notification only", "err", sendErr)
@@ -330,7 +329,7 @@ func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) outcome {
 		return outcomeDone
 
 	default: // notify.Transient
-		n.metrics.Notifications.WithLabelValues("transient").Inc()
+		n.metrics.Notifications.WithLabelValues("transient", kindLabel(p)).Inc()
 		gaveUp, err := n.queue.Retry(ctx, p.ID, p.Attempts, retryAfter, sendErr.Error())
 		if err != nil {
 			log.Error("could not reschedule", "err", err)
@@ -362,4 +361,15 @@ func (n *Notifier) waitForSlot(ctx context.Context, chatID int64) error {
 		}
 	}
 	return n.global.Wait(ctx)
+}
+
+// kindLabel reports why the notification exists, which is a different question
+// from how old the release is and is not visible anywhere else once the row is
+// sent. It is the number that says whether the catch-up path is delivering
+// anything worth having.
+func kindLabel(p *storage.Pending) string {
+	if p.CatchUp {
+		return "catch_up"
+	}
+	return "release"
 }

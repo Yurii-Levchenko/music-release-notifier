@@ -50,7 +50,7 @@ func TestFormatReleaseEscapesHTML(t *testing.T) {
 		InfoURL:     "https://musicbrainz.org/release-group/abc?x=1&y=2",
 	}
 
-	out := formatRelease(rel)
+	out := formatRelease(rel, testClock)
 
 	for _, raw := range []string{"Simon & Garfunkel", "<Untitled>", "?x=1&y=2"} {
 		if strings.Contains(out, raw) {
@@ -76,7 +76,7 @@ func TestFormatReleaseWithoutURL(t *testing.T) {
 		ArtistName:  "Aphex Twin",
 		Title:       "Selected Ambient Works",
 		PrimaryType: "EP",
-	})
+	}, testClock)
 	// The title must not be a link without an URL to point at. The listen row
 	// below it legitimately is one, so this checks the title's own line.
 	title := strings.Split(out, nlChar)[2]
@@ -119,7 +119,7 @@ func TestListenRowSearchesForTheRelease(t *testing.T) {
 			YouTube:    "https://www.youtube.com/channel/UC0VOyT2OCBKdQhF3BAbZ-1g",
 			AppleMusic: "https://music.apple.com/us/artist/412778295",
 		},
-	})
+	}, testClock)
 
 	// The release title has to be in every query, or the link is no better
 	// than the artist page it replaced.
@@ -152,7 +152,7 @@ func TestOnlyPlatformsTheArtistIsKnownOnAreOffered(t *testing.T) {
 	got := formatRelease(notify.Release{
 		ArtistName: "LATERNO", Title: "Briefly",
 		Links: notify.ArtistLinks{Spotify: "https://open.spotify.com/artist/X"},
-	})
+	}, testClock)
 
 	if !strings.Contains(got, "Spotify") {
 		t.Fatalf("Spotify missing:\n%s", got)
@@ -165,7 +165,7 @@ func TestOnlyPlatformsTheArtistIsKnownOnAreOffered(t *testing.T) {
 // Absent data is not evidence of absence: MusicBrainz coverage is patchy, so
 // knowing nothing about an artist must not mean offering nothing.
 func TestAllPlatformsWhenNothingIsKnown(t *testing.T) {
-	got := formatRelease(notify.Release{ArtistName: "Soft Vein", Title: "All We Have Known"})
+	got := formatRelease(notify.Release{ArtistName: "Soft Vein", Title: "All We Have Known"}, testClock)
 
 	for _, want := range []string{"Spotify", "YouTube", "Apple Music"} {
 		if !strings.Contains(got, want) {
@@ -191,7 +191,7 @@ func TestSearchQueryIsBounded(t *testing.T) {
 // where the row is genuinely empty. An artist with no *known* links is not
 // that case — see TestAllPlatformsWhenNothingIsKnown.
 func TestNoTitleMeansNoListenRow(t *testing.T) {
-	got := formatRelease(notify.Release{PrimaryType: "Single"})
+	got := formatRelease(notify.Release{PrimaryType: "Single"}, testClock)
 
 	if strings.Contains(got, "▶") {
 		t.Fatalf("a listen row was rendered with nothing to search for:\n%s", got)
@@ -203,7 +203,7 @@ func TestOnlyKnownLinksAreRendered(t *testing.T) {
 	got := formatRelease(notify.Release{
 		ArtistName: "X", Title: "Y",
 		Links: notify.ArtistLinks{YouTube: "https://www.youtube.com/channel/Z"},
-	})
+	}, testClock)
 
 	if !strings.Contains(got, "YouTube") {
 		t.Fatalf("YouTube missing:\n%s", got)
@@ -219,7 +219,7 @@ func TestOnlyKnownLinksAreRendered(t *testing.T) {
 func TestAbsurdlyLongTitleIsTrimmed(t *testing.T) {
 	got := formatRelease(notify.Release{
 		ArtistName: "X", Title: strings.Repeat("а", 5000), PrimaryType: "Album",
-	})
+	}, testClock)
 
 	// Telegram counts a caption after entity parsing, so URLs inside href
 	// attributes do not count — the earlier version of this test measured the
@@ -238,7 +238,7 @@ func TestAbsurdlyLongTitleIsTrimmed(t *testing.T) {
 func TestTrimCountsRunesNotBytes(t *testing.T) {
 	title := strings.Repeat("唇", 100) // 300 bytes, 100 runes
 
-	got := formatRelease(notify.Release{ArtistName: "X", Title: title})
+	got := formatRelease(notify.Release{ArtistName: "X", Title: title}, testClock)
 
 	if !strings.Contains(got, title) {
 		t.Fatalf("a 100-rune title was trimmed as if it were 300 characters:\n%s", got)
@@ -255,7 +255,7 @@ func TestInstagramHandleIsInTheHeader(t *testing.T) {
 			Instagram: "https://www.instagram.com/aimyon36/",
 			Spotify:   "https://open.spotify.com/artist/X",
 		},
-	})
+	}, testClock)
 
 	header := strings.SplitN(got, "\n", 2)[0]
 	if !strings.Contains(header, "@aimyon36") {
@@ -273,7 +273,7 @@ func TestInstagramAloneStillOffersSearches(t *testing.T) {
 	got := formatRelease(notify.Release{
 		ArtistName: "X", Title: "Y",
 		Links: notify.ArtistLinks{Instagram: "https://www.instagram.com/x/"},
-	})
+	}, testClock)
 
 	if !strings.Contains(got, "@x") {
 		t.Fatalf("the handle is missing:\n%s", got)
@@ -290,7 +290,7 @@ func TestNonProfileInstagramURLRendersNothing(t *testing.T) {
 	got := formatRelease(notify.Release{
 		ArtistName: "X", Title: "Y",
 		Links: notify.ArtistLinks{Instagram: "https://www.instagram.com/p/Cabcdef/"},
-	})
+	}, testClock)
 
 	if strings.Contains(got, "@") {
 		t.Fatalf("a post URL was rendered as a handle:\n%s", got)
@@ -305,4 +305,88 @@ const nlChar = "\n"
 // caption and message limits.
 func visibleText(html string) string {
 	return regexp.MustCompile(`<[^>]*>`).ReplaceAllString(html, "")
+}
+
+// The wording follows how old the release is, not how the notification came to
+// be queued. Those are different questions and only the first is the reader's:
+// measured on live data, the ordinary fan-out path has announced releases 3, 5
+// and 7 days after their release date, every one of them saying "new".
+func TestHeadlineFollowsTheReleaseDate(t *testing.T) {
+	now := time.Date(2026, 9, 12, 20, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name     string
+		released time.Time
+		want     string
+	}{
+		{"today", time.Date(2026, 9, 12, 0, 0, 0, 0, time.UTC), "новий реліз"},
+		{"yesterday", time.Date(2026, 9, 11, 0, 0, 0, 0, time.UTC), "новий реліз"},
+		{"two days", time.Date(2026, 9, 10, 0, 0, 0, 0, time.UTC), "недавній реліз від 10 вересня"},
+		{"five days", time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC), "недавній реліз від 7 вересня"},
+		{"a week", time.Date(2026, 9, 5, 0, 0, 0, 0, time.UTC), "недавній реліз від 5 вересня"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := headline(tc.released, now); got != tc.want {
+				t.Fatalf("headline = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// Yesterday is the normal healthy path — the poller runs daily — so it must
+// not read as late.
+func TestYesterdayIsStillNew(t *testing.T) {
+	now := time.Date(2026, 9, 12, 3, 0, 0, 0, time.UTC)
+	yesterday := time.Date(2026, 9, 11, 22, 0, 0, 0, time.UTC)
+
+	if got := headline(yesterday, now); got != "новий реліз" {
+		t.Fatalf("headline = %q, want it to still read as new", got)
+	}
+}
+
+// A missing or future date must not produce a strange headline. The poller
+// guards against future dates; if one slips through, "new" is the least wrong
+// thing to call it.
+func TestHeadlineHandlesMissingAndFutureDates(t *testing.T) {
+	now := time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
+
+	if got := headline(time.Time{}, now); got != "новий реліз" {
+		t.Errorf("missing date = %q", got)
+	}
+	if got := headline(now.AddDate(0, 0, 3), now); got != "новий реліз" {
+		t.Errorf("future date = %q", got)
+	}
+}
+
+// Ukrainian puts the month in the genitive after a date: "від 7 вересня", not
+// "від 7 вересень".
+func TestMonthGenitiveForms(t *testing.T) {
+	for month, want := range map[time.Month]string{
+		time.January: "1 січня", time.March: "3 березня", time.May: "5 травня",
+		time.September: "9 вересня", time.November: "11 листопада", time.December: "12 грудня",
+	} {
+		got := dayAndMonth(time.Date(2026, month, int(month), 0, 0, 0, 0, time.UTC))
+		if got != want {
+			t.Errorf("dayAndMonth(%v) = %q, want %q", month, got, want)
+		}
+	}
+}
+
+// The header is what shows in a lock-screen preview, so an old release has to
+// say so there and not only on the line below.
+func TestAnOldReleaseSaysSoInTheHeader(t *testing.T) {
+	now := time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
+	got := formatRelease(notify.Release{
+		ArtistName: "Ado", Title: "好きでいて", PrimaryType: "Single",
+		ReleaseDate: time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC),
+	}, now)
+
+	header := strings.SplitN(got, nlChar, 2)[0]
+	if !strings.Contains(header, "від 7 вересня") {
+		t.Fatalf("header = %q, want the release date", header)
+	}
+	if strings.Contains(header, "новий") {
+		t.Fatalf("a five-day-old release is announced as new: %q", header)
+	}
 }

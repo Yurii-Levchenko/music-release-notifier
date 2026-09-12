@@ -28,12 +28,6 @@ type Release struct {
 	CoverURL string
 	InfoURL  string
 
-	// CatchUp marks a release the subscriber missed: they subscribed after it
-	// came out, within the catch-up window. A property of this notification
-	// rather than of the release, carried here because the alternative is a
-	// wider Notifier interface for one boolean that only changes two words.
-	CatchUp bool
-
 	// Links are the artist's own destinations. Empty is normal: they are
 	// looked up once per artist, and an artist subscribed to before that
 	// lookup existed has none. A channel must render fine without them.

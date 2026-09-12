@@ -33,10 +33,12 @@ type Metrics struct {
 	// a message take" rather than "how long did the batch take".
 	DeliverySeconds prometheus.Histogram
 
-	// Notifications counts outcomes by disposition: sent, transient,
-	// permanent, bad_message. The ratio between them is the health of the
-	// delivery path, and permanent is the one that costs somebody their
-	// subscriptions.
+	// Notifications counts outcomes by disposition — sent, transient,
+	// permanent, bad_message — and by why the row exists: an ordinary release
+	// fan-out or a catch-up queued when somebody subscribed. The ratio between
+	// dispositions is the health of the delivery path, permanent is the one
+	// that costs somebody their subscriptions, and the kind split is what says
+	// whether the catch-up path earns its keep.
 	Notifications *prometheus.CounterVec
 
 	// BatchesAbandoned counts batches cut short because the server asked us to
@@ -92,7 +94,7 @@ func New(reg prometheus.Registerer) *Metrics {
 			Namespace: namespace,
 			Name:      "notifications_total",
 			Help:      "Delivery attempts by outcome.",
-		}, "disposition"),
+		}, "disposition", "kind"),
 		BatchesAbandoned: factory.counter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "delivery_batches_abandoned_total",
@@ -173,7 +175,9 @@ func New(reg prometheus.Registerer) *Metrics {
 // invented row for a code that never occurred is a claim, not a zero.
 func (m *Metrics) initSeries() {
 	for _, disposition := range []string{"sent", "transient", "permanent", "bad_message"} {
-		m.Notifications.WithLabelValues(disposition)
+		for _, kind := range []string{"release", "catch_up"} {
+			m.Notifications.WithLabelValues(disposition, kind)
+		}
 	}
 	for _, outcome := range []string{"ok", "retried_ok", "degraded_to_text"} {
 		m.CoverSends.WithLabelValues(outcome)
