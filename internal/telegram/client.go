@@ -237,14 +237,21 @@ func formatRelease(rel notify.Release, now time.Time) string {
 	b.WriteString("🎵 <b>")
 	b.WriteString(html.EscapeString(rel.ArtistName))
 	b.WriteString("</b> — ")
-	b.WriteString(headline(rel.ReleaseDate, now))
+	b.WriteString(releaseLabel(rel.ReleaseDate, now))
 
-	// The Instagram handle goes in the header rather than with the streaming
-	// links, because it answers a different question: those are "where do I
-	// play this", this is "who is this".
+	// The handle sits between the label and the date, next to the artist it
+	// belongs to. It goes in the header rather than with the streaming links
+	// because it answers a different question: those are "where do I play
+	// this", this is "who is this".
 	if handle := musicbrainz.InstagramHandle(rel.Links.Instagram); handle != "" {
 		b.WriteString(" ")
 		b.WriteString(link(rel.Links.Instagram, "@"+handle))
+	}
+
+	// The date last, so it reads as a qualifier on the whole line.
+	if on := releasedOn(rel.ReleaseDate, now); on != "" {
+		b.WriteString(" ")
+		b.WriteString(on)
 	}
 
 	b.WriteString("\n\n")
@@ -396,34 +403,46 @@ func trimRunes(s string, n int) string {
 // came out is the normal healthy path, not a late one.
 const freshDays = 2
 
-// headline says what kind of news this is.
+// releaseLabel and releasedOn are the two halves of the header, split so the
+// Instagram handle can sit between them — next to the artist it belongs to,
+// with the date trailing as a qualifier on the whole line.
 //
-// Driven by the release date rather than by how the notification came to be
-// queued, because those are different questions and only the first is the
+// Both are driven by the release date rather than by how the notification came
+// to be queued, because those are different questions and only the first is the
 // reader's. The poll window is seven days wide and the feed filters on
 // release_date rather than on when a volunteer entered the record (C24c), so
-// the ordinary path routinely announces releases that are days old: measured
-// on live data, notifications have gone out 3, 5 and 7 days after the release
+// the ordinary path routinely announces releases that are days old: measured on
+// live data, notifications have gone out 3, 5 and 7 days after the release
 // date, every one of them saying "new".
+func releaseLabel(released, now time.Time) string {
+	if isFresh(released, now) {
+		return "новий реліз"
+	}
+	return "недавній реліз"
+}
+
+// releasedOn is the trailing date, empty while the release still reads as new.
 //
 // The date is repeated on the line below. That is deliberate — this line is
 // what shows in a lock-screen preview, and "new" there when the record is five
 // days old is the part that misleads.
-func headline(released, now time.Time) string {
-	if released.IsZero() {
-		return "новий реліз"
+func releasedOn(released, now time.Time) string {
+	if isFresh(released, now) {
+		return ""
 	}
+	return "від " + dayAndMonth(released)
+}
 
+func isFresh(released, now time.Time) bool {
+	if released.IsZero() {
+		return true
+	}
 	days := int(now.UTC().Truncate(24*time.Hour).
 		Sub(released.UTC().Truncate(24*time.Hour)) / (24 * time.Hour))
 
-	if days < freshDays {
-		// Today or yesterday, and a future date lands here too: the poller
-		// guards against those, and if one slips through, "new" is the least
-		// wrong thing to call it.
-		return "новий реліз"
-	}
-	return "недавній реліз від " + dayAndMonth(released)
+	// A future date lands here too: the poller guards against those, and if one
+	// slips through, "new" is the least wrong thing to call it.
+	return days < freshDays
 }
 
 // monthsGenitive are the forms Ukrainian uses after a date: "від 7 вересня".

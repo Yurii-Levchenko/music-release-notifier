@@ -327,8 +327,11 @@ func TestHeadlineFollowsTheReleaseDate(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := headline(tc.released, now); got != tc.want {
-				t.Fatalf("headline = %q, want %q", got, tc.want)
+			// The two halves, joined as they are when there is no handle
+			// between them.
+			got := strings.TrimSpace(releaseLabel(tc.released, now) + " " + releasedOn(tc.released, now))
+			if got != tc.want {
+				t.Fatalf("header = %q, want %q", got, tc.want)
 			}
 		})
 	}
@@ -340,8 +343,11 @@ func TestYesterdayIsStillNew(t *testing.T) {
 	now := time.Date(2026, 9, 12, 3, 0, 0, 0, time.UTC)
 	yesterday := time.Date(2026, 9, 11, 22, 0, 0, 0, time.UTC)
 
-	if got := headline(yesterday, now); got != "новий реліз" {
-		t.Fatalf("headline = %q, want it to still read as new", got)
+	if got := releaseLabel(yesterday, now); got != "новий реліз" {
+		t.Fatalf("label = %q, want it to still read as new", got)
+	}
+	if on := releasedOn(yesterday, now); on != "" {
+		t.Fatalf("a date was added to a fresh release: %q", on)
 	}
 }
 
@@ -351,10 +357,13 @@ func TestYesterdayIsStillNew(t *testing.T) {
 func TestHeadlineHandlesMissingAndFutureDates(t *testing.T) {
 	now := time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
 
-	if got := headline(time.Time{}, now); got != "новий реліз" {
+	if got := releaseLabel(time.Time{}, now); got != "новий реліз" {
 		t.Errorf("missing date = %q", got)
 	}
-	if got := headline(now.AddDate(0, 0, 3), now); got != "новий реліз" {
+	if on := releasedOn(time.Time{}, now); on != "" {
+		t.Errorf("a missing date produced a suffix: %q", on)
+	}
+	if got := releaseLabel(now.AddDate(0, 0, 3), now); got != "новий реліз" {
 		t.Errorf("future date = %q", got)
 	}
 }
@@ -388,5 +397,44 @@ func TestAnOldReleaseSaysSoInTheHeader(t *testing.T) {
 	}
 	if strings.Contains(header, "новий") {
 		t.Fatalf("a five-day-old release is announced as new: %q", header)
+	}
+}
+
+// The handle belongs next to the artist it names, with the date trailing as a
+// qualifier on the whole line.
+func TestHeaderOrderIsLabelHandleDate(t *testing.T) {
+	now := time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
+	got := formatRelease(notify.Release{
+		ArtistName: "あいみょん", Title: "Sleepy", PrimaryType: "Single",
+		ReleaseDate: time.Date(2026, 9, 9, 0, 0, 0, 0, time.UTC),
+		Links:       notify.ArtistLinks{Instagram: "https://www.instagram.com/aimyon36/"},
+	}, now)
+
+	header := visibleText(strings.SplitN(got, nlChar, 2)[0])
+	want := "🎵 あいみょん — недавній реліз @aimyon36 від 9 вересня"
+	if header != want {
+		t.Fatalf("header = %q, want %q", header, want)
+	}
+}
+
+// Without a handle the two halves have to join cleanly, with no double space
+// and nothing dangling.
+func TestHeaderWithoutAHandle(t *testing.T) {
+	now := time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
+
+	old := visibleText(strings.SplitN(formatRelease(notify.Release{
+		ArtistName: "X", Title: "Y",
+		ReleaseDate: time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC),
+	}, now), nlChar, 2)[0])
+	if old != "🎵 X — недавній реліз від 7 вересня" {
+		t.Errorf("old release header = %q", old)
+	}
+
+	fresh := visibleText(strings.SplitN(formatRelease(notify.Release{
+		ArtistName: "X", Title: "Y",
+		ReleaseDate: time.Date(2026, 9, 12, 0, 0, 0, 0, time.UTC),
+	}, now), nlChar, 2)[0])
+	if fresh != "🎵 X — новий реліз" {
+		t.Errorf("fresh release header = %q", fresh)
 	}
 }
