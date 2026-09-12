@@ -187,8 +187,8 @@ func TestIsSubscribed(t *testing.T) {
 	}
 }
 
-// Paging must be stable: sorted by name, so subscribing mid-browse cannot
-// shuffle someone onto a page they already looked at.
+// Paging must be stable: sorted by subscription time, oldest first, so a new
+// subscription appends rather than shifting everything already on a page.
 func TestListPagination(t *testing.T) {
 	ctx, subs := testSubs(t)
 
@@ -197,9 +197,9 @@ func TestListPagination(t *testing.T) {
 	// depend on Go's hash seed. The previous version of this test asserted
 	// alphabetical order, which hid that.
 	for _, sub := range []struct{ mbid, name string }{
-		{mbidA, "Charlie"}, // subscribed first, so listed last
+		{mbidA, "Charlie"}, // subscribed first, so listed first
 		{mbidB, "Alice"},
-		{mbidC, "Bob"}, // subscribed last, so listed first
+		{mbidC, "Bob"}, // subscribed last, so listed last
 	} {
 		if _, err := subs.Subscribe(ctx, testChatID,
 			storage.ArtistRef{MBID: sub.mbid, Name: sub.name}, "bot"); err != nil {
@@ -214,13 +214,14 @@ func TestListPagination(t *testing.T) {
 	if total != 3 {
 		t.Fatalf("total = %d, want 3", total)
 	}
-	// Newest first: the artist just added is what somebody opening the list
-	// most likely came for.
-	if len(page1) != 2 || page1[0].Name != "Bob" || page1[1].Name != "Alice" {
-		t.Fatalf("page 1 = %+v, want Bob then Alice", page1)
+	// Oldest first, so a number keeps meaning the same artist. The buttons
+	// unsubscribe by position, and a list that renumbers itself on every new
+	// subscription is a way to unsubscribe from the wrong artist.
+	if len(page1) != 2 || page1[0].Name != "Charlie" || page1[1].Name != "Alice" {
+		t.Fatalf("page 1 = %+v, want Charlie then Alice", page1)
 	}
-	if page1[0].SubscribedAt.Before(page1[1].SubscribedAt) {
-		t.Fatalf("page 1 is not in descending subscription order: %+v", page1)
+	if page1[0].SubscribedAt.After(page1[1].SubscribedAt) {
+		t.Fatalf("page 1 is not in ascending subscription order: %+v", page1)
 	}
 	if page1[0].SubscribedAt.IsZero() {
 		t.Fatal("SubscribedAt was not returned")
@@ -230,8 +231,8 @@ func TestListPagination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list page 2: %v", err)
 	}
-	if len(page2) != 1 || page2[0].Name != "Charlie" {
-		t.Fatalf("page 2 = %+v, want Charlie", page2)
+	if len(page2) != 1 || page2[0].Name != "Bob" {
+		t.Fatalf("page 2 = %+v, want Bob", page2)
 	}
 
 	// Past the end is empty, not an error: the last item can vanish under a
@@ -300,5 +301,49 @@ func TestForgetCascades(t *testing.T) {
 	existed, err = subs.Forget(ctx, testChatID)
 	if err != nil || existed {
 		t.Fatalf("second forget: existed=%v err=%v", existed, err)
+	}
+}
+
+// The property the order exists for: a new subscription must not renumber the
+// ones already there. The buttons act on position, so a shifting list is a way
+// to unsubscribe from the wrong artist.
+func TestSubscribingDoesNotRenumberTheExistingList(t *testing.T) {
+	ctx, subs := testSubs(t)
+
+	for _, sub := range []struct{ mbid, name string }{
+		{mbidA, "First"}, {mbidB, "Second"},
+	} {
+		if _, err := subs.Subscribe(ctx, testChatID,
+			storage.ArtistRef{MBID: sub.mbid, Name: sub.name}, "bot"); err != nil {
+			t.Fatalf("subscribe %s: %v", sub.name, err)
+		}
+	}
+
+	before, _, err := subs.List(ctx, testChatID, 20, 0)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if _, err := subs.Subscribe(ctx, testChatID,
+		storage.ArtistRef{MBID: mbidC, Name: "Third"}, "bot"); err != nil {
+		t.Fatalf("subscribe Third: %v", err)
+	}
+
+	after, _, err := subs.List(ctx, testChatID, 20, 0)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(after) != len(before)+1 {
+		t.Fatalf("list went from %d to %d entries", len(before), len(after))
+	}
+	for i := range before {
+		if after[i].MBID != before[i].MBID {
+			t.Fatalf("position %d changed from %q to %q after a new subscription",
+				i+1, before[i].Name, after[i].Name)
+		}
+	}
+	if after[len(after)-1].Name != "Third" {
+		t.Fatalf("the new subscription is at position %d, not last", len(after))
 	}
 }

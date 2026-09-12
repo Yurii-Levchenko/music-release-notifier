@@ -117,16 +117,22 @@ func (s *Subscriptions) IsSubscribed(ctx context.Context, chatID int64, mbid str
 
 // List returns one page of a user's subscriptions plus the total count.
 //
-// Ordered by when the subscription was made, newest first.
+// Ordered by when the subscription was made, oldest first.
 //
-// This replaces alphabetical order, and the comment that used to be here
-// argued against it: a new subscription inserts at position 1 and shifts
-// everything after it, so subscribing mid-browse can repeat one row on the
-// next page. That is true, and it is a smaller problem than it sounds — the
-// page holds 20, subscribing happens from a search card rather than from the
-// list, and OFFSET pagination has the same flaw under any order that a new row
-// can land in front of. Keyset pagination would fix it properly and is more
-// machinery than a list of this size has ever needed.
+// The numbers are what the unsubscribe buttons act on, so the order that
+// matters is the one where a number keeps meaning the same artist. Appending
+// at the end does that: subscribing to somebody new leaves every existing
+// position untouched. Newest-first — which this briefly was — renumbers the
+// entire list on every subscription, which is a way to unsubscribe from the
+// wrong artist.
+//
+// It also removes the pagination flaw that came with newest-first. A row that
+// can only ever be appended cannot shift anything already on a page, so OFFSET
+// paging is exactly correct here rather than correct-enough.
+//
+// The cost is that a fresh subscription lands on the last page. Small, because
+// unsubscribing right after subscribing is done from the search card, which
+// still has its own button and does not involve this list at all.
 func (s *Subscriptions) List(ctx context.Context, chatID int64, limit, offset int) (items []Subscription, total int, err error) {
 	if limit <= 0 {
 		limit = 20
@@ -146,13 +152,6 @@ func (s *Subscriptions) List(ctx context.Context, chatID int64, limit, offset in
 		return nil, 0, nil
 	}
 
-	// Newest subscription first, not alphabetical.
-	//
-	// The list is paginated and its buttons unsubscribe by position, so what
-	// belongs on the first page is what the reader most likely came for: the
-	// artist they just added, usually because they want to undo it. Alphabetical
-	// order buries a fresh mistake somewhere in the middle.
-	//
 	// a.mbid breaks ties. Two subscriptions can share a created_at — the
 	// extension will add several at once in S9 — and an ORDER BY that is not
 	// total lets the same row appear on two pages, or on neither.
@@ -161,7 +160,7 @@ func (s *Subscriptions) List(ctx context.Context, chatID int64, limit, offset in
 		FROM subscriptions s
 		JOIN artists a ON a.mbid = s.artist_mbid
 		WHERE s.user_id = (SELECT id FROM users WHERE telegram_chat_id = $1)
-		ORDER BY s.created_at DESC, a.mbid
+		ORDER BY s.created_at, a.mbid
 		LIMIT $2 OFFSET $3`,
 		chatID, limit, offset)
 	if err != nil {
