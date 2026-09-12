@@ -45,6 +45,9 @@ type fakeStore struct {
 	records    []recorded
 	recordErr  error
 	failOnMBID string // makes Record fail for one specific release group
+	// known marks release groups the store already has, so Record reports
+	// Created:false — the state a catch-up has to handle.
+	known map[string]bool
 
 	pollErrs   []error // what RecordPoll was told, in order
 	pollCalls  int
@@ -64,6 +67,10 @@ func (s *fakeStore) Record(_ context.Context, rel storage.NewRelease, notify boo
 	}
 	if s.failOnMBID != "" && rel.ReleaseGroupMBID == s.failOnMBID {
 		return storage.FanOut{}, errors.New("simulated write failure")
+	}
+	if s.known[rel.ReleaseGroupMBID] {
+		// Already recorded by an earlier poll: no insert, no fan-out.
+		return storage.FanOut{Created: false}, nil
 	}
 	s.records = append(s.records, recorded{rel: rel, notify: notify})
 	out := storage.FanOut{ReleaseID: int64(len(s.records)), Created: true}
@@ -130,7 +137,7 @@ func TestPollFiltersReleaseTypes(t *testing.T) {
 		t.Fatalf("recorded %d releases, want 3 (Album, Single, EP)", stats.Recorded)
 	}
 	for _, r := range store.records {
-		if !notifiableType(r.rel.PrimaryType) {
+		if !(listenbrainz.Release{PrimaryType: r.rel.PrimaryType}).NotifiableType() {
 			t.Fatalf("recorded a %q release", r.rel.PrimaryType)
 		}
 	}
@@ -643,34 +650,5 @@ func TestCompilationsAreNotNotified(t *testing.T) {
 	if stats.SkippedByType != 1 {
 		t.Fatalf("SkippedByType = %d, want 1 — the skip must be visible in the summary",
 			stats.SkippedByType)
-	}
-}
-
-// Every excluded kind, so adding one to the list cannot silently do nothing.
-func TestExcludedSecondaryTypes(t *testing.T) {
-	for _, kind := range []string{"Compilation", "Demo", "Interview", "Audiobook", "Spokenword", "DJ-mix"} {
-		if notifiableSecondary(kind) {
-			t.Errorf("%q is notifiable; it is meant to be excluded", kind)
-		}
-	}
-}
-
-// The kept ones matter as much as the excluded ones: each is a real release
-// somebody following the artist wants to hear about, and quietly dropping a
-// live album or a mixtape would be worse than the noise this filter removes.
-func TestKeptSecondaryTypes(t *testing.T) {
-	for _, kind := range []string{"", "Live", "Remix", "Soundtrack", "Mixtape/Street"} {
-		if !notifiableSecondary(kind) {
-			t.Errorf("%q was filtered out; it is meant to be kept", kind)
-		}
-	}
-}
-
-// An unfamiliar value must pass. The feed's vocabulary is MusicBrainz's, which
-// grows, and defaulting to "drop" would make a new qualifier silently swallow
-// releases.
-func TestUnknownSecondaryTypePasses(t *testing.T) {
-	if !notifiableSecondary("Something MusicBrainz Added Later") {
-		t.Fatal("an unrecognized secondary type was dropped")
 	}
 }

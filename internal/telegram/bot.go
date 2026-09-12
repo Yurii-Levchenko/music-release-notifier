@@ -47,6 +47,22 @@ type Bot struct {
 	// now is injectable because the artist card shows an age, and a fact that
 	// changes with the calendar must be testable without waiting a year.
 	now func() time.Time
+
+	// catchUp is optional; nil disables the recent-release lookup on subscribe.
+	catchUp CatchUp
+}
+
+// CatchUp queues anything an artist released in the last few days for a
+// subscriber who just signed up. Implemented by the poller, which already owns
+// the feed and the release-recording path.
+type CatchUp interface {
+	CatchUp(ctx context.Context, chatID int64, artistMBID string) (queued int, err error)
+}
+
+// WithCatchUp enables the recent-release lookup on subscribe.
+func (b *Bot) WithCatchUp(c CatchUp) *Bot {
+	b.catchUp = c
+	return b
 }
 
 func NewBot(

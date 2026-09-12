@@ -52,6 +52,10 @@ type Pending struct {
 	UserID   int64
 	ChatID   int64
 	Attempts int
+	// CatchUp marks a notification queued because somebody subscribed to an
+	// artist who had just released something, rather than because the release
+	// was new to us. It changes the wording, nothing else.
+	CatchUp bool
 
 	ReleaseID        int64
 	ReleaseGroupMBID string
@@ -116,7 +120,7 @@ func (n *Notifications) Claim(ctx context.Context, limit int) ([]Pending, error)
 		  AND u.id = n.user_id
 		  AND r.id = n.release_id
 		  AND a.mbid = r.artist_mbid
-		RETURNING n.id, n.user_id, u.telegram_chat_id, n.attempts,
+		RETURNING n.id, n.user_id, u.telegram_chat_id, n.attempts, n.kind = 'catch_up',
 		          r.id, r.release_group_mbid, r.artist_mbid, a.name, r.title, r.primary_type,
 		          r.release_date, coalesce(r.cover_url, ''),
 		          coalesce(a.links->>'spotify', ''),
@@ -132,7 +136,7 @@ func (n *Notifications) Claim(ctx context.Context, limit int) ([]Pending, error)
 	var out []Pending
 	for rows.Next() {
 		var p Pending
-		if err := rows.Scan(&p.ID, &p.UserID, &p.ChatID, &p.Attempts,
+		if err := rows.Scan(&p.ID, &p.UserID, &p.ChatID, &p.Attempts, &p.CatchUp,
 			&p.ReleaseID, &p.ReleaseGroupMBID, &p.ArtistMBID, &p.ArtistName, &p.Title, &p.PrimaryType,
 			&p.ReleaseDate, &p.CoverURL,
 			&p.Spotify, &p.YouTube, &p.AppleMusic, &p.Instagram); err != nil {

@@ -519,3 +519,122 @@ func TestLinkFetchStateSeparatesNeverLookedFromNoneFound(t *testing.T) {
 		t.Fatal("an artist with no links is indistinguishable from one never checked")
 	}
 }
+
+// A catch-up row has to reach the channel marked as one, or the message says
+// "new release" about something three days old — a small lie that costs trust
+// in the rest of it.
+func TestClaimReportsACatchUpNotification(t *testing.T) {
+	ctx, tx := testTx(t)
+	f := outboxFixtures(ctx, t, tx, -999000130,
+		"aaaa1111-0000-4000-8000-000000000130", "bbbb1111-0000-4000-8000-000000000130")
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE notifications SET kind = 'catch_up' WHERE id = $1`, f.notifID); err != nil {
+		t.Fatalf("mark catch-up: %v", err)
+	}
+
+	outbox := storage.NewNotifications(tx, 5*time.Minute, 5)
+	batch, err := outbox.Claim(ctx, outboxLimit)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	got := find(batch, f.notifID)
+	if got == nil {
+		t.Fatalf("claim missed notification %d", f.notifID)
+	}
+	if !got.CatchUp {
+		t.Fatal("a catch_up notification was claimed as an ordinary release")
+	}
+}
+
+// The default has to stay 'release', or every existing row and every poller
+// fan-out would start describing itself as a catch-up.
+func TestOrdinaryNotificationsAreNotCatchUps(t *testing.T) {
+	ctx, tx := testTx(t)
+	f := outboxFixtures(ctx, t, tx, -999000131,
+		"aaaa1111-0000-4000-8000-000000000131", "bbbb1111-0000-4000-8000-000000000131")
+
+	outbox := storage.NewNotifications(tx, 5*time.Minute, 5)
+	batch, err := outbox.Claim(ctx, outboxLimit)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	got := find(batch, f.notifID)
+	if got == nil {
+		t.Fatalf("claim missed notification %d", f.notifID)
+	}
+	if got.CatchUp {
+		t.Fatal("an ordinary notification claims to be a catch-up")
+	}
+}
+
+// QueueCatchUp is what gives a late subscriber a row for a release that was
+// fanned out before they existed.
+func TestQueueCatchUpGivesALateSubscriberARow(t *testing.T) {
+	ctx, tx := testTx(t)
+	const chat int64 = -999000132
+	const mbid = "aaaa1111-0000-4000-8000-000000000132"
+	const group = "bbbb1111-0000-4000-8000-000000000132"
+
+	// The fixture already queues a notification for its own user, so this test
+	// needs a second user who subscribed afterwards.
+	f := outboxFixtures(ctx, t, tx, chat, mbid, group)
+
+	const lateChat int64 = -999000133
+	var lateUser int64
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO users (telegram_chat_id) VALUES ($1) RETURNING id`, lateChat).
+		Scan(&lateUser); err != nil {
+		t.Fatalf("insert late user: %v", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO subscriptions (user_id, artist_mbid, source) VALUES ($1, $2, 'bot')`,
+		lateUser, mbid); err != nil {
+		t.Fatalf("subscribe late user: %v", err)
+	}
+
+	releases := storage.NewReleases(tx)
+
+	queued, err := releases.QueueCatchUp(ctx, lateChat, group)
+	if err != nil {
+		t.Fatalf("queue catch-up: %v", err)
+	}
+	if !queued {
+		t.Fatal("the late subscriber got no row")
+	}
+
+	var kind string
+	if err := tx.QueryRow(ctx, `
+		SELECT kind FROM notifications
+		WHERE user_id = $1 AND release_id = $2`, lateUser, f.releaseID).Scan(&kind); err != nil {
+		t.Fatalf("read the new row: %v", err)
+	}
+	if kind != "catch_up" {
+		t.Fatalf("kind = %q, want catch_up", kind)
+	}
+
+	// Idempotent: pressing Subscribe twice must not send the release twice.
+	again, err := releases.QueueCatchUp(ctx, lateChat, group)
+	if err != nil {
+		t.Fatalf("second queue: %v", err)
+	}
+	if again {
+		t.Fatal("a second call queued a duplicate notification")
+	}
+}
+
+// Somebody who already has a row for this release — sent or pending — must not
+// get another one.
+func TestQueueCatchUpDoesNotDuplicateAnExistingNotification(t *testing.T) {
+	ctx, tx := testTx(t)
+	f := outboxFixtures(ctx, t, tx, -999000134,
+		"aaaa1111-0000-4000-8000-000000000134", "bbbb1111-0000-4000-8000-000000000134")
+
+	queued, err := storage.NewReleases(tx).QueueCatchUp(ctx, f.chatID, f.group)
+	if err != nil {
+		t.Fatalf("queue catch-up: %v", err)
+	}
+	if queued {
+		t.Fatal("queued a second notification for a release this user already has")
+	}
+}

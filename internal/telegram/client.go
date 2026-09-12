@@ -232,7 +232,14 @@ func formatRelease(rel notify.Release) string {
 	var b strings.Builder
 	b.WriteString("🎵 <b>")
 	b.WriteString(html.EscapeString(rel.ArtistName))
-	b.WriteString("</b> — новий реліз")
+	// "recent", not "new", when the subscriber missed it. The release is days
+	// old and they can see the date two lines down; calling it new is the kind
+	// of small lie that makes somebody stop trusting the rest of the message.
+	if rel.CatchUp {
+		b.WriteString("</b> — недавній реліз")
+	} else {
+		b.WriteString("</b> — новий реліз")
+	}
 
 	// The Instagram handle goes in the header rather than with the streaming
 	// links, because it answers a different question: those are "where do I

@@ -74,6 +74,39 @@ func (b *Bot) handleSubscribe(ctx context.Context, cq *telego.CallbackQuery, has
 	// one request a second and shared with search, so doing it first would
 	// make the button feel slow for something the user cannot see yet.
 	b.ensureArtistLinks(ctx, artist.MBID, log)
+
+	// Only on a first subscription. Pressing Subscribe again on an artist you
+	// already follow should not re-send anything, and the notification's own
+	// unique constraint would stop it anyway — but doing the lookup at all
+	// would be work for a guaranteed no-op.
+	if created {
+		b.catchUpOnRecentReleases(ctx, cq.From.ID, artist, log)
+	}
+}
+
+// catchUpOnRecentReleases sends anything the artist put out in the last few
+// days, so that subscribing to somebody who released an album on Friday is
+// worth doing on Sunday rather than only from tomorrow's poll onward.
+//
+// Best effort. A subscription that succeeded must never be reported as failed
+// because a courtesy lookup did not work, so every failure here is a log line.
+func (b *Bot) catchUpOnRecentReleases(ctx context.Context, chatID int64, artist musicbrainz.Artist, log *slog.Logger) {
+	if b.catchUp == nil {
+		return
+	}
+
+	queued, err := b.catchUp.CatchUp(ctx, chatID, artist.MBID)
+	if err != nil {
+		log.Warn("catch-up lookup failed", "mbid", artist.MBID, "err", err)
+		return
+	}
+	if queued == 0 {
+		// The common case, and deliberately silent: telling somebody "nothing
+		// recent" every time they subscribe is noise about a non-event.
+		return
+	}
+	log.Info("queued recent releases for a new subscriber",
+		"mbid", artist.MBID, "artist", artist.Name, "queued", queued)
 }
 
 // ensureArtistLinks fetches the artist's streaming links once, if they have

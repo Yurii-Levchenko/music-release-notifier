@@ -281,6 +281,7 @@ func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) outcome {
 		ReleaseDate: p.ReleaseDate,
 		CoverURL:    p.CoverURL,
 		InfoURL:     p.InfoURL,
+		CatchUp:     p.CatchUp,
 		Links: notify.ArtistLinks{
 			Spotify:    p.Spotify,
 			YouTube:    p.YouTube,

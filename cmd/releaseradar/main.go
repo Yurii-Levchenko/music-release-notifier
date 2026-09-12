@@ -174,6 +174,15 @@ func run() error {
 	pollerHealth := healthReg.Register("poller", 26*time.Hour)
 	releasePoller.ReportProgressTo(pollerHealth.Beat)
 	releasePoller.WithMetrics(appMetrics)
+	releasePoller.WithCatchUp(storage.NewReleases(pool))
+
+	// The poller owns the feed and the release-recording path, so it is what
+	// answers "did this artist release anything in the last few days" when
+	// somebody subscribes. Wired after both exist, rather than through the
+	// constructor, because they refer to each other.
+	if bot != nil {
+		bot.WithCatchUp(releasePoller)
+	}
 	releasePoller.WithLinkBackfill(linkBackfill{
 		Subscriptions: storage.NewSubscriptions(pool),
 		Client:        mb,

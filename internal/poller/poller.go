@@ -29,12 +29,6 @@ const (
 	// would never appear in a one-day window. It also absorbs missed polls,
 	// which have no backfill.
 	windowDays = 7
-
-	// notifiableTypes are the only release kinds worth a message (SPEC.md D3).
-	// The feed also carries Broadcast, Other and empty types.
-	typeAlbum  = "Album"
-	typeSingle = "Single"
-	typeEP     = "EP"
 )
 
 // Feed is the slice of ListenBrainz the poller needs.
@@ -65,6 +59,11 @@ type Poller struct {
 
 	// links is optional; nil disables the backfill.
 	links LinkBackfill
+	// catchUp is optional; nil makes CatchUp a no-op.
+	catchUp CatchUpStore
+	// feed3 caches the short catch-up window, which is fetched on a button
+	// press rather than on a schedule.
+	feed3 feedCache
 }
 
 func New(feed Feed, store Store, interval time.Duration, log *slog.Logger) *Poller {
@@ -165,8 +164,6 @@ func (p *Poller) initialDelay(ctx context.Context) time.Duration {
 	return 0
 }
 
-// PollOnce reads the feed and records what it finds. Exported so it can be
-// triggered deliberately rather than only by the clock.
 // LinkBackfill fills in artist streaming links that were never looked up.
 //
 // This exists because links are fetched at subscribe time, which leaves every
@@ -245,6 +242,8 @@ func (p *Poller) WithMetrics(m *metrics.Metrics) *Poller {
 	return p
 }
 
+// PollOnce reads the feed and records what it finds. Exported so it can be
+// triggered deliberately rather than only by the clock.
 func (p *Poller) PollOnce(ctx context.Context) (Stats, error) {
 	start := p.now()
 	stats, err := p.poll(ctx)
@@ -312,10 +311,10 @@ func (p *Poller) poll(ctx context.Context) (Stats, error) {
 	for i := range releases {
 		rel := &releases[i]
 
-		if !notifiableType(rel.PrimaryType) {
+		if !rel.NotifiableType() {
 			continue
 		}
-		if !notifiableSecondary(rel.SecondaryType) {
+		if !rel.NotifiableSecondary() {
 			// Logged rather than dropped silently: this filter is a judgment
 			// call, and the only way to find out it is wrong is to be able to
 			// see what it removed.
@@ -377,45 +376,6 @@ func (p *Poller) poll(ctx context.Context) (Stats, error) {
 			"recorded", stats.Recorded)
 	}
 	return stats, nil
-}
-
-func notifiableType(t string) bool {
-	return t == typeAlbum || t == typeSingle || t == typeEP
-}
-
-// excludedSecondaryTypes are release-group qualifiers that make something not
-// "new music by an artist you follow", whatever its primary type says.
-//
-// SPEC D3 already excluded compilations, and the poller was not honoring it:
-// the filter looked only at the primary type, so an official Brazil-only
-// compilation of unreleased Ariana Grande tracks was announced as a new album
-// on 10.09.2026. Measured over a 1660-release window, 9.7% of everything the
-// primary-type filter accepts carries a secondary type.
-//
-// What is excluded and what is kept is a taste decision, so it is a list
-// rather than a condition:
-//
-//   - Compilation, Demo — old material, repackaged or unfinished. D3.
-//   - Interview, Audiobook, Spokenword — not music.
-//   - DJ-mix — mostly other people's tracks.
-//
-// Deliberately kept, because each is a real release somebody following the
-// artist would want to hear about: Live (a new performance), Remix (official
-// new versions), Soundtrack (new work), Mixtape/Street (a primary release
-// format in hip-hop, not a lesser one).
-var excludedSecondaryTypes = map[string]bool{
-	"Compilation": true,
-	"Demo":        true,
-	"Interview":   true,
-	"Audiobook":   true,
-	"Spokenword":  true,
-	"DJ-mix":      true,
-}
-
-// notifiableSecondary reports whether a secondary type is worth a message.
-// Empty is the usual case and always passes.
-func notifiableSecondary(t string) bool {
-	return !excludedSecondaryTypes[t]
 }
 
 // firstTracked returns the first artist on the release that somebody follows.
