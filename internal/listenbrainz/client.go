@@ -49,7 +49,20 @@ type Release struct {
 	// PrimaryType is Album, Single, EP — or Broadcast, Other, or empty. The feed
 	// carries all of them; filtering is the caller's job.
 	PrimaryType string
-	ReleaseDate time.Time
+	// SecondaryType qualifies the primary one: Compilation, Live, Remix,
+	// Soundtrack, Demo, Mixtape/Street, DJ-mix, Interview, Audiobook,
+	// Spokenword — or empty, which is the usual case.
+	//
+	// The field is absent from most entries rather than null, which is how it
+	// went unnoticed: a dump of one release's keys does not show it. Present on
+	// 9.7% of what the primary-type filter accepts (measured 10.09.2026 over a
+	// 1660-release window).
+	//
+	// Singular, unlike MusicBrainz's own array. The feed flattens it, so a
+	// "Live Compilation" arrives as one of the two. Accepted: either value is
+	// enough to make the decision this drives.
+	SecondaryType string
+	ReleaseDate   time.Time
 	// CoverURL is built from the response, never fetched. Empty for roughly a
 	// quarter of releases (SPEC.md C27b).
 	CoverURL string
@@ -90,6 +103,7 @@ type freshReleasesResponse struct {
 			ReleaseMBID    string `json:"release_mbid"`
 			ReleaseName    string `json:"release_name"`
 			PrimaryType    string `json:"release_group_primary_type"`
+			SecondaryType  string `json:"release_group_secondary_type"`
 		} `json:"releases"`
 	} `json:"payload"`
 }
@@ -143,6 +157,7 @@ func (c *Client) FreshReleases(ctx context.Context, days int) ([]Release, error)
 			ArtistName:       r.ArtistCreditName,
 			Title:            r.ReleaseName,
 			PrimaryType:      r.PrimaryType,
+			SecondaryType:    r.SecondaryType,
 			ReleaseDate:      date,
 			CoverURL:         coverURL(r.CAAReleaseMBID, r.CAAID),
 		})
@@ -243,4 +258,66 @@ func jitter(d time.Duration) time.Duration {
 	}
 	spread := int64(d) / 2
 	return d - time.Duration(spread/2) + time.Duration(rand.Int64N(spread+1))
+}
+
+// Which releases are worth telling somebody about.
+//
+// This lives with the feed rather than in the poller because two workers now
+// ask the question — the daily poll and the catch-up run when somebody
+// subscribes — and two copies of a filter that must agree is how they stop
+// agreeing.
+const (
+	typeAlbum  = "Album"
+	typeSingle = "Single"
+	typeEP     = "EP"
+)
+
+// excludedSecondaryTypes are qualifiers that make a release not "new music by
+// an artist you follow", whatever its primary type says.
+//
+// SPEC D3 excluded compilations from the start and the poller was not honoring
+// it, because the filter looked only at the primary type: an official
+// Brazil-only compilation of unreleased Ariana Grande tracks was announced as a
+// new album on 10.09.2026. Measured over a 1660-release window, 9.7% of
+// everything the primary-type filter accepts carries a secondary type.
+//
+// What is excluded and what is kept is a taste decision, so it is a list
+// rather than a condition:
+//
+//   - Compilation, Demo — old material, repackaged or unfinished. D3.
+//   - Interview, Audiobook, Spokenword — not music.
+//   - DJ-mix — mostly other people's tracks.
+//
+// Deliberately kept, because each is a real release somebody following the
+// artist would want to hear about: Live (a new performance), Remix (official
+// new versions), Soundtrack (new work), Mixtape/Street (a primary release
+// format in hip-hop, not a lesser one).
+var excludedSecondaryTypes = map[string]bool{
+	"Compilation": true,
+	"Demo":        true,
+	"Interview":   true,
+	"Audiobook":   true,
+	"Spokenword":  true,
+	"DJ-mix":      true,
+}
+
+// NotifiableType reports whether the primary type is one we announce. The feed
+// also carries Broadcast, Other and empty types.
+func (r Release) NotifiableType() bool {
+	return r.PrimaryType == typeAlbum || r.PrimaryType == typeSingle || r.PrimaryType == typeEP
+}
+
+// NotifiableSecondary reports whether the secondary type is worth a message.
+// Empty is the usual case and always passes.
+//
+// An unfamiliar value passes too: the feed's vocabulary is MusicBrainz's, which
+// grows, and defaulting to "drop" would let a new qualifier silently swallow
+// releases.
+func (r Release) NotifiableSecondary() bool {
+	return !excludedSecondaryTypes[r.SecondaryType]
+}
+
+// Notifiable is both checks, for callers that do not need to tell them apart.
+func (r Release) Notifiable() bool {
+	return r.NotifiableType() && r.NotifiableSecondary()
 }

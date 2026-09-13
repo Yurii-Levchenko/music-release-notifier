@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -15,9 +16,15 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/config"
+
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/health"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/httpx"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/listenbrainz"
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/metrics"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/musicbrainz"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/notifier"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/notify"
@@ -79,6 +86,35 @@ func run() error {
 		return err
 	}
 
+	// A private registry rather than prometheus.DefaultRegisterer. The default
+	// one is global state that any imported library can write to, and the Go
+	// runtime collectors are added explicitly below so the set is exactly what
+	// this binary chose to publish.
+	promReg := prometheus.NewRegistry()
+	promReg.MustRegister(collectors.NewGoCollector())
+	promReg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	appMetrics := metrics.New(promReg)
+
+	outbox := storage.NewNotifications(pool, claimLease, maxDeliveryAttempts)
+	if err := appMetrics.RegisterQueue(promReg, outbox); err != nil {
+		return fmt.Errorf("register queue metrics: %w", err)
+	}
+	if err := appMetrics.RegisterPollState(promReg, storage.NewReleases(pool)); err != nil {
+		return fmt.Errorf("register poll state metrics: %w", err)
+	}
+
+	// Built here rather than inside the Telegram branch, because the poller's
+	// link backfill needs it whether or not a bot token is configured.
+	//
+	// Refuses to build without a User-Agent carrying a contact address:
+	// MusicBrainz answers an anonymous client with 403 and a generic one with
+	// 503, and neither improves on retry.
+	mb, err := musicbrainz.New(cfg.UserAgent, log)
+	if err != nil {
+		return err
+	}
+	mb.WithMetrics(appMetrics)
+
 	// D13: delivery channels are plugins. The registry is what the notifier
 	// worker will resolve against in S5; nothing above it knows about Telegram.
 	var channels *notify.Registry
@@ -96,13 +132,6 @@ func run() error {
 		}
 		// Fail fast on a bad token rather than on the first send.
 		if err := client.Init(ctx); err != nil {
-			return err
-		}
-		// Refuses to build without a User-Agent carrying a contact address:
-		// MusicBrainz answers an anonymous client with 403 and a generic one
-		// with 503, and neither improves on retry.
-		mb, err := musicbrainz.New(cfg.UserAgent, log)
-		if err != nil {
 			return err
 		}
 		channels = notify.NewRegistry(telegram.NewNotifier(client))
@@ -126,9 +155,42 @@ func run() error {
 	}
 	releasePoller := poller.New(lb, storage.NewReleases(pool), pollInterval, log)
 
+	// The health registry defines what "working" means for the dead-man's
+	// switch. Budgets are per worker because their rhythms differ by four
+	// orders of magnitude: the bot proves itself every minute, the poller once
+	// a day. A single global budget would either cry wolf over the idle poller
+	// or never notice a wedged bot.
+	//
+	// Each budget is a small multiple of the worker's own cycle, so one missed
+	// cycle is tolerated and a genuinely stuck worker is not.
+	healthReg := health.NewRegistry()
+	healthReg.AddProbe("database", pool.Ping)
+
+	if bot != nil {
+		botHealth := healthReg.Register("bot", 5*time.Minute)
+		bot.ReportProgressTo(botHealth.Beat)
+		bot.WithMetrics(appMetrics)
+	}
+	pollerHealth := healthReg.Register("poller", 26*time.Hour)
+	releasePoller.ReportProgressTo(pollerHealth.Beat)
+	releasePoller.WithMetrics(appMetrics)
+	releasePoller.WithCatchUp(storage.NewReleases(pool))
+
+	// The poller owns the feed and the release-recording path, so it is what
+	// answers "did this artist release anything in the last few days" when
+	// somebody subscribes. Wired after both exist, rather than through the
+	// constructor, because they refer to each other.
+	if bot != nil {
+		bot.WithCatchUp(releasePoller)
+	}
+	releasePoller.WithLinkBackfill(linkBackfill{
+		Subscriptions: storage.NewSubscriptions(pool),
+		Client:        mb,
+	})
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpx.New(pool, log).Routes(),
+		Handler:           httpx.New(pool, healthReg, promReg, log).Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
@@ -155,12 +217,18 @@ func run() error {
 	// The notifier drains whatever the poller queued. It starts even with no
 	// channels configured, so that "the queue is filling and nobody is draining
 	// it" is a log line rather than a discovery weeks later.
-	deliveries := notifier.New(
-		storage.NewNotifications(pool, claimLease, maxDeliveryAttempts),
-		channels,
-		log,
-	)
+	deliveries := notifier.New(outbox, channels, log).WithMetrics(appMetrics)
+	notifierHealth := healthReg.Register("notifier", 5*time.Minute)
+	deliveries.ReportProgressTo(notifierHealth.Beat)
 	g.Go(func() error { return deliveries.Run(gctx) })
+
+	// The dead-man's switch. It pings only while every worker above is inside
+	// its budget, so silence — from a crash, a wedge, or an unreachable
+	// database — is what raises the alarm. This is the one piece that could
+	// have caught the 14-hour outage on 29.08.2026, because it lives outside
+	// the process it watches.
+	beat := health.NewHeartbeat(cfg.HeartbeatURL, cfg.HeartbeatInterval, healthReg, log)
+	g.Go(func() error { return beat.Run(gctx) })
 
 	// Shut the HTTP server down when anything else asks us to stop; without
 	// this, ListenAndServe would keep the group waiting forever.
@@ -183,4 +251,15 @@ func run() error {
 	}
 	log.Info("stopped cleanly")
 	return nil
+}
+
+// linkBackfill satisfies poller.LinkBackfill by combining the two things that
+// own half of the job each: the database knows which artists are missing
+// links, and MusicBrainz knows what they are.
+//
+// Embedding rather than three forwarding methods, because there is nothing to
+// add — any logic here would belong in the poller, where it is tested.
+type linkBackfill struct {
+	*storage.Subscriptions
+	*musicbrainz.Client
 }

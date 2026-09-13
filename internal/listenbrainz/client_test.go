@@ -278,3 +278,46 @@ func TestParseReleaseDate(t *testing.T) {
 		}
 	}
 }
+
+// Every excluded kind, so adding one to the list cannot silently do nothing.
+func TestExcludedSecondaryTypes(t *testing.T) {
+	for _, kind := range []string{"Compilation", "Demo", "Interview", "Audiobook", "Spokenword", "DJ-mix"} {
+		if (Release{SecondaryType: kind}).NotifiableSecondary() {
+			t.Errorf("%q is notifiable; it is meant to be excluded", kind)
+		}
+	}
+}
+
+// The kept ones matter as much as the excluded ones: each is a real release
+// somebody following the artist wants to hear about, and quietly dropping a
+// live album or a mixtape would be worse than the noise this filter removes.
+func TestKeptSecondaryTypes(t *testing.T) {
+	for _, kind := range []string{"", "Live", "Remix", "Soundtrack", "Mixtape/Street"} {
+		if !(Release{SecondaryType: kind}).NotifiableSecondary() {
+			t.Errorf("%q was filtered out; it is meant to be kept", kind)
+		}
+	}
+}
+
+// An unfamiliar value must pass. The feed's vocabulary is MusicBrainz's, which
+// grows, and defaulting to "drop" would make a new qualifier silently swallow
+// releases.
+func TestUnknownSecondaryTypePasses(t *testing.T) {
+	if !(Release{SecondaryType: "Something MusicBrainz Added Later"}).NotifiableSecondary() {
+		t.Fatal("an unrecognized secondary type was dropped")
+	}
+}
+
+// Notifiable is both checks, and both have to apply — a Compilation Album must
+// not pass because its primary type is fine.
+func TestNotifiableNeedsBothChecks(t *testing.T) {
+	if (Release{PrimaryType: "Album", SecondaryType: "Compilation"}).Notifiable() {
+		t.Error("a compilation album passed the combined check")
+	}
+	if (Release{PrimaryType: "Broadcast"}).Notifiable() {
+		t.Error("a broadcast passed the combined check")
+	}
+	if !(Release{PrimaryType: "Album"}).Notifiable() {
+		t.Error("a plain album was filtered out")
+	}
+}

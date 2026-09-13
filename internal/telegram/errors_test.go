@@ -134,3 +134,35 @@ func TestIsUserGone(t *testing.T) {
 		t.Fatal("bad token must not count as the user being gone")
 	}
 }
+
+// Telegram failing to download our cover URL and Telegram rejecting the URL
+// itself are both 400s classified BadMessage, but only the first can succeed
+// on a retry. Conflating them silently downgraded a release to a text-only
+// message because archive.org was slow for two seconds (seen live 09.09.2026).
+func TestCoverFetchFailureIsDistinguishedFromABadURL(t *testing.T) {
+	retryable := []string{
+		"telego: sendPhoto: api: 400 \"Bad Request: failed to get HTTP URL content\"",
+		"Bad Request: WEBPAGE_CURL_FAILED",
+		"Bad Request: IMAGE_PROCESS_FAILED",
+	}
+	for _, msg := range retryable {
+		if !isCoverFetchFailure(errors.New(msg)) {
+			t.Errorf("a fetch failure was treated as hopeless: %q", msg)
+		}
+	}
+
+	hopeless := []string{
+		"Bad Request: wrong file identifier/HTTP URL specified",
+		"Bad Request: can't parse entities",
+		"Bad Request: caption is too long",
+	}
+	for _, msg := range hopeless {
+		if isCoverFetchFailure(errors.New(msg)) {
+			t.Errorf("retrying this cannot help and only delays the text message: %q", msg)
+		}
+	}
+
+	if isCoverFetchFailure(nil) {
+		t.Error("nil was reported as a fetch failure")
+	}
+}

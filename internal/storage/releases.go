@@ -9,15 +9,17 @@ import (
 	"unicode"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Releases records detected releases and fans them out to subscribers.
 type Releases struct {
-	pool *pgxpool.Pool
+	// DB rather than the pool, for the same reason Notifications takes one:
+	// a pgx.Tx satisfies it, so these operations can be tested inside a
+	// transaction that is rolled back instead of against live rows.
+	db DB
 }
 
-func NewReleases(pool *pgxpool.Pool) *Releases { return &Releases{pool: pool} }
+func NewReleases(db DB) *Releases { return &Releases{db: db} }
 
 // NewRelease is a release the poller wants to record.
 type NewRelease struct {
@@ -48,7 +50,7 @@ type FanOut struct {
 // rows created by searches that nobody followed up on, and matching against
 // those would record releases nobody asked for.
 func (r *Releases) TrackedArtistMBIDs(ctx context.Context) (map[string]struct{}, error) {
-	rows, err := r.pool.Query(ctx, `SELECT DISTINCT artist_mbid FROM subscriptions`)
+	rows, err := r.db.Query(ctx, `SELECT DISTINCT artist_mbid FROM subscriptions`)
 	if err != nil {
 		return nil, fmt.Errorf("read tracked artists: %w", err)
 	}
@@ -85,7 +87,7 @@ func (r *Releases) Record(ctx context.Context, rel NewRelease, notify bool) (Fan
 		return FanOut{}, errors.New("storage: release needs both a release group and an artist")
 	}
 
-	tx, err := r.pool.Begin(ctx)
+	tx, err := r.db.Begin(ctx)
 	if err != nil {
 		return FanOut{}, fmt.Errorf("begin: %w", err)
 	}
@@ -141,7 +143,7 @@ func (r *Releases) Record(ctx context.Context, rel NewRelease, notify bool) (Fan
 // decide whether a poll is the first-run seed.
 func (r *Releases) HasAnyReleases(ctx context.Context) (bool, error) {
 	var exists bool
-	if err := r.pool.QueryRow(ctx,
+	if err := r.db.QueryRow(ctx,
 		`SELECT EXISTS (SELECT 1 FROM releases)`).Scan(&exists); err != nil {
 		return false, fmt.Errorf("check for existing releases: %w", err)
 	}
@@ -196,7 +198,7 @@ func (r *Releases) PollState(ctx context.Context, source string) (PollState, boo
 	var polled, ok *time.Time
 	var lastErr *string
 
-	err := r.pool.QueryRow(ctx,
+	err := r.db.QueryRow(ctx,
 		`SELECT last_polled_at, last_ok_at, last_error FROM poll_state WHERE source = $1`,
 		source).Scan(&polled, &ok, &lastErr)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -228,7 +230,7 @@ func (r *Releases) RecordPoll(ctx context.Context, source string, pollErr error)
 		msg = &s
 	}
 
-	_, err := r.pool.Exec(ctx, `
+	_, err := r.db.Exec(ctx, `
 		INSERT INTO poll_state (source, last_polled_at, last_ok_at, last_error)
 		VALUES ($1, now(), CASE WHEN $2::text IS NULL THEN now() END, $2)
 		ON CONFLICT (source) DO UPDATE
@@ -240,4 +242,46 @@ func (r *Releases) RecordPoll(ctx context.Context, source string, pollErr error)
 		return fmt.Errorf("record poll state for %s: %w", source, err)
 	}
 	return nil
+}
+
+// LastSuccessfulPoll reports when the release poller last completed without an
+// error. Read by the metrics collector at scrape time, so the answer survives
+// restarts — an in-memory timestamp would reset on every deploy and make a
+// fresh container look like a poller that has never run.
+func (r *Releases) LastSuccessfulPoll(ctx context.Context) (time.Time, bool, error) {
+	st, found, err := r.PollState(ctx, "listenbrainz")
+	if err != nil || !found {
+		return time.Time{}, false, err
+	}
+	if st.LastOKAt.IsZero() {
+		return time.Time{}, false, nil
+	}
+	return st.LastOKAt, true, nil
+}
+
+// QueueCatchUp gives one subscriber a notification for a release that was
+// already known, so that subscribing to an artist who released something two
+// days ago is worth doing today rather than tomorrow.
+//
+// Only for releases that already exist. A release nobody has recorded yet is
+// handled by Record, which fans out to everybody subscribed — and must, since
+// the poller skips a release group it has already seen, so a release recorded
+// here without a fan-out would never reach the other subscribers at all.
+//
+// ON CONFLICT covers the case that matters: a subscriber who already has a row
+// for this release, sent or pending, does not get a second one.
+func (r *Releases) QueueCatchUp(ctx context.Context, chatID int64, releaseGroupMBID string) (queued bool, err error) {
+	tag, err := r.db.Exec(ctx, `
+		INSERT INTO notifications (user_id, release_id, kind)
+		SELECT u.id, rel.id, 'catch_up'
+		FROM users u, releases rel
+		WHERE u.telegram_chat_id = $1
+		  AND rel.release_group_mbid = $2
+		ON CONFLICT (user_id, release_id) DO NOTHING`,
+		chatID, releaseGroupMBID)
+	if err != nil {
+		return false, fmt.Errorf("queue catch-up for chat %d, release group %s: %w",
+			chatID, releaseGroupMBID, err)
+	}
+	return tag.RowsAffected() > 0, nil
 }

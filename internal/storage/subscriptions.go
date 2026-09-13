@@ -2,8 +2,10 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -24,6 +26,9 @@ func NewSubscriptions(pool *pgxpool.Pool) *Subscriptions { return &Subscriptions
 type Subscription struct {
 	MBID string
 	Name string
+	// SubscribedAt is what the list is ordered by, and is returned so a caller
+	// can show it without a second query.
+	SubscribedAt time.Time
 }
 
 // ArtistRef is the minimum needed to subscribe. Deliberately not
@@ -112,8 +117,22 @@ func (s *Subscriptions) IsSubscribed(ctx context.Context, chatID int64, mbid str
 
 // List returns one page of a user's subscriptions plus the total count.
 //
-// Sorted by name so the order is stable between pages; sorting by created_at
-// would shuffle the list every time someone subscribes mid-browse.
+// Ordered by when the subscription was made, oldest first.
+//
+// The numbers are what the unsubscribe buttons act on, so the order that
+// matters is the one where a number keeps meaning the same artist. Appending
+// at the end does that: subscribing to somebody new leaves every existing
+// position untouched. Newest-first — which this briefly was — renumbers the
+// entire list on every subscription, which is a way to unsubscribe from the
+// wrong artist.
+//
+// It also removes the pagination flaw that came with newest-first. A row that
+// can only ever be appended cannot shift anything already on a page, so OFFSET
+// paging is exactly correct here rather than correct-enough.
+//
+// The cost is that a fresh subscription lands on the last page. Small, because
+// unsubscribing right after subscribing is done from the search card, which
+// still has its own button and does not involve this list at all.
 func (s *Subscriptions) List(ctx context.Context, chatID int64, limit, offset int) (items []Subscription, total int, err error) {
 	if limit <= 0 {
 		limit = 20
@@ -133,12 +152,15 @@ func (s *Subscriptions) List(ctx context.Context, chatID int64, limit, offset in
 		return nil, 0, nil
 	}
 
+	// a.mbid breaks ties. Two subscriptions can share a created_at — the
+	// extension will add several at once in S9 — and an ORDER BY that is not
+	// total lets the same row appear on two pages, or on neither.
 	rows, err := s.pool.Query(ctx, `
-		SELECT a.mbid, a.name
+		SELECT a.mbid, a.name, s.created_at
 		FROM subscriptions s
 		JOIN artists a ON a.mbid = s.artist_mbid
 		WHERE s.user_id = (SELECT id FROM users WHERE telegram_chat_id = $1)
-		ORDER BY a.name, a.mbid
+		ORDER BY s.created_at, a.mbid
 		LIMIT $2 OFFSET $3`,
 		chatID, limit, offset)
 	if err != nil {
@@ -148,7 +170,7 @@ func (s *Subscriptions) List(ctx context.Context, chatID int64, limit, offset in
 
 	for rows.Next() {
 		var sub Subscription
-		if err := rows.Scan(&sub.MBID, &sub.Name); err != nil {
+		if err := rows.Scan(&sub.MBID, &sub.Name, &sub.SubscribedAt); err != nil {
 			return nil, 0, fmt.Errorf("scan subscription: %w", err)
 		}
 		items = append(items, sub)
@@ -172,4 +194,87 @@ func (s *Subscriptions) Forget(ctx context.Context, chatID int64) (existed bool,
 		return false, fmt.Errorf("forget chat=%d: %w", chatID, err)
 	}
 	return tag.RowsAffected() > 0, nil
+}
+
+// ArtistLinks are the external destinations shown in a notification.
+type ArtistLinks struct {
+	Spotify    string `json:"spotify,omitempty"`
+	YouTube    string `json:"youtube,omitempty"`
+	AppleMusic string `json:"apple_music,omitempty"`
+	Instagram  string `json:"instagram,omitempty"`
+}
+
+// SetArtistLinks records the lookup result, including an empty one.
+//
+// Storing the empty case is the point: links_fetched_at is what separates "we
+// have never looked" from "we looked and there is nothing", and without that
+// distinction every subscribe would re-fetch the artists that have no links —
+// forever, and against an API limited to one request a second.
+func (s *Subscriptions) SetArtistLinks(ctx context.Context, mbid string, links ArtistLinks, version int) error {
+	payload, err := json.Marshal(links)
+	if err != nil {
+		return fmt.Errorf("encode links for %s: %w", mbid, err)
+	}
+
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE artists
+		SET links = $2::jsonb, links_fetched_at = now(), links_version = $3
+		WHERE mbid = $1`, mbid, string(payload), version); err != nil {
+		return fmt.Errorf("store links for %s: %w", mbid, err)
+	}
+	return nil
+}
+
+// NeedsLinks reports whether this artist has never had a link lookup.
+//
+// A missing artist row answers false: there is nothing to attach links to, and
+// the caller has a worse problem than missing links.
+func (s *Subscriptions) NeedsLinks(ctx context.Context, mbid string, version int) (bool, error) {
+	var fetched *time.Time
+	var stored int
+	err := s.pool.QueryRow(ctx,
+		`SELECT links_fetched_at, links_version FROM artists WHERE mbid = $1`, mbid).
+		Scan(&fetched, &stored)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read link state for %s: %w", mbid, err)
+	}
+	// Never resolved, or resolved against an older set of link kinds.
+	return fetched == nil || stored < version, nil
+}
+
+// ArtistsMissingLinks returns tracked artists that have never had a link
+// lookup, oldest subscription first.
+//
+// Only artists somebody is actually subscribed to: looking up links for an
+// artist nobody follows would spend a rate-limited request on a row that will
+// never appear in a notification.
+func (s *Subscriptions) ArtistsMissingLinks(ctx context.Context, limit, version int) ([]string, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT a.mbid
+		FROM artists a
+		WHERE (a.links_fetched_at IS NULL OR a.links_version < $2)
+		  AND EXISTS (SELECT 1 FROM subscriptions s WHERE s.artist_mbid = a.mbid)
+		ORDER BY a.created_at
+		LIMIT $1`, limit, version)
+	if err != nil {
+		return nil, fmt.Errorf("find artists missing links: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var mbid string
+		if err := rows.Scan(&mbid); err != nil {
+			return nil, fmt.Errorf("scan artist mbid: %w", err)
+		}
+		out = append(out, mbid)
+	}
+	return out, rows.Err()
 }

@@ -1,0 +1,88 @@
+# Thresholds from SPEC §15a. They are starting points, to be corrected after
+# the first Friday with real data (C36: Friday is 48.5% of releases and 5.6x an
+# average day, so a threshold tuned on a Tuesday will cry wolf on a Friday).
+#
+# Note what is deliberately NOT here: "the application is down". An alert
+# evaluated by a Prometheus that scrapes one target cannot distinguish a dead
+# app from a dead Prometheus. That job belongs to the external dead-man's
+# switch (S6.1), which lives outside this machine entirely.
+groups:
+  - name: releaseradar
+    rules:
+      - alert: QueueNotReadable
+        expr: releaseradar_queue_readable == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: The outbox cannot be read
+          description: >-
+            The queue collector could not query Postgres for 2 minutes.
+            Nothing is being delivered.
+
+      - alert: QueueBacklogAgeing
+        # The age of the oldest waiting item is the delay a person is actually
+        # experiencing, which is why it is the alert rather than depth.
+        expr: releaseradar_notification_queue_age_seconds > 3600
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: A notification has been waiting over an hour
+
+      - alert: QueueGrowing
+        # Depth rising across three evaluation windows means arrivals are
+        # outpacing delivery, which shows up before any latency does.
+        expr: delta(releaseradar_notifications_pending[15m]) > 0
+        for: 45m
+        labels:
+          severity: warning
+        annotations:
+          summary: The outbox has grown for 45 minutes without draining
+
+      - alert: TelegramThrottling
+        # A 429 share above 10% means the pacing is wrong, not that Telegram is
+        # unhappy about one message.
+        expr: >-
+          sum(rate(releaseradar_telegram_requests_total{code="429"}[15m]))
+          /
+          sum(rate(releaseradar_telegram_requests_total[15m])) > 0.1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Over 10% of Telegram requests are rate limited
+
+      - alert: PollerStalled
+        # 25 hours, not 24: a poller that ran 24h01m ago is on time, and an
+        # alert that fires on a punctual daily job gets muted within a week.
+        #
+        # The timestamp comes from the database rather than from process
+        # memory, so a deploy does not reset it. The absent() clause covers the
+        # other case: the metric disappears when the poller has never
+        # succeeded, and "never ran" must alert as loudly as "stopped running".
+        expr: >-
+          (time() - releaseradar_poller_last_success_timestamp_seconds > 90000)
+          or absent(releaseradar_poller_last_success_timestamp_seconds)
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: No successful poll in over 25 hours
+          description: >-
+            New releases are not being detected. Subscribers are silently
+            getting nothing.
+
+      - alert: PermanentFailuresSpiking
+        # Permanent means somebody's subscriptions were deleted. A handful is
+        # normal churn; a spike means we are deleting subscriptions we should
+        # not be, which is unrecoverable for the user.
+        expr: sum(increase(releaseradar_notifications_total{disposition="permanent"}[1h])) > 5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: More than 5 recipients dropped in an hour
+          description: >-
+            Each of these deleted a user's subscriptions. Check the
+            classification table before this runs any longer.

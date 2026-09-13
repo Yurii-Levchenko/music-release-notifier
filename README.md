@@ -8,8 +8,8 @@ message when a new album, single or EP lands.
 
 **Go · PostgreSQL · ListenBrainz / MusicBrainz**
 
-> Status: **S5 complete** — the bot now sends on its own. First unprompted
-> message delivered 2 Sep 2026. Next is S6: production and observability.
+> Status: **S5 complete**, S6 in progress — the bot sends on its own, and an
+> external dead-man's switch now watches whether it still can.
 
 ---
 
@@ -73,6 +73,30 @@ curl localhost:8090/healthz
 The database is published on host port **5433**, not 5432, to stay out of the
 way of a locally installed PostgreSQL.
 
+### Observability
+
+```bash
+docker compose --profile observability up -d
+```
+
+Grafana on **3001** (anonymous viewer). Neither Prometheus nor the app's
+`/metrics` is published to the host — Grafana reaches both over the compose
+network, `/metrics` carries queue depths and chat volumes, and every port not
+published is one fewer chance to lose a container to a bind race on startup.
+That is not hypothetical: Prometheus died that way on 9091 and stayed dead for
+six days.
+
+Two collectors read Postgres when Prometheus scrapes rather than tracking a
+number in memory. That is not incidental — a gauge set from the drain loop is
+only correct at the instant of a drain, so during an incident, when the drain
+loop is the thing that stopped, the graph would sit at its last healthy value
+and look fine. And an unreadable queue publishes `queue_readable 0` with *no*
+depth sample, because a zero depth reads as an empty queue and would silence
+the alert that should be firing.
+
+`/status` shows what each worker is doing; `/healthz` stays liveness for the
+container.
+
 ```bash
 make run        # run against a local Go toolchain instead
 make test       # unit tests; database tests skip without TEST_DATABASE_URL
@@ -104,7 +128,7 @@ behind. Without `TEST_DATABASE_URL` they skip rather than fail, keeping
 | ✅ S3 | Subscriptions, `/list`, `/stop` |
 | ✅ S4 | Release detection |
 | ✅ S5 | Delivery: outbox drain, pacing, failure classification |
-| ⬜ S6 | Production: VPS, backups, and observability — **v1 done** |
+| 🔄 S6 | Production: dead-man's switch ✅, metrics ✅, logs, VPS — **v1 done** |
 | ⬜ S11 | Rank search results by metadata completeness, not score |
 | ⬜ S12 | Dead-letter handling for poison messages (with the v2 broker) |
 | ⬜ S8–S10 | Extension: linking API, subscribe from Spotify, publish |
@@ -117,10 +141,18 @@ internal/config/       environment parsing and validation
 internal/storage/      pool, migration runner, schema, invariant tests
 internal/notify/       the channel boundary — no Telegram types allowed here
 internal/notifier/     drains the outbox; decides what a failure costs
+internal/health/       worker liveness and the external dead-man's switch
+internal/metrics/      Prometheus collectors; two of them read at scrape time
+deploy/                Prometheus scrape config, alert rules, Grafana datasource
 internal/httpx/        HTTP surface (health now, extension API in S8)
 spike/                 throwaway proof-of-concept; delete after S8
 SPEC.md                source of truth: requirements, constraints, decisions
 ```
+
+A release notification carries where to listen — Spotify, YouTube, Apple
+Music — resolved once per artist and stored in `artists.links`, never looked up
+while sending. Same reason `cover_url` works that way: resolving at send time
+would mean one lookup per subscriber instead of one per artist, ever.
 
 `SPEC.md` is updated in the same commit as the code it describes. A spec that
 has fallen behind the code is worse than no spec, because it lies with a

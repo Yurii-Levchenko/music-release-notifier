@@ -34,7 +34,7 @@ func TestSubscriptionCallbackDataFitsLimit(t *testing.T) {
 	}
 
 	// And through the real renderers, since those are what actually ship.
-	_, markup := renderCandidate("q", []musicbrainz.Artist{{MBID: mbid, Name: "X"}}, 0, hash, false)
+	_, markup := renderCandidate("q", []musicbrainz.Artist{{MBID: mbid, Name: "X"}}, 0, hash, false, testClock)
 	assertCallbackBudget(t, markup.InlineKeyboard)
 
 	items := make([]storage.Subscription, listPageSize)
@@ -77,7 +77,7 @@ func TestRenderCandidateRendersTheActionButton(t *testing.T) {
 		{false, cbSubscribe + ":", "Підписатись"},
 		{true, cbUnsubscribe + ":", "Відписатись"},
 	} {
-		text, markup := renderCandidate("radiohead", candidates, 0, "abcdef123456", tc.subscribed)
+		text, markup := renderCandidate("radiohead", candidates, 0, "abcdef123456", tc.subscribed, testClock)
 
 		var found bool
 		for _, row := range markup.InlineKeyboard {
@@ -265,5 +265,85 @@ func TestRenderListStaysUnderMessageLimit(t *testing.T) {
 	text, _ := renderList(items, 500, 9)
 	if n := len([]rune(text)); n > 4096 {
 		t.Fatalf("list page is %d characters, over Telegram's 4096 limit", n)
+	}
+}
+
+// /stop sits in Telegram's command menu, so a mis-tap there used to be two taps
+// from destroying every subscription. Nothing but the word deletes anything.
+func TestOnlyTheWordConfirmsDeletion(t *testing.T) {
+	confirms := []string{"DELETE", "delete", "Delete", "  DELETE  ", "DELETE\n"}
+	for _, args := range confirms {
+		if !isStopConfirmation(args) {
+			t.Errorf("%q did not confirm; somebody who meant it would try three times", args)
+		}
+	}
+
+	refuses := []string{
+		"",           // a bare /stop
+		"yes",        // the old button's answer
+		"так",        //
+		"DELETE ALL", // close, but not the word
+		"delet",      //
+		"видалити",   //
+	}
+	for _, args := range refuses {
+		if isStopConfirmation(args) {
+			t.Errorf("%q deleted everything", args)
+		}
+	}
+}
+
+// The farewell list is the only copy of the data once Forget runs, so it has to
+// be complete and correctly escaped.
+func TestFarewellListIsCompleteAndEscaped(t *testing.T) {
+	items := []storage.Subscription{
+		{Name: "Simon & Garfunkel"},
+		{Name: "あいміみょん"},
+		{Name: "<script>"},
+	}
+
+	got := farewellList(items, len(items))
+
+	for i, item := range items {
+		if !strings.Contains(got, fmt.Sprintf("%d. ", i+1)) {
+			t.Errorf("position %d is missing:\n%s", i+1, got)
+		}
+		_ = item
+	}
+	if !strings.Contains(got, "Simon &amp; Garfunkel") {
+		t.Errorf("an ampersand reached the message unescaped:\n%s", got)
+	}
+	if strings.Contains(got, "<script>") {
+		t.Errorf("markup reached the message unescaped:\n%s", got)
+	}
+	if !strings.Contains(got, "あいміみょん") {
+		t.Errorf("a non-Latin name was lost:\n%s", got)
+	}
+}
+
+// A truncated list must say so. Handing somebody an incomplete list that looks
+// complete is worse than handing them nothing.
+func TestFarewellListAdmitsTruncation(t *testing.T) {
+	items := make([]storage.Subscription, 3)
+	for i := range items {
+		items[i] = storage.Subscription{Name: fmt.Sprintf("Artist %d", i+1)}
+	}
+
+	got := farewellList(items, 250)
+
+	if !strings.Contains(got, "250") {
+		t.Errorf("the real total is missing:\n%s", got)
+	}
+	if !strings.Contains(got, "247") {
+		t.Errorf("the remainder is not mentioned:\n%s", got)
+	}
+}
+
+// No truncation notice when nothing was truncated.
+func TestFarewellListSaysNothingExtraWhenComplete(t *testing.T) {
+	got := farewellList([]storage.Subscription{{Name: "Only One"}}, 1)
+
+	if strings.Contains(got, "та ще") {
+		t.Errorf("a complete list claims to be truncated:\n%s", got)
 	}
 }

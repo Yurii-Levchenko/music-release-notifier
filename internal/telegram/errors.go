@@ -125,3 +125,53 @@ func IsUserGone(err error) bool {
 	d, _ := classify(err)
 	return d == notify.Permanent
 }
+
+// observe records the API result and returns the wrapped error.
+//
+// Instrumenting here rather than at each call site means a new API call cannot
+// be added without being counted — the metric cannot drift out of date by
+// omission, which is the usual way instrumentation rots.
+func (c *Client) observe(err error) error {
+	wrapped := wrap(err)
+	c.metrics.TelegramRequests.WithLabelValues(codeLabel(err)).Inc()
+
+	var de *notify.DeliveryError
+	if errors.As(wrapped, &de) && de.RetryAfter > 0 {
+		c.metrics.TelegramRetryAfter.Observe(de.RetryAfter.Seconds())
+	}
+	return wrapped
+}
+
+// codeLabel buckets a result into a small, bounded set of label values.
+//
+// Bounded matters: a label whose values come from an upstream is how a metrics
+// backend gets a cardinality explosion. Individual 5xx codes carry no
+// information we act on differently, so they collapse into one.
+func codeLabel(err error) string {
+	if err == nil {
+		return "ok"
+	}
+
+	var apiErr *telegoapi.Error
+	if !errors.As(err, &apiErr) {
+		// No HTTP status at all: a transport failure, a canceled context, a
+		// decode error. Distinct from a 5xx, because the request may never
+		// have reached Telegram.
+		return "transport"
+	}
+
+	switch code := apiErr.ErrorCode; {
+	case code == 429:
+		return "429"
+	case code == 403:
+		return "403"
+	case code == 401:
+		return "401"
+	case code == 400:
+		return "400"
+	case code >= 500:
+		return "5xx"
+	default:
+		return "other"
+	}
+}

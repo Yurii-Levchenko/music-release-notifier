@@ -33,11 +33,63 @@ services:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       USER_AGENT: ${USER_AGENT:-ReleaseRadar/0.1 ( unset@example.com )}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      HEARTBEAT_URL: ${HEARTBEAT_URL:-}
+      HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL:-5m}
     ports:
       # Host port 8090, not 8080. 8080 is the most contended port on any dev
       # machine, and losing the race for it on a host restart kills the
       # container before it runs — see the note in CLAUDE.md.
       - "8090:8080"
 
+  # Observability lives behind a profile, so `docker compose up` stays two
+  # containers on a dev machine. Start it with:
+  #   docker compose --profile observability up -d
+  prometheus:
+    image: prom/prometheus:v3.7.3
+    profiles: ["observability"]
+    restart: unless-stopped
+    volumes:
+      - ./deploy/prometheus:/etc/prometheus:ro
+      - promdata:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=30d
+    # No published port, on purpose. Grafana reaches Prometheus over the
+    # compose network, so publishing it bought nothing and cost a failure
+    # mode: on 04.09.2026 this container exited 255 with "Bind for
+    # 0.0.0.0:9091 failed: port is already allocated" and stayed dead for six
+    # days. The same race that killed the app on 8080 - the failure happens
+    # while Docker sets up networking, before the process starts, so
+    # restart: unless-stopped never applies. Every port not published is one
+    # fewer way for that to happen.
+    #
+    # To reach the Prometheus UI when you actually want it:
+    #   docker compose exec prometheus wget -qO- localhost:9090/api/v1/rules
+    # or query it through Grafana, which provisions it as the default source.
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  grafana:
+    image: grafana/grafana:12.3.1
+    profiles: ["observability"]
+    restart: unless-stopped
+    depends_on: [prometheus]
+    environment:
+      # Anonymous read-only viewing: this is a single-operator deployment, and
+      # a password nobody remembers is a dashboard nobody opens.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "3001:3000"
+
 volumes:
   pgdata:
+  promdata:
+  grafanadata:

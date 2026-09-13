@@ -36,6 +36,8 @@ type SubscriptionStore interface {
 	IsSubscribed(ctx context.Context, chatID int64, mbid string) (bool, error)
 	List(ctx context.Context, chatID int64, limit, offset int) (items []storage.Subscription, total int, err error)
 	Forget(ctx context.Context, chatID int64) (existed bool, err error)
+	NeedsLinks(ctx context.Context, mbid string, version int) (bool, error)
+	SetArtistLinks(ctx context.Context, mbid string, links storage.ArtistLinks, version int) error
 }
 
 // handleSubscribe is the Subscribe button on a search card.
@@ -67,6 +69,81 @@ func (b *Bot) handleSubscribe(ctx context.Context, cq *telego.CallbackQuery, has
 		b.answerCallback(ctx, cq.ID, "Ти вже підписаний на "+artist.Name, log)
 	}
 	b.refreshCard(ctx, cq, query, candidates, index, hash, true, log)
+
+	// Deliberately after the card is updated. The lookup is rate limited to
+	// one request a second and shared with search, so doing it first would
+	// make the button feel slow for something the user cannot see yet.
+	b.ensureArtistLinks(ctx, artist.MBID, log)
+
+	// Only on a first subscription. Pressing Subscribe again on an artist you
+	// already follow should not re-send anything, and the notification's own
+	// unique constraint would stop it anyway — but doing the lookup at all
+	// would be work for a guaranteed no-op.
+	if created {
+		b.catchUpOnRecentReleases(ctx, cq.From.ID, artist, log)
+	}
+}
+
+// catchUpOnRecentReleases sends anything the artist put out in the last few
+// days, so that subscribing to somebody who released an album on Friday is
+// worth doing on Sunday rather than only from tomorrow's poll onward.
+//
+// Best effort. A subscription that succeeded must never be reported as failed
+// because a courtesy lookup did not work, so every failure here is a log line.
+func (b *Bot) catchUpOnRecentReleases(ctx context.Context, chatID int64, artist musicbrainz.Artist, log *slog.Logger) {
+	if b.catchUp == nil {
+		return
+	}
+
+	queued, err := b.catchUp.CatchUp(ctx, chatID, artist.MBID)
+	if err != nil {
+		log.Warn("catch-up lookup failed", "mbid", artist.MBID, "err", err)
+		return
+	}
+	if queued == 0 {
+		// The common case, and deliberately silent: telling somebody "nothing\n// recent" every time they subscribe is noise about a non-event.
+		return
+	}
+	log.Info("queued recent releases for a new subscriber",
+		"mbid", artist.MBID, "artist", artist.Name, "queued", queued)
+}
+
+// ensureArtistLinks fetches the artist's streaming links once, if they have
+// never been looked up.
+//
+// Best effort by design. A failure here costs the "listen on" row in future
+// notifications and nothing else, so it must not turn a successful
+// subscription into an error the user sees. links_fetched_at stays null on
+// failure, so the next subscribe to the same artist tries again.
+func (b *Bot) ensureArtistLinks(ctx context.Context, mbid string, log *slog.Logger) {
+	needed, err := b.subs.NeedsLinks(ctx, mbid, musicbrainz.LinksVersion)
+	if err != nil {
+		log.Warn("could not check artist links", "mbid", mbid, "err", err)
+		return
+	}
+	if !needed {
+		return
+	}
+
+	links, err := b.search.ArtistLinks(ctx, mbid)
+	if err != nil {
+		log.Warn("artist link lookup failed", "mbid", mbid, "err", err)
+		return
+	}
+
+	if err := b.subs.SetArtistLinks(ctx, mbid, storage.ArtistLinks{
+		Spotify:    links.Spotify,
+		YouTube:    links.YouTube,
+		AppleMusic: links.AppleMusic,
+		Instagram:  links.Instagram,
+	}, musicbrainz.LinksVersion); err != nil {
+		log.Warn("could not store artist links", "mbid", mbid, "err", err)
+		return
+	}
+
+	log.Info("artist links stored", "mbid", mbid,
+		"spotify", links.Spotify != "", "youtube", links.YouTube != "",
+		"apple_music", links.AppleMusic != "")
 }
 
 // handleUnsubscribeFromCard is the Unsubscribe button on a search card.
@@ -242,37 +319,133 @@ func renderList(items []storage.Subscription, total, page int) (string, *telego.
 
 // handleStop asks before deleting. /stop removes everything and cannot be
 // undone, so a single mistyped character should not cost someone their list.
-func (b *Bot) handleStop(ctx context.Context, chatID int64, log *slog.Logger) {
+// stopWord is what somebody has to type to delete everything.
+//
+// A typed word rather than a button, because the two are not equally safe for
+// this action. /stop sits in Telegram's command menu, so a mis-tap there
+// followed by a mis-tap on a confirm button was two taps away from destroying
+// twenty subscriptions somebody spent real time building — and the legitimate
+// use of /stop is approximately never. That asymmetry is what justifies making
+// it harder rather than faster.
+//
+// Latin capitals in the prompt, because on a Ukrainian keyboard that already
+// takes a deliberate layout switch. Matching is case-insensitive though: the
+// barrier is having to type a word at all, and refusing "delete" would only
+// make somebody who genuinely means it try three times.
+const stopWord = "DELETE"
+
+// maxFarewellList bounds the list handed back before deletion. Well inside
+// Telegram's 4096-character limit for any plausible number of subscriptions.
+const maxFarewellList = 200
+
+// isStopConfirmation reports whether the argument to /stop is the word.
+func isStopConfirmation(args string) bool {
+	return strings.EqualFold(strings.TrimSpace(args), stopWord)
+}
+
+// handleStop explains what deletion costs. It never deletes: that needs the
+// word.
+func (b *Bot) handleStop(ctx context.Context, chatID int64, args string, log *slog.Logger) {
+	if isStopConfirmation(args) {
+		b.deleteEverything(ctx, chatID, log)
+		return
+	}
+
 	_, total, err := b.subs.List(ctx, chatID, 1, 0)
 	if err != nil {
 		log.Error("list subscriptions failed", "err", err)
 		b.reply(ctx, chatID, "Не вдалося прочитати твої дані. Спробуй ще раз.", log)
 		return
 	}
+
+	var what string
 	if total == 0 {
-		// Still offer deletion: a user with no subscriptions may still want
-		// their row gone.
-		b.reply(ctx, chatID, "У тебе немає підписок. Видаляти нічого.", log)
+		// Still offered. Somebody with no subscriptions may still want their
+		// row gone, and Telegram's terms require honoring that (SPEC C30) —
+		// the previous version said "nothing to delete" and refused, which
+		// was the comment's intent inverted by the code.
+		what = "У тебе немає підписок, але твої дані все одно буде видалено."
+	} else {
+		what = fmt.Sprintf("Це видалить <b>усі %d підписок</b> і всі твої дані.", total)
+	}
+
+	b.reply(ctx, chatID, what+
+		"\n\nДію не можна скасувати. Перед видаленням я надішлю список твоїх підписок, "+
+		"щоб ти міг відновити їх вручну.\n\n"+
+		"Щоб підтвердити, надішли:\n<code>/stop "+stopWord+"</code>", log)
+}
+
+// deleteEverything hands back the list and then deletes.
+//
+// The list goes first, and that order is the point: deletion is irreversible
+// and Telegram's terms rule out a soft delete with a grace period (C30), so the
+// only way to make a mistake recoverable is to give somebody what they need to
+// rebuild it before it is gone. If the send fails, nothing is deleted.
+func (b *Bot) deleteEverything(ctx context.Context, chatID int64, log *slog.Logger) {
+	items, total, err := b.subs.List(ctx, chatID, maxFarewellList, 0)
+	if err != nil {
+		log.Error("list subscriptions before deletion failed", "err", err)
+		b.reply(ctx, chatID, "Не вдалося прочитати твої дані. Нічого не видалено.", log)
 		return
 	}
 
-	text := fmt.Sprintf(
-		"Це видалить <b>усі %d підписок</b> і всі твої дані.\n\nДію не можна скасувати.", total)
-	if _, err := b.client.api.SendMessage(ctx, &telego.SendMessageParams{
-		ChatID:    telego.ChatID{ID: chatID},
-		Text:      text,
-		ParseMode: telego.ModeHTML,
-		ReplyMarkup: &telego.InlineKeyboardMarkup{
-			InlineKeyboard: [][]telego.InlineKeyboardButton{{
-				{Text: "Видалити все", CallbackData: cbStop + ":yes"},
-				{Text: "Скасувати", CallbackData: cbStop + ":no"},
-			}},
-		},
-	}); err != nil {
-		b.handleSendError(ctx, chatID, err, log)
+	if total > 0 {
+		if !b.sendFarewellList(ctx, chatID, items, total, log) {
+			// Deliberately fatal to the deletion. Deleting after failing to
+			// hand back the list would remove the one thing that made the
+			// action recoverable.
+			b.reply(ctx, chatID, "Не вдалося надіслати список підписок. Нічого не видалено — спробуй ще раз.", log)
+			return
+		}
 	}
+
+	existed, err := b.subs.Forget(ctx, chatID)
+	if err != nil {
+		log.Error("forget user failed", "err", err)
+		b.reply(ctx, chatID, "Не вдалося видалити. Спробуй ще раз.", log)
+		return
+	}
+
+	log.Info("user data deleted", "existed", existed, "subscriptions", total)
+	b.reply(ctx, chatID,
+		"Усі твої дані видалені.\n\nЯкщо захочеш повернутись — просто напиши /start.", log)
 }
 
+// sendFarewellList sends the subscriptions as plain text, reporting success.
+func (b *Bot) sendFarewellList(ctx context.Context, chatID int64,
+	items []storage.Subscription, total int, log *slog.Logger,
+) bool {
+	if err := b.client.SendHTML(ctx, chatID, farewellList(items, total)); err != nil {
+		log.Error("could not send the farewell list", "err", err)
+		return false
+	}
+	return true
+}
+
+// farewellList renders the subscriptions handed back before deletion.
+//
+// Separate from the send so it can be tested. Once Forget runs this text is the
+// only copy of the data, and getting it wrong is not something a later message
+// can fix.
+func farewellList(items []storage.Subscription, total int) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Твої підписки перед видаленням — %d:\n\n", total)
+	for i, item := range items {
+		fmt.Fprintf(&sb, "%d. %s\n", i+1, html.EscapeString(item.Name))
+	}
+	if total > len(items) {
+		// The cap is generous, but saying nothing about the remainder would
+		// hand somebody an incomplete list that looks complete.
+		fmt.Fprintf(&sb, "\n…та ще %d.", total-len(items))
+	}
+	return sb.String()
+}
+
+// handleStopConfirm answers the buttons an older version of /stop drew.
+//
+// Kept so a stale message in somebody's history does something sensible rather
+// than nothing. It no longer deletes: there is one deletion path now, and it
+// needs the word.
 func (b *Bot) handleStopConfirm(ctx context.Context, cq *telego.CallbackQuery, answer string, log *slog.Logger) {
 	msg := callbackMessage(cq)
 
@@ -284,17 +457,10 @@ func (b *Bot) handleStopConfirm(ctx context.Context, cq *telego.CallbackQuery, a
 		return
 	}
 
-	existed, err := b.subs.Forget(ctx, cq.From.ID)
-	if err != nil {
-		log.Error("forget user failed", "err", err)
-		b.answerCallback(ctx, cq.ID, "Не вдалося видалити. Спробуй ще раз.", log)
-		return
-	}
-	log.Info("user data deleted", "existed", existed)
-	b.answerCallback(ctx, cq.ID, "Видалено", log)
+	b.answerCallback(ctx, cq.ID, "Тепер потрібне підтвердження текстом", log)
 	if msg != nil {
 		b.editText(ctx, msg,
-			"Усі твої дані видалені.\n\nЯкщо захочеш повернутись — просто напиши /start.", log)
+			"Ця кнопка більше не діє.\n\nЩоб видалити всі дані, надішли:\n<code>/stop "+stopWord+"</code>", log)
 	}
 }
 
@@ -324,7 +490,7 @@ func (b *Bot) refreshCard(ctx context.Context, cq *telego.CallbackQuery, query s
 	if msg == nil {
 		return
 	}
-	text, markup := renderCandidate(query, candidates, index, hash, subscribed)
+	text, markup := renderCandidate(query, candidates, index, hash, subscribed, b.now())
 	if _, err := b.client.api.EditMessageText(ctx, &telego.EditMessageTextParams{
 		ChatID:             telego.ChatID{ID: msg.Chat.ID},
 		MessageID:          msg.MessageID,

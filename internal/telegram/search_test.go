@@ -3,6 +3,7 @@ package telegram
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/musicbrainz"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/storage"
@@ -129,7 +130,7 @@ func TestRenderCandidateEscapesHTML(t *testing.T) {
 		Tags:           []string{"folk & rock"},
 	}}
 
-	text, _ := renderCandidate("s&g <query>", candidates, 0, "abcdef123456", false)
+	text, _ := renderCandidate("s&g <query>", candidates, 0, "abcdef123456", false, testClock)
 
 	for _, raw := range []string{"Simon & Garfunkel", "<the duo>", `"S&G"`, "s&g <query>"} {
 		if strings.Contains(text, raw) {
@@ -162,7 +163,7 @@ func TestRenderCandidateStaysUnderMessageLimit(t *testing.T) {
 		Tags:           []string{long, long, long},
 	}}
 
-	text, _ := renderCandidate(long, candidates, 0, "abcdef123456", false)
+	text, _ := renderCandidate(long, candidates, 0, "abcdef123456", false, testClock)
 	if n := len([]rune(text)); n > 4096 {
 		t.Fatalf("card is %d characters, over Telegram's 4096 limit", n)
 	}
@@ -189,8 +190,8 @@ func TestArtistFacts(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := artistFacts(tc.in); got != tc.want {
-				t.Fatalf("artistFacts(%+v) = %q, want %q", tc.in, got, tc.want)
+			if got := artistFacts(tc.in, testClock); got != tc.want {
+				t.Fatalf("artistFacts(%+v, testClock) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
 	}
@@ -200,7 +201,7 @@ func TestRenderCandidateShowsPosition(t *testing.T) {
 	candidates := sampleCandidates()
 
 	for i := range candidates {
-		_, markup := renderCandidate("radiohead", candidates, i, "abcdef123456", false)
+		_, markup := renderCandidate("radiohead", candidates, i, "abcdef123456", false, testClock)
 		var counter string
 		for _, row := range markup.InlineKeyboard {
 			for _, b := range row {
@@ -214,3 +215,142 @@ func TestRenderCandidateShowsPosition(t *testing.T) {
 		}
 	}
 }
+
+// Drake is a Person, so MusicBrainz's life-span begin is his birthday — not
+// the start of his career. Rendering it as "з 1986-10-24" claimed he had been
+// recording since he was born.
+func TestPersonShowsAgeNotACareerStart(t *testing.T) {
+	got := artistFacts(musicbrainz.Artist{
+		Type: "Person", Country: "CA", Begin: "1986-10-24",
+	}, testClock)
+
+	if strings.Contains(got, "з 1986") {
+		t.Fatalf("a person's birth year is presented as a career start: %q", got)
+	}
+	// testClock is November, so the October birthday has passed.
+	if !strings.Contains(got, "40 років") {
+		t.Fatalf("facts = %q, want an age", got)
+	}
+	if strings.Contains(got, "10-24") {
+		t.Fatalf("the full date of birth is on the card: %q", got)
+	}
+}
+
+// The birthday not having happened yet this year must take a year off, or
+// every artist is a year too old for most of the calendar.
+func TestAgeAccountsForTheBirthdayNotYetPassed(t *testing.T) {
+	before := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	after := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+	drake := musicbrainz.Artist{Type: "Person", Begin: "1986-10-24"}
+
+	if got := artistFacts(drake, before); !strings.Contains(got, "39") {
+		t.Errorf("before the birthday = %q, want 39", got)
+	}
+	if got := artistFacts(drake, after); !strings.Contains(got, "40") {
+		t.Errorf("after the birthday = %q, want 40", got)
+	}
+}
+
+// A bare year cannot place a birthday, so an age computed from it is off by
+// one for most of the year. Better to show the year than to be confidently
+// wrong.
+func TestCoarseBirthDateFallsBackToTheYear(t *testing.T) {
+	for _, begin := range []string{"1986", "1986-10"} {
+		got := artistFacts(musicbrainz.Artist{Type: "Person", Begin: begin}, testClock)
+		if !strings.Contains(got, "нар. 1986") {
+			t.Errorf("begin %q = %q, want a year fallback rather than a guessed age", begin, got)
+		}
+	}
+}
+
+// Ukrainian agreement has three forms and the teens are the trap: 11 is
+// "років", not "рік", even though it ends in 1.
+func TestAgeAgreement(t *testing.T) {
+	cases := map[int]string{
+		1:   "1 рік",
+		2:   "2 роки",
+		4:   "4 роки",
+		5:   "5 років",
+		11:  "11 років",
+		12:  "12 років",
+		14:  "14 років",
+		21:  "21 рік",
+		22:  "22 роки",
+		25:  "25 років",
+		31:  "31 рік",
+		40:  "40 років",
+		101: "101 рік",
+		111: "111 років",
+	}
+	for age, want := range cases {
+		if got := ageWords(age); got != want {
+			t.Errorf("ageWords(%d) = %q, want %q", age, got, want)
+		}
+	}
+}
+
+// A date MusicBrainz accepted that cannot describe a living person must not
+// produce a nonsense age.
+func TestImplausibleBirthDateShowsNoAge(t *testing.T) {
+	got := artistFacts(musicbrainz.Artist{Type: "Person", Country: "IT", Begin: "1567-03-02"}, testClock)
+
+	if strings.Contains(got, "рок") || strings.Contains(got, "рік") {
+		t.Fatalf("a 459-year-old was given an age: %q", got)
+	}
+	if !strings.Contains(got, "нар. 1567") {
+		t.Fatalf("facts = %q, want the year", got)
+	}
+}
+
+// For a group the same field really is the formation date, so "з" is right.
+func TestGroupLifeSpanIsLabeledAsFormation(t *testing.T) {
+	got := artistFacts(musicbrainz.Artist{
+		Type: "Group", Country: "GB", Begin: "1985",
+	}, testClock)
+
+	if !strings.Contains(got, "з 1985") {
+		t.Fatalf("facts = %q, want a formation label", got)
+	}
+}
+
+// An unknown type must not be asserted to be a person. "Formed in" is the
+// safer reading when we do not know what the act is.
+func TestUnknownTypeDoesNotClaimABirthDate(t *testing.T) {
+	got := artistFacts(musicbrainz.Artist{Begin: "1999"}, testClock)
+
+	if strings.Contains(got, "нар.") {
+		t.Fatalf("a birth date was asserted about an artist of unknown type: %q", got)
+	}
+	if !strings.Contains(got, "з 1999") {
+		t.Fatalf("facts = %q", got)
+	}
+}
+
+// A closed range needs no label: it reads correctly as a lifetime for a person
+// and as an active period for a group.
+func TestClosedRangeNeedsNoLabel(t *testing.T) {
+	person := artistFacts(musicbrainz.Artist{Type: "Person", Begin: "1971-06-16", End: "1996-09-13"}, testClock)
+	if !strings.Contains(person, "1971–1996") {
+		t.Fatalf("facts = %q, want a bare range", person)
+	}
+	if strings.Contains(person, "нар.") {
+		t.Fatalf("a closed range was also labeled as a birth: %q", person)
+	}
+}
+
+func TestMalformedDatesAreDropped(t *testing.T) {
+	for _, bad := range []string{"", "19", "unknown", "circa 1980"} {
+		got := artistFacts(musicbrainz.Artist{Type: "Group", Country: "US", Begin: bad}, testClock)
+		if strings.Contains(got, bad) && bad != "" {
+			t.Errorf("unparseable date %q reached the card: %q", bad, got)
+		}
+		if !strings.Contains(got, "Гурт") {
+			t.Errorf("the rest of the facts were lost for %q: %q", bad, got)
+		}
+	}
+}
+
+// testClock fixes "today" so an age assertion does not change with the
+// calendar. Chosen after Drake's October birthday so the arithmetic is
+// unambiguous.
+var testClock = time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)

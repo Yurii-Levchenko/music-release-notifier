@@ -27,6 +27,31 @@ type Release struct {
 	// channel needs a no-image path. Not a rare edge case.
 	CoverURL string
 	InfoURL  string
+
+	// Links are the artist's own destinations. Empty is normal: they are
+	// looked up once per artist, and an artist subscribed to before that
+	// lookup existed has none. A channel must render fine without them.
+	Links ArtistLinks
+}
+
+// ArtistLinks are an artist's external destinations.
+//
+// They live on the domain release rather than being resolved by a channel, for
+// the same reason CoverURL does (D14): resolving at send time would mean one
+// lookup per subscriber instead of one per artist, ever.
+type ArtistLinks struct {
+	Spotify    string
+	YouTube    string
+	AppleMusic string
+	// Instagram is the profile URL. Not a place to listen, which is why this
+	// type is not called ListenLinks — it was, briefly, and the name became a
+	// lie the moment a social account joined it.
+	Instagram string
+}
+
+// Listenable reports whether there is anywhere to go and play the thing.
+func (l ArtistLinks) Listenable() bool {
+	return l.Spotify != "" || l.YouTube != "" || l.AppleMusic != ""
 }
 
 // Recipient says where to deliver without saying how. Address is opaque to the

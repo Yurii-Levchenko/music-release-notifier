@@ -8,9 +8,14 @@ import (
 	"fmt"
 	"html"
 	"log/slog"
+	"net/url"
 	"strings"
+	"time"
 
 	"github.com/mymmrac/telego"
+
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/metrics"
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/musicbrainz"
 
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/notify"
 )
@@ -18,8 +23,9 @@ import (
 // Client is a thin wrapper over the Bot API. It exists so the notifier and the
 // bot worker can share one connection and one error-classification path.
 type Client struct {
-	api *telego.Bot
-	log *slog.Logger
+	api     *telego.Bot
+	log     *slog.Logger
+	metrics *metrics.Metrics
 	// self is filled by Init and used for logging and deep links.
 	self *telego.User
 }
@@ -31,7 +37,7 @@ func NewClient(token string, log *slog.Logger) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create telegram bot: %w", err)
 	}
-	return &Client{api: api, log: log}, nil
+	return &Client{api: api, log: log, metrics: metrics.Nop()}, nil
 }
 
 // Init verifies the token and caches the bot's own identity. Called once at
@@ -69,7 +75,7 @@ func (c *Client) SendHTML(ctx context.Context, chatID int64, text string) error 
 			IsDisabled: true,
 		},
 	})
-	return wrap(err)
+	return c.observe(err)
 }
 
 // SendPhotoHTML sends a photo by URL with an HTML caption. Telegram fetches the
@@ -81,7 +87,7 @@ func (c *Client) SendPhotoHTML(ctx context.Context, chatID int64, photoURL, capt
 		Caption:   caption,
 		ParseMode: telego.ModeHTML,
 	})
-	return wrap(err)
+	return c.observe(err)
 }
 
 // SetCommands registers the command list so it shows up in the client's menu.
@@ -94,16 +100,20 @@ func (c *Client) SetCommands(ctx context.Context) error {
 			{Command: "stop", Description: "Відписатися від усього і видалити дані"},
 		},
 	})
-	return wrap(err)
+	return c.observe(err)
 }
 
 // Notifier adapts Client to notify.Notifier. Kept separate so the domain
 // depends on the interface and never on this package.
 type Notifier struct {
 	client *Client
+	// now is injectable because the headline depends on how old the release is
+	// today, and a message whose wording changes with the calendar has to be
+	// testable without waiting for tomorrow.
+	now func() time.Time
 }
 
-func NewNotifier(c *Client) *Notifier { return &Notifier{client: c} }
+func NewNotifier(c *Client) *Notifier { return &Notifier{client: c, now: time.Now} }
 
 // Kind matches channels.kind in the database.
 func (n *Notifier) Kind() string { return "telegram" }
@@ -118,7 +128,7 @@ func (n *Notifier) Send(ctx context.Context, to notify.Recipient, rel notify.Rel
 		return &notify.DeliveryError{Disposition: notify.BadMessage, Err: err}
 	}
 
-	body := formatRelease(rel)
+	body := formatRelease(rel, n.now())
 
 	// Roughly a quarter of releases have no cover art (SPEC C27b), so the
 	// text-only path is normal operation, not a rare fallback.
@@ -126,38 +136,135 @@ func (n *Notifier) Send(ctx context.Context, to notify.Recipient, rel notify.Rel
 		return n.client.SendHTML(ctx, chatID, body)
 	}
 
-	err = n.client.SendPhotoHTML(ctx, chatID, rel.CoverURL, body)
+	return n.sendWithCover(ctx, chatID, rel, body)
+}
+
+// coverFetchRetryDelay is how long to wait before asking Telegram to fetch the
+// cover a second time.
+//
+// Telegram downloads the image itself (D14: we never fetch it), and Cover Art
+// Archive answers with a 307 to archive.org, which is occasionally slow enough
+// that Telegram gives up. Observed live on 09.09.2026: the URL that failed
+// served a 24 KB JPEG in 2.1 s when checked minutes later.
+const coverFetchRetryDelay = 3 * time.Second
+
+// sendWithCover sends the photo, and degrades to text only once that is
+// actually hopeless.
+//
+// The distinction that matters: "Telegram could not download our URL" and "our
+// URL is malformed" are both 400s and both classified BadMessage, but only the
+// first is worth another try. Treating them the same silently downgraded a
+// release to a text-only message because archive.org was slow for two seconds.
+func (n *Notifier) sendWithCover(ctx context.Context, chatID int64, rel notify.Release, body string) error {
+	err := n.client.SendPhotoHTML(ctx, chatID, rel.CoverURL, body)
 	if err == nil {
+		n.client.metrics.CoverSends.WithLabelValues("ok").Inc()
 		return nil
 	}
-	// A bad or unreachable image URL must not cost the user the notification.
-	// Fall back to text once, then let the real disposition stand.
+
 	var de *notify.DeliveryError
-	if ok := asDeliveryError(err, &de); ok && de.Disposition == notify.BadMessage {
-		n.client.log.Warn("photo send failed, falling back to text",
-			"release_id", rel.ID, "err", de.Err)
-		return n.client.SendHTML(ctx, chatID, body)
+	if ok := asDeliveryError(err, &de); !ok || de.Disposition != notify.BadMessage {
+		// Not a caption or image problem at all — a rate limit, an outage, a
+		// dead chat. That belongs to the outbox, which will retry the whole
+		// notification rather than quietly dropping the cover.
+		return err
 	}
-	return err
+
+	if isCoverFetchFailure(de.Err) {
+		n.client.log.Warn("telegram could not fetch the cover, retrying once",
+			"release_id", rel.ID, "err", de.Err)
+
+		if sleepErr := sleepCtx(ctx, coverFetchRetryDelay); sleepErr != nil {
+			return sleepErr
+		}
+
+		if retryErr := n.client.SendPhotoHTML(ctx, chatID, rel.CoverURL, body); retryErr == nil {
+			n.client.metrics.CoverSends.WithLabelValues("retried_ok").Inc()
+			return nil
+		}
+		n.client.log.Warn("cover still unavailable on the second try, sending text",
+			"release_id", rel.ID)
+	}
+
+	// A malformed URL, or a fetch that failed twice. The notification must not
+	// be lost over a missing picture.
+	n.client.metrics.CoverSends.WithLabelValues("degraded_to_text").Inc()
+	return n.client.SendHTML(ctx, chatID, body)
+}
+
+// isCoverFetchFailure reports whether Telegram failed to *download* the image,
+// as opposed to rejecting the URL itself. Only the former can succeed on a
+// retry; retrying a malformed URL just delays the text message.
+func isCoverFetchFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	desc := strings.ToLower(err.Error())
+	return contains(desc,
+		"failed to get http url content",
+		"webpage_curl_failed",
+		"image_process_failed",
+		"wrong type of the web page content")
+}
+
+// sleepCtx waits, or returns early if the context is canceled.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // formatRelease builds the message body. Every value that came from an external
 // API is escaped — artist and album titles routinely contain &, < and >.
-func formatRelease(rel notify.Release) string {
+// maxTitleRunes bounds the release title in a notification.
+//
+// A photo caption is limited to 1024 characters and a message to 4096, and
+// MusicBrainz titles are not bounded at all — box sets and classical works run
+// long. Exceeding the caption limit is survivable (the photo path degrades to
+// text) but it would cost the artwork over something as avoidable as a title,
+// and exceeding the message limit would cost the notification.
+//
+// 180 runes is well inside both and already longer than anyone reads in a chat.
+const maxTitleRunes = 180
+
+func formatRelease(rel notify.Release, now time.Time) string {
 	var b strings.Builder
 	b.WriteString("🎵 <b>")
 	b.WriteString(html.EscapeString(rel.ArtistName))
-	b.WriteString("</b> — новий реліз\n\n")
+	b.WriteString("</b> — ")
+	b.WriteString(releaseLabel(rel.ReleaseDate, now))
+
+	// The handle sits between the label and the date, next to the artist it
+	// belongs to. It goes in the header rather than with the streaming links
+	// because it answers a different question: those are "where do I play
+	// this", this is "who is this".
+	if handle := musicbrainz.InstagramHandle(rel.Links.Instagram); handle != "" {
+		b.WriteString(" ")
+		b.WriteString(link(rel.Links.Instagram, "@"+handle))
+	}
+
+	// The date last, so it reads as a qualifier on the whole line.
+	if on := releasedOn(rel.ReleaseDate, now); on != "" {
+		b.WriteString(" ")
+		b.WriteString(on)
+	}
+
+	b.WriteString("\n\n")
 
 	if rel.InfoURL != "" {
 		b.WriteString(`<a href="`)
 		b.WriteString(html.EscapeString(rel.InfoURL))
 		b.WriteString(`">`)
-		b.WriteString(html.EscapeString(rel.Title))
+		b.WriteString(html.EscapeString(trimRunes(rel.Title, maxTitleRunes)))
 		b.WriteString("</a>")
 	} else {
 		b.WriteString("<b>")
-		b.WriteString(html.EscapeString(rel.Title))
+		b.WriteString(html.EscapeString(trimRunes(rel.Title, maxTitleRunes)))
 		b.WriteString("</b>")
 	}
 
@@ -167,7 +274,102 @@ func formatRelease(rel notify.Release) string {
 		b.WriteString(" · ")
 		b.WriteString(rel.ReleaseDate.Format("02.01.2006"))
 	}
+
+	if listen := listenRow(rel); listen != "" {
+		b.WriteString("\n\n")
+		b.WriteString(listen)
+	}
 	return b.String()
+}
+
+// listenRow is the "go press play" line.
+//
+// It links to a *search* for the release on each platform, not to the release
+// itself, because a link to the release does not exist. MusicBrainz carries
+// streaming links for artists only: a canonical 2014 album's release group has
+// thirteen relations — allmusic, discogs, genius, last.fm, rateyourmusic,
+// wikidata — and zero streaming ones, and ten random fresh release groups from
+// the feed had none either (SPEC C46). Spotify's own API could answer this and
+// is ruled out for the same reasons it is not the release source (D2).
+//
+// A search link is honest in a way an artist link is not. When the release is
+// on the platform it lands on it; when it is not, the empty result says so —
+// which is exactly the question that went unanswered when a Brazil-only
+// compilation arrived with three links to artist pages (C48).
+func listenRow(rel notify.Release) string {
+	query := searchQuery(rel.ArtistName, rel.Title)
+	if query == "" {
+		return ""
+	}
+
+	// Which platforms to offer. Where MusicBrainz says the artist is present,
+	// only those; where it says nothing at all, all three.
+	//
+	// The gate matters because most of this feed is obscure artists — sending
+	// somebody to Apple Music search for an artist with no Apple presence is
+	// the same dead end this change is meant to remove. But absent data is not
+	// evidence of absence, and MusicBrainz's coverage is patchy, so "we know
+	// nothing about this artist" must not mean "we offer nothing".
+	l := rel.Links
+	showAll := !l.Listenable()
+
+	var parts []string
+	// Spotify first: this project exists because Spotify does not reliably tell
+	// you about releases, so that is where most readers will want to go.
+	if showAll || l.Spotify != "" {
+		parts = append(parts, link(spotifySearchURL(query), "Spotify"))
+	}
+	if showAll || l.YouTube != "" {
+		parts = append(parts, link(youTubeSearchURL(query), "YouTube"))
+	}
+	if showAll || l.AppleMusic != "" {
+		parts = append(parts, link(appleMusicSearchURL(query), "Apple Music"))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "▶️ " + strings.Join(parts, " · ")
+}
+
+// maxQueryRunes bounds the search query. Release titles are unbounded
+// upstream, and a 5000-character title would otherwise become a 15 KB URL in
+// three places. No search engine reads that far anyway.
+const maxQueryRunes = 120
+
+// searchQuery builds "artist title", cut to a length a search box can use.
+//
+// Cut without an ellipsis, unlike the displayed title: "…" is a character the
+// search would try to match.
+func searchQuery(artist, title string) string {
+	query := strings.TrimSpace(artist + " " + title)
+	runes := []rune(query)
+	if len(runes) > maxQueryRunes {
+		query = strings.TrimSpace(string(runes[:maxQueryRunes]))
+	}
+	return query
+}
+
+// Search entry points on each platform's own site. Plain URLs, no API: nothing
+// here comes from Spotify's API, so the restriction that ruled it out as a
+// data source (ToS §III.9, forwarding Spotify content) does not apply.
+func spotifySearchURL(query string) string {
+	// Path segment, not a query parameter — that is the shape of Spotify's
+	// search route, and it opens the app rather than the web player on mobile.
+	return "https://open.spotify.com/search/" + url.PathEscape(query)
+}
+
+func youTubeSearchURL(query string) string {
+	return "https://www.youtube.com/results?search_query=" + url.QueryEscape(query)
+}
+
+func appleMusicSearchURL(query string) string {
+	// Apple answers this with a 301 to the viewer's regional store, which is
+	// the correct destination and not something to hardcode.
+	return "https://music.apple.com/search?term=" + url.QueryEscape(query)
+}
+
+func link(href, label string) string {
+	return `<a href="` + html.EscapeString(href) + `">` + html.EscapeString(label) + `</a>`
 }
 
 func releaseTypeLabel(t string) string {
@@ -181,4 +383,75 @@ func releaseTypeLabel(t string) string {
 	default:
 		return t
 	}
+}
+
+// trimRunes shortens s to at most n runes, counting runes rather than bytes
+// because Telegram's limits are in characters and half of this project's data
+// is Japanese and Cyrillic — a byte-based cut would both truncate too early
+// and be able to split a character in half.
+func trimRunes(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n-1]) + "…"
+}
+
+// freshDays is how long a release still reads as "new".
+//
+// Two, not one. The poller runs daily, so a release announced the day after it
+// came out is the normal healthy path, not a late one.
+const freshDays = 2
+
+// releaseLabel and releasedOn are the two halves of the header, split so the
+// Instagram handle can sit between them — next to the artist it belongs to,
+// with the date trailing as a qualifier on the whole line.
+//
+// Both are driven by the release date rather than by how the notification came
+// to be queued, because those are different questions and only the first is the
+// reader's. The poll window is seven days wide and the feed filters on
+// release_date rather than on when a volunteer entered the record (C24c), so
+// the ordinary path routinely announces releases that are days old: measured on
+// live data, notifications have gone out 3, 5 and 7 days after the release
+// date, every one of them saying "new".
+func releaseLabel(released, now time.Time) string {
+	if isFresh(released, now) {
+		return "новий реліз"
+	}
+	return "недавній реліз"
+}
+
+// releasedOn is the trailing date, empty while the release still reads as new.
+//
+// The date is repeated on the line below. That is deliberate — this line is
+// what shows in a lock-screen preview, and "new" there when the record is five
+// days old is the part that misleads.
+func releasedOn(released, now time.Time) string {
+	if isFresh(released, now) {
+		return ""
+	}
+	return "від " + dayAndMonth(released)
+}
+
+func isFresh(released, now time.Time) bool {
+	if released.IsZero() {
+		return true
+	}
+	days := int(now.UTC().Truncate(24*time.Hour).
+		Sub(released.UTC().Truncate(24*time.Hour)) / (24 * time.Hour))
+
+	// A future date lands here too: the poller guards against those, and if one
+	// slips through, "new" is the least wrong thing to call it.
+	return days < freshDays
+}
+
+// monthsGenitive are the forms Ukrainian uses after a date: "від 7 вересня".
+var monthsGenitive = [...]string{
+	"січня", "лютого", "березня", "квітня", "травня", "червня",
+	"липня", "серпня", "вересня", "жовтня", "листопада", "грудня",
+}
+
+func dayAndMonth(t time.Time) string {
+	t = t.UTC()
+	return fmt.Sprintf("%d %s", t.Day(), monthsGenitive[t.Month()-1])
 }

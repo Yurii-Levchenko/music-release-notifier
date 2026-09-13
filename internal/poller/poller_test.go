@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/listenbrainz"
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/musicbrainz"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/storage"
 )
 
@@ -44,6 +45,9 @@ type fakeStore struct {
 	records    []recorded
 	recordErr  error
 	failOnMBID string // makes Record fail for one specific release group
+	// known marks release groups the store already has, so Record reports
+	// Created:false — the state a catch-up has to handle.
+	known map[string]bool
 
 	pollErrs   []error // what RecordPoll was told, in order
 	pollCalls  int
@@ -63,6 +67,10 @@ func (s *fakeStore) Record(_ context.Context, rel storage.NewRelease, notify boo
 	}
 	if s.failOnMBID != "" && rel.ReleaseGroupMBID == s.failOnMBID {
 		return storage.FanOut{}, errors.New("simulated write failure")
+	}
+	if s.known[rel.ReleaseGroupMBID] {
+		// Already recorded by an earlier poll: no insert, no fan-out.
+		return storage.FanOut{Created: false}, nil
 	}
 	s.records = append(s.records, recorded{rel: rel, notify: notify})
 	out := storage.FanOut{ReleaseID: int64(len(s.records)), Created: true}
@@ -129,7 +137,7 @@ func TestPollFiltersReleaseTypes(t *testing.T) {
 		t.Fatalf("recorded %d releases, want 3 (Album, Single, EP)", stats.Recorded)
 	}
 	for _, r := range store.records {
-		if !notifiableType(r.rel.PrimaryType) {
+		if !(listenbrainz.Release{PrimaryType: r.rel.PrimaryType}).NotifiableType() {
 			t.Fatalf("recorded a %q release", r.rel.PrimaryType)
 		}
 	}
@@ -419,5 +427,228 @@ func TestInitialDelayIsZeroWhenOverdueOrUnknown(t *testing.T) {
 				t.Fatalf("initialDelay = %v, want 0", got)
 			}
 		})
+	}
+}
+
+// --- link backfill ----------------------------------------------------------
+
+type fakeBackfill struct {
+	pending []string
+	links   map[string]musicbrainz.Links
+	stored  map[string]storage.ArtistLinks
+	lookups []string
+
+	listErr   error
+	lookupErr error
+
+	askedVersion  int
+	storedVersion int
+}
+
+func (f *fakeBackfill) ArtistsMissingLinks(_ context.Context, limit, version int) ([]string, error) {
+	f.askedVersion = version
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	if len(f.pending) > limit {
+		return f.pending[:limit], nil
+	}
+	return f.pending, nil
+}
+
+func (f *fakeBackfill) ArtistLinks(_ context.Context, mbid string) (musicbrainz.Links, error) {
+	f.lookups = append(f.lookups, mbid)
+	if f.lookupErr != nil {
+		return musicbrainz.Links{}, f.lookupErr
+	}
+	return f.links[mbid], nil
+}
+
+func (f *fakeBackfill) SetArtistLinks(_ context.Context, mbid string, l storage.ArtistLinks, version int) error {
+	f.storedVersion = version
+	if f.stored == nil {
+		f.stored = map[string]storage.ArtistLinks{}
+	}
+	f.stored[mbid] = l
+	return nil
+}
+
+// Links are fetched at subscribe time, which leaves every artist subscribed to
+// before the feature existed permanently without them. The backfill is what
+// makes it a whole feature rather than half of one.
+func TestBackfillFillsArtistsThatNeverHadALookup(t *testing.T) {
+	b := &fakeBackfill{
+		pending: []string{"mbid-a", "mbid-b"},
+		links: map[string]musicbrainz.Links{
+			"mbid-a": {
+				Spotify:    "https://open.spotify.com/artist/A",
+				YouTube:    "https://youtube.com/channel/A",
+				AppleMusic: "https://music.apple.com/us/artist/1",
+				Instagram:  "https://www.instagram.com/a/",
+			},
+			"mbid-b": {YouTube: "https://youtube.com/channel/B"},
+		},
+	}
+	p := bareTestPoller().WithLinkBackfill(b)
+
+	p.backfillLinks(context.Background())
+
+	if len(b.stored) != 2 {
+		t.Fatalf("stored %d, want 2", len(b.stored))
+	}
+
+	// Every field, not just one. Asserting only Spotify let a missing
+	// Instagram field ship: the mapping to storage.ArtistLinks is written out
+	// by hand, so a new link kind is exactly the thing that gets forgotten in
+	// one of the two call sites.
+	got := b.stored["mbid-a"]
+	want := storage.ArtistLinks{
+		Spotify:    "https://open.spotify.com/artist/A",
+		YouTube:    "https://youtube.com/channel/A",
+		AppleMusic: "https://music.apple.com/us/artist/1",
+		Instagram:  "https://www.instagram.com/a/",
+	}
+	if got != want {
+		t.Errorf("stored = %+v, want %+v", got, want)
+	}
+}
+
+// An artist with no links must still be recorded as looked at, or the lookup
+// repeats every poll forever against a one-request-a-second API.
+func TestBackfillRecordsAnEmptyResult(t *testing.T) {
+	b := &fakeBackfill{
+		pending: []string{"mbid-none"},
+		links:   map[string]musicbrainz.Links{"mbid-none": {}},
+	}
+	p := bareTestPoller().WithLinkBackfill(b)
+
+	p.backfillLinks(context.Background())
+
+	if _, recorded := b.stored["mbid-none"]; !recorded {
+		t.Fatal("an artist with no links was not recorded as checked; it will be retried forever")
+	}
+}
+
+// A failed lookup must not be recorded, so the next poll tries again.
+func TestBackfillLeavesAFailedLookupUnrecorded(t *testing.T) {
+	b := &fakeBackfill{
+		pending:   []string{"mbid-x"},
+		lookupErr: errors.New("503 service unavailable"),
+	}
+	p := bareTestPoller().WithLinkBackfill(b)
+
+	p.backfillLinks(context.Background())
+
+	if len(b.stored) != 0 {
+		t.Fatalf("a failed lookup was recorded as done: %+v", b.stored)
+	}
+}
+
+// The backfill is housekeeping. A MusicBrainz outage must not be able to make
+// a successful poll look failed.
+func TestBackfillFailureIsNotFatal(t *testing.T) {
+	b := &fakeBackfill{listErr: errors.New("database unreachable")}
+	p := bareTestPoller().WithLinkBackfill(b)
+
+	p.backfillLinks(context.Background()) // must not panic
+
+	if len(b.lookups) != 0 {
+		t.Fatal("looked up artists it could not list")
+	}
+}
+
+// Without a backfill configured the poller must behave exactly as before —
+// nil is the normal state for every existing deployment and every other test.
+func TestPollerWithoutBackfillIsInert(t *testing.T) {
+	p := bareTestPoller()
+
+	// A nil dependency must be a no-op, not a nil dereference: the poll loop
+	// calls this on every cycle.
+	p.backfillLinks(context.Background())
+
+	if p.links != nil {
+		t.Fatal("a backfill appeared without being configured")
+	}
+}
+
+// Cancellation has to stop the loop rather than working through the batch.
+func TestBackfillStopsOnCancellation(t *testing.T) {
+	b := &fakeBackfill{pending: []string{"a", "b", "c"}, links: map[string]musicbrainz.Links{}}
+	p := bareTestPoller().WithLinkBackfill(b)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	p.backfillLinks(ctx)
+
+	if len(b.lookups) != 0 {
+		t.Fatalf("performed %d lookups after cancellation", len(b.lookups))
+	}
+}
+
+// bareTestPoller builds a poller with no feed or store: the backfill touches
+// neither, and supplying fakes for them would only obscure what is under test.
+func bareTestPoller() *Poller {
+	return New(nil, nil, time.Hour, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+// A row must be stamped with the version it was resolved against, or the
+// backfill cannot tell "resolved against an older set of link kinds" from
+// "resolved, and has none" — and one of those has to be re-resolved while the
+// other must never be.
+func TestBackfillStampsTheLinksVersion(t *testing.T) {
+	b := &fakeBackfill{
+		pending: []string{"mbid-a"},
+		links:   map[string]musicbrainz.Links{"mbid-a": {Spotify: "https://open.spotify.com/artist/A"}},
+	}
+	p := bareTestPoller().WithLinkBackfill(b)
+
+	p.backfillLinks(context.Background())
+
+	if b.askedVersion != musicbrainz.LinksVersion {
+		t.Errorf("asked for version %d, want %d", b.askedVersion, musicbrainz.LinksVersion)
+	}
+	if b.storedVersion != musicbrainz.LinksVersion {
+		t.Errorf("stored version %d, want %d", b.storedVersion, musicbrainz.LinksVersion)
+	}
+}
+
+// --- secondary types -------------------------------------------------------
+
+// The release that prompted this. "the unreleased collection vol.01" is an
+// Official, Brazil-only Album whose release group is a Compilation — so it
+// passed a filter that looked only at the primary type and was announced as a
+// new album, while existing on no streaming service the subscriber could find.
+// SPEC D3 excluded compilations from the start; the poller was not honoring it.
+func TestCompilationsAreNotNotified(t *testing.T) {
+	tracked := "aaaa1111-0000-4000-8000-000000000001"
+	feed := &fakeFeed{releases: []listenbrainz.Release{{
+		ReleaseGroupMBID: "rg-compilation",
+		ArtistMBIDs:      []string{tracked},
+		ArtistName:       "Ariana Grande",
+		Title:            "the unreleased collection vol.01",
+		PrimaryType:      "Album",
+		SecondaryType:    "Compilation",
+		ReleaseDate:      fixedNow.Add(-24 * time.Hour),
+	}}}
+	// stateFound with a past LastOKAt: not a first run, so a match would be
+	// notified rather than seeded — which is what makes the skip meaningful.
+	store := &fakeStore{
+		tracked:    map[string]struct{}{tracked: {}},
+		stateFound: true,
+		state:      storage.PollState{LastOKAt: fixedNow.Add(-24 * time.Hour)},
+	}
+
+	stats, err := testPoller(feed, store).PollOnce(context.Background())
+	if err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+
+	if stats.Recorded != 0 || stats.Notified != 0 {
+		t.Fatalf("a compilation was recorded/notified: %+v", stats)
+	}
+	if stats.SkippedByType != 1 {
+		t.Fatalf("SkippedByType = %d, want 1 — the skip must be visible in the summary",
+			stats.SkippedByType)
 	}
 }

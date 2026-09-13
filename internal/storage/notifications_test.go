@@ -2,6 +2,7 @@ package storage_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,12 +28,13 @@ type outboxFixture struct {
 	releaseID int64
 	notifID   int64
 	artist    string
+	group     string
 }
 
 func outboxFixtures(ctx context.Context, t *testing.T, tx pgx.Tx, chatID int64, mbid, group string) outboxFixture {
 	t.Helper()
 
-	f := outboxFixture{chatID: chatID, artist: mbid}
+	f := outboxFixture{chatID: chatID, artist: mbid, group: group}
 
 	if err := tx.QueryRow(ctx,
 		`INSERT INTO users (telegram_chat_id) VALUES ($1) RETURNING id`, chatID).
@@ -127,8 +129,13 @@ func TestClaimReturnsTheJoinedMessage(t *testing.T) {
 	if got.PrimaryType != "Album" || got.CoverURL == "" {
 		t.Errorf("type = %q, cover = %q", got.PrimaryType, got.CoverURL)
 	}
-	if got.InfoURL != "https://musicbrainz.org/artist/"+f.artist {
-		t.Errorf("InfoURL = %q", got.InfoURL)
+	// The release group, not the artist: the title in a notification is the
+	// release's title, so tapping it must land on that release.
+	if got.InfoURL != "https://musicbrainz.org/release-group/"+f.group {
+		t.Errorf("InfoURL = %q, want the release group", got.InfoURL)
+	}
+	if strings.Contains(got.InfoURL, "/artist/") {
+		t.Errorf("the release title still links to the artist page: %q", got.InfoURL)
 	}
 	// Claim counts the attempt it is handing out, so the first claim is 1.
 	if got.Attempts != 1 {
@@ -416,5 +423,218 @@ func TestQueueDepthCountsPendingWork(t *testing.T) {
 	}
 	if sentDepth != before {
 		t.Fatalf("depth = %d after sending, want back to %d", sentDepth, before)
+	}
+}
+
+// The links have to survive the whole way from the artist row to a claimed
+// notification, because the notifier does no lookups of its own — the same
+// property cover_url has (D14). A join that silently returns nothing would
+// leave every notification without its listen row and nothing would fail.
+func TestClaimCarriesTheArtistsListenLinks(t *testing.T) {
+	ctx, tx := testTx(t)
+	f := outboxFixtures(ctx, t, tx, -999000120,
+		"aaaa1111-0000-4000-8000-000000000120", "bbbb1111-0000-4000-8000-000000000120")
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE artists
+		SET links = $2::jsonb, links_fetched_at = now()
+		WHERE mbid = $1`, f.artist,
+		`{"spotify":"https://open.spotify.com/artist/S","youtube":"https://youtube.com/channel/Y"}`,
+	); err != nil {
+		t.Fatalf("set links: %v", err)
+	}
+
+	outbox := storage.NewNotifications(tx, 5*time.Minute, 5)
+	batch, err := outbox.Claim(ctx, outboxLimit)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	got := find(batch, f.notifID)
+	if got == nil {
+		t.Fatalf("claim missed notification %d", f.notifID)
+	}
+
+	if got.Spotify != "https://open.spotify.com/artist/S" {
+		t.Errorf("Spotify = %q", got.Spotify)
+	}
+	if got.YouTube != "https://youtube.com/channel/Y" {
+		t.Errorf("YouTube = %q", got.YouTube)
+	}
+	// Absent in the jsonb, so it must come back empty rather than as "null".
+	if got.AppleMusic != "" {
+		t.Errorf("AppleMusic = %q, want empty for a key that is not there", got.AppleMusic)
+	}
+}
+
+// An artist with no links must still be claimable. The join is the only path
+// notifications take, so a missing key must not drop the row.
+func TestClaimWorksForAnArtistWithNoLinks(t *testing.T) {
+	ctx, tx := testTx(t)
+	f := outboxFixtures(ctx, t, tx, -999000121,
+		"aaaa1111-0000-4000-8000-000000000121", "bbbb1111-0000-4000-8000-000000000121")
+
+	outbox := storage.NewNotifications(tx, 5*time.Minute, 5)
+	batch, err := outbox.Claim(ctx, outboxLimit)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	got := find(batch, f.notifID)
+	if got == nil {
+		t.Fatal("an artist with no links lost its notification entirely")
+	}
+	if got.Spotify != "" || got.YouTube != "" || got.AppleMusic != "" {
+		t.Errorf("links invented from an empty jsonb: %+v", got)
+	}
+}
+
+// The distinction that stops an endless re-fetch: '{}' means two different
+// things, and only links_fetched_at tells them apart.
+func TestLinkFetchStateSeparatesNeverLookedFromNoneFound(t *testing.T) {
+	ctx, tx := testTx(t)
+	f := outboxFixtures(ctx, t, tx, -999000122,
+		"aaaa1111-0000-4000-8000-000000000122", "bbbb1111-0000-4000-8000-000000000122")
+
+	var fetched *time.Time
+	if err := tx.QueryRow(ctx,
+		`SELECT links_fetched_at FROM artists WHERE mbid = $1`, f.artist).Scan(&fetched); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if fetched != nil {
+		t.Fatal("a fresh artist is marked as already looked up")
+	}
+
+	// An artist that genuinely has none: empty links, but recorded as looked
+	// at. Without this the lookup would repeat on every subscribe forever.
+	if _, err := tx.Exec(ctx, `
+		UPDATE artists SET links = '{}'::jsonb, links_fetched_at = now()
+		WHERE mbid = $1`, f.artist); err != nil {
+		t.Fatalf("mark fetched: %v", err)
+	}
+
+	if err := tx.QueryRow(ctx,
+		`SELECT links_fetched_at FROM artists WHERE mbid = $1`, f.artist).Scan(&fetched); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if fetched == nil {
+		t.Fatal("an artist with no links is indistinguishable from one never checked")
+	}
+}
+
+// A catch-up row has to reach the channel marked as one, or the message says
+// "new release" about something three days old — a small lie that costs trust
+// in the rest of it.
+func TestClaimReportsACatchUpNotification(t *testing.T) {
+	ctx, tx := testTx(t)
+	f := outboxFixtures(ctx, t, tx, -999000130,
+		"aaaa1111-0000-4000-8000-000000000130", "bbbb1111-0000-4000-8000-000000000130")
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE notifications SET kind = 'catch_up' WHERE id = $1`, f.notifID); err != nil {
+		t.Fatalf("mark catch-up: %v", err)
+	}
+
+	outbox := storage.NewNotifications(tx, 5*time.Minute, 5)
+	batch, err := outbox.Claim(ctx, outboxLimit)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	got := find(batch, f.notifID)
+	if got == nil {
+		t.Fatalf("claim missed notification %d", f.notifID)
+	}
+	if !got.CatchUp {
+		t.Fatal("a catch_up notification was claimed as an ordinary release")
+	}
+}
+
+// The default has to stay 'release', or every existing row and every poller
+// fan-out would start describing itself as a catch-up.
+func TestOrdinaryNotificationsAreNotCatchUps(t *testing.T) {
+	ctx, tx := testTx(t)
+	f := outboxFixtures(ctx, t, tx, -999000131,
+		"aaaa1111-0000-4000-8000-000000000131", "bbbb1111-0000-4000-8000-000000000131")
+
+	outbox := storage.NewNotifications(tx, 5*time.Minute, 5)
+	batch, err := outbox.Claim(ctx, outboxLimit)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	got := find(batch, f.notifID)
+	if got == nil {
+		t.Fatalf("claim missed notification %d", f.notifID)
+	}
+	if got.CatchUp {
+		t.Fatal("an ordinary notification claims to be a catch-up")
+	}
+}
+
+// QueueCatchUp is what gives a late subscriber a row for a release that was
+// fanned out before they existed.
+func TestQueueCatchUpGivesALateSubscriberARow(t *testing.T) {
+	ctx, tx := testTx(t)
+	const chat int64 = -999000132
+	const mbid = "aaaa1111-0000-4000-8000-000000000132"
+	const group = "bbbb1111-0000-4000-8000-000000000132"
+
+	// The fixture already queues a notification for its own user, so this test
+	// needs a second user who subscribed afterwards.
+	f := outboxFixtures(ctx, t, tx, chat, mbid, group)
+
+	const lateChat int64 = -999000133
+	var lateUser int64
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO users (telegram_chat_id) VALUES ($1) RETURNING id`, lateChat).
+		Scan(&lateUser); err != nil {
+		t.Fatalf("insert late user: %v", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO subscriptions (user_id, artist_mbid, source) VALUES ($1, $2, 'bot')`,
+		lateUser, mbid); err != nil {
+		t.Fatalf("subscribe late user: %v", err)
+	}
+
+	releases := storage.NewReleases(tx)
+
+	queued, err := releases.QueueCatchUp(ctx, lateChat, group)
+	if err != nil {
+		t.Fatalf("queue catch-up: %v", err)
+	}
+	if !queued {
+		t.Fatal("the late subscriber got no row")
+	}
+
+	var kind string
+	if err := tx.QueryRow(ctx, `
+		SELECT kind FROM notifications
+		WHERE user_id = $1 AND release_id = $2`, lateUser, f.releaseID).Scan(&kind); err != nil {
+		t.Fatalf("read the new row: %v", err)
+	}
+	if kind != "catch_up" {
+		t.Fatalf("kind = %q, want catch_up", kind)
+	}
+
+	// Idempotent: pressing Subscribe twice must not send the release twice.
+	again, err := releases.QueueCatchUp(ctx, lateChat, group)
+	if err != nil {
+		t.Fatalf("second queue: %v", err)
+	}
+	if again {
+		t.Fatal("a second call queued a duplicate notification")
+	}
+}
+
+// Somebody who already has a row for this release — sent or pending — must not
+// get another one.
+func TestQueueCatchUpDoesNotDuplicateAnExistingNotification(t *testing.T) {
+	ctx, tx := testTx(t)
+	f := outboxFixtures(ctx, t, tx, -999000134,
+		"aaaa1111-0000-4000-8000-000000000134", "bbbb1111-0000-4000-8000-000000000134")
+
+	queued, err := storage.NewReleases(tx).QueueCatchUp(ctx, f.chatID, f.group)
+	if err != nil {
+		t.Fatalf("queue catch-up: %v", err)
+	}
+	if queued {
+		t.Fatal("queued a second notification for a release this user already has")
 	}
 }

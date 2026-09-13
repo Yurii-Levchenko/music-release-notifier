@@ -46,6 +46,10 @@ const (
 // consumer side so the bot can be tested without an HTTP client.
 type ArtistSearcher interface {
 	SearchArtist(ctx context.Context, query string, limit int) ([]musicbrainz.Artist, error)
+	// ArtistLinks costs a second request — the search index carries no
+	// relationships at all — so it is called once per artist at subscribe time
+	// and never while rendering a card.
+	ArtistLinks(ctx context.Context, mbid string) (musicbrainz.Links, error)
 }
 
 // SearchCache is the slice of storage the picker needs.
@@ -231,7 +235,7 @@ func (b *Bot) present(ctx context.Context, chatID int64, placeholder int, query 
 	artists []musicbrainz.Artist, hash, note string, log *slog.Logger,
 ) {
 	text, markup := renderCandidate(query, artists, 0, hash,
-		b.subscribed(ctx, chatID, artists[0].MBID, log))
+		b.subscribed(ctx, chatID, artists[0].MBID, log), b.now())
 	b.finish(ctx, chatID, placeholder, note+text, markup, log)
 }
 
@@ -270,6 +274,11 @@ func (b *Bot) finish(ctx context.Context, chatID int64, placeholder int, text st
 
 // logSearch emits the one line per search that makes cache behavior visible.
 func (b *Bot) logSearch(log *slog.Logger, query, source string, results int, started time.Time) {
+	// The same place the log line is emitted, so the metric cannot disagree
+	// with the logs about where an answer came from. `source` is one of a
+	// fixed set defined in this package, so the label stays bounded.
+	b.metrics.SearchCache.WithLabelValues(source).Inc()
+
 	log.Info("artist search",
 		"query", query,
 		"source", source,
@@ -310,7 +319,7 @@ func (b *Bot) handleNavigate(ctx context.Context, cq *telego.CallbackQuery, hash
 	}
 
 	text, markup := renderCandidate(cached.Query, candidates, index, hash,
-		b.subscribed(ctx, cq.From.ID, candidates[index].MBID, log))
+		b.subscribed(ctx, cq.From.ID, candidates[index].MBID, log), b.now())
 
 	if cq.Message == nil {
 		b.answerCallback(ctx, cq.ID, "", log)
@@ -360,14 +369,18 @@ func (b *Bot) answerCallback(ctx context.Context, id, text string, log *slog.Log
 // MusicBrainz has no artist image to show (SPEC.md C32). What it does return —
 // type, country, active years, disambiguation comment and top tags —
 // distinguishes two same-named artists better than a photo would.
-func renderCandidate(query string, candidates []musicbrainz.Artist, index int, hash string, subscribed bool) (string, *telego.InlineKeyboardMarkup) {
+// now is threaded through rather than read inside, so the age on a card can be
+// tested end to end. Reading the clock deeper down would leave the caller
+// untested, and the last bug in this function was exactly that: a parameter
+// the caller supplied and the body ignored.
+func renderCandidate(query string, candidates []musicbrainz.Artist, index int, hash string, subscribed bool, now time.Time) (string, *telego.InlineKeyboardMarkup) {
 	a := candidates[index]
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "🔎 Результати для <b>%s</b>\n\n", html.EscapeString(query))
 	fmt.Fprintf(&b, "<b>%s</b>\n", html.EscapeString(a.Name))
 
-	if facts := artistFacts(a); facts != "" {
+	if facts := artistFacts(a, now); facts != "" {
 		fmt.Fprintf(&b, "%s\n", html.EscapeString(facts))
 	}
 	if a.Disambiguation != "" {
@@ -386,7 +399,10 @@ func renderCandidate(query string, candidates []musicbrainz.Artist, index int, h
 }
 
 // artistFacts is the one-line summary: what kind of act, from where, and when.
-func artistFacts(a musicbrainz.Artist) string {
+//
+// now is a parameter because an age depends on today's date, and a fact that
+// changes with the calendar has to be testable without waiting for a birthday.
+func artistFacts(a musicbrainz.Artist, now time.Time) string {
 	parts := make([]string, 0, 3)
 
 	switch a.Type {
@@ -405,16 +421,123 @@ func artistFacts(a musicbrainz.Artist) string {
 		parts = append(parts, a.Country)
 	}
 
-	switch {
-	case a.Begin != "" && a.End != "":
-		parts = append(parts, a.Begin+"–"+a.End)
-	case a.Begin != "":
-		parts = append(parts, "з "+a.Begin)
-	case a.End != "":
-		parts = append(parts, "до "+a.End)
+	if span := lifeSpan(a, now); span != "" {
+		parts = append(parts, span)
 	}
 
 	return strings.Join(parts, " · ")
+}
+
+// lifeSpan renders MusicBrainz's life-span according to what the artist is.
+//
+// The same field means two different things: for a Group it is the date the
+// act formed, and for a Person it is a birth date. Labeling both "з" produced
+// "Drake · CA · з 1986-10-24", which reads as a career start and is his
+// birthday — he released his first mixtape in 2006.
+//
+// Career start is not available here. The artist index carries no such field
+// (verified: relationships are absent from search results entirely), and
+// deriving it from the earliest release would cost one query per candidate on
+// an API limited to one request a second.
+//
+// For a living person we show the age rather than the year, because that is
+// the form a reader actually parses — MusicBrainz itself prints
+// "Born: 1986-10-24 (39 years ago)". It loses nothing for the card's real job
+// of telling two same-named artists apart: given today's date, an age and a
+// birth year carry exactly the same information.
+//
+// For a group the formation year stays, because for a band the year *is* the
+// informative fact — it places them in an era, and "40 years old" does not.
+func lifeSpan(a musicbrainz.Artist, now time.Time) string {
+	begin, end := year(a.Begin), year(a.End)
+
+	switch {
+	case begin != "" && end != "":
+		// A closed range needs no label: for a group it reads as the active
+		// period, for a person as a lifetime, and both are correct. An age
+		// would be wrong here — the dead do not have a current one.
+		return begin + "–" + end
+
+	case begin != "" && a.Type == "Person":
+		if age, ok := ageAt(a.Begin, now); ok {
+			return ageWords(age)
+		}
+		// The date was too coarse to place a birthday, so fall back to the
+		// year rather than printing an age that could be off by one while
+		// looking authoritative about it.
+		return "нар. " + begin
+
+	case begin != "":
+		// Group, Orchestra, Choir — and an unknown type, where "formed" is
+		// the safer reading: an unlabeled year is less wrong than a birth date
+		// asserted about something that may not be a person.
+		return "з " + begin
+
+	case end != "":
+		return "до " + end
+
+	default:
+		return ""
+	}
+}
+
+// ageAt computes an age from a MusicBrainz date, and reports whether it could
+// be computed exactly.
+//
+// Exactness matters: from a bare year the answer is off by one for most of the
+// calendar, and a card that says "39 років" when the artist is 38 is worse
+// than one that says "нар. 1986" and lets the reader do the arithmetic.
+func ageAt(date string, now time.Time) (int, bool) {
+	born, err := time.Parse("2006-01-02", date)
+	if err != nil {
+		return 0, false
+	}
+
+	age := now.Year() - born.Year()
+	if now.YearDay() < born.YearDay() {
+		// The birthday has not happened yet this year.
+		age--
+	}
+	if age < 0 || age > 130 {
+		// A date MusicBrainz accepted that cannot describe a living person.
+		// Say nothing rather than print nonsense.
+		return 0, false
+	}
+	return age, true
+}
+
+// ageWords applies Ukrainian plural agreement, which has three forms chosen by
+// the last two digits: 21 рік, 22 роки, 25 років — and 11 років, not
+// "11 рік", which is the case a units-only rule gets wrong.
+func ageWords(age int) string {
+	tens := age % 100
+	units := age % 10
+
+	switch {
+	case tens >= 11 && tens <= 14:
+		return fmt.Sprintf("%d років", age)
+	case units == 1:
+		return fmt.Sprintf("%d рік", age)
+	case units >= 2 && units <= 4:
+		return fmt.Sprintf("%d роки", age)
+	default:
+		return fmt.Sprintf("%d років", age)
+	}
+}
+
+// year keeps just the year from a MusicBrainz date, which arrives as
+// YYYY-MM-DD, YYYY-MM or YYYY.
+func year(date string) string {
+	if len(date) < 4 {
+		return ""
+	}
+	y := date[:4]
+	for _, r := range y {
+		if r < '0' || r > '9' {
+			return ""
+		}
+	}
+	return y
 }
 
 // candidateKeyboard renders the navigation row plus the subscribe toggle.
