@@ -33,11 +33,19 @@ type Bot struct {
 	users  UserStore
 	search ArtistSearcher
 	cache  SearchCache
+	subs   SubscriptionStore
 	log    *slog.Logger
 }
 
-func NewBot(c *Client, users UserStore, search ArtistSearcher, cache SearchCache, log *slog.Logger) *Bot {
-	return &Bot{client: c, users: users, search: search, cache: cache, log: log}
+func NewBot(
+	c *Client,
+	users UserStore,
+	search ArtistSearcher,
+	cache SearchCache,
+	subs SubscriptionStore,
+	log *slog.Logger,
+) *Bot {
+	return &Bot{client: c, users: users, search: search, cache: cache, subs: subs, log: log}
 }
 
 // Run blocks until ctx is canceled. Returns nil on a clean shutdown.
@@ -99,22 +107,90 @@ func (b *Bot) handleCallback(ctx context.Context, cq *telego.CallbackQuery) {
 		return
 	}
 
-	prefix, hash, index, ok := parseCallbackData(cq.Data)
-	if !ok {
-		// An old message from a previous build, or hand-crafted data. Neither
-		// deserves a crash, and both deserve an answer.
+	// Prefixes carry different payloads: a card button needs a result-set handle
+	// plus an index, a list button needs only an MBID. Split once and let each
+	// case state what shape it expects, rather than forcing one arity on all.
+	prefix, rest, found := strings.Cut(cq.Data, ":")
+	if !found || prefix == "" {
 		log.Debug("unrecognized callback data", "data", cq.Data)
 		b.answerCallback(ctx, cq.ID, "Ця кнопка більше не працює.", log)
 		return
 	}
 
 	switch prefix {
-	case cbNavigate:
-		b.handleNavigate(ctx, cq, hash, index, log)
+	case cbNavigate, cbSubscribe, cbUnsubscribe:
+		hash, index, ok := parseCardTarget(rest)
+		if ok {
+			switch prefix {
+			case cbNavigate:
+				b.handleNavigate(ctx, cq, hash, index, log)
+			case cbSubscribe:
+				b.handleSubscribe(ctx, cq, hash, index, log)
+			case cbUnsubscribe:
+				b.handleUnsubscribeFromCard(ctx, cq, hash, index, log)
+			}
+			return
+		}
+		// unsub also appears under /list carrying a bare MBID.
+		if prefix == cbUnsubscribe && looksLikeMBID(rest) {
+			b.handleUnsubscribeByMBID(ctx, cq, rest, log)
+			return
+		}
+		log.Debug("malformed card callback", "data", cq.Data)
+		b.answerCallback(ctx, cq.ID, "Ця кнопка більше не працює.", log)
+
+	case cbList:
+		page, err := strconv.Atoi(rest)
+		if err != nil {
+			b.answerCallback(ctx, cq.ID, "Ця кнопка більше не працює.", log)
+			return
+		}
+		b.answerCallback(ctx, cq.ID, "", log)
+		b.renderList(ctx, cq, page, log)
+
+	case cbStop:
+		b.handleStopConfirm(ctx, cq, rest, log)
+
 	default:
 		log.Debug("unknown callback prefix", "prefix", prefix)
 		b.answerCallback(ctx, cq.ID, "Ця кнопка більше не працює.", log)
 	}
+}
+
+// parseCardTarget reads the "<hash>:<index>" tail of a search-card button.
+func parseCardTarget(rest string) (hash string, index int, ok bool) {
+	h, idx, found := strings.Cut(rest, ":")
+	if !found || h == "" {
+		return "", 0, false
+	}
+	n, err := strconv.Atoi(idx)
+	if err != nil {
+		return "", 0, false
+	}
+	return h, n, true
+}
+
+// looksLikeMBID is a shape check, not validation: the database is the authority
+// on whether the id exists. It only has to tell an MBID apart from a card
+// target so the dispatcher picks the right handler.
+func looksLikeMBID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, r := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if r != '-' {
+				return false
+			}
+		default:
+			isHex := (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')
+			if !isHex {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (b *Bot) handleMessage(ctx context.Context, msg *telego.Message) {
@@ -138,11 +214,9 @@ func (b *Bot) handleMessage(ctx context.Context, msg *telego.Message) {
 	case "/search":
 		b.handleSearch(ctx, chatID, args, log)
 	case "/list":
-		b.reply(ctx, chatID,
-			"Список підписок ще не готовий — він з'явиться разом із підписками.", log)
+		b.handleList(ctx, chatID, log)
 	case "/stop":
-		b.reply(ctx, chatID,
-			"Поки що нема від чого відписуватися: підписки ще не реалізовані.", log)
+		b.handleStop(ctx, chatID, log)
 	case "":
 		// Plain text is the common case: people type a name, not a command.
 		b.handleSearch(ctx, chatID, args, log)
