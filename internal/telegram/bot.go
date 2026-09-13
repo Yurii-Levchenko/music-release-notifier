@@ -31,11 +31,13 @@ type UserStore interface {
 type Bot struct {
 	client *Client
 	users  UserStore
+	search ArtistSearcher
+	cache  SearchCache
 	log    *slog.Logger
 }
 
-func NewBot(c *Client, users UserStore, log *slog.Logger) *Bot {
-	return &Bot{client: c, users: users, log: log}
+func NewBot(c *Client, users UserStore, search ArtistSearcher, cache SearchCache, log *slog.Logger) *Bot {
+	return &Bot{client: c, users: users, search: search, cache: cache, log: log}
 }
 
 // Run blocks until ctx is canceled. Returns nil on a clean shutdown.
@@ -82,13 +84,36 @@ func (b *Bot) handle(ctx context.Context, u *telego.Update) {
 	case u.MyChatMember != nil:
 		b.handleMyChatMember(ctx, u.MyChatMember)
 	case u.CallbackQuery != nil:
-		// Wired up in S2 with the artist picker. Answer anyway so the client
-		// stops showing a spinner on the button.
-		if err := b.client.api.AnswerCallbackQuery(ctx, &telego.AnswerCallbackQueryParams{
-			CallbackQueryID: u.CallbackQuery.ID,
-		}); err != nil {
-			b.log.Warn("answer callback query", "err", err)
-		}
+		b.handleCallback(ctx, u.CallbackQuery)
+	}
+}
+
+// handleCallback routes a button press. Every path must answer the query, or
+// the client leaves a spinner on the button until it times out (SPEC.md C8).
+func (b *Bot) handleCallback(ctx context.Context, cq *telego.CallbackQuery) {
+	log := b.log.With("callback_id", cq.ID)
+
+	// The page counter in the middle of the navigation row is not actionable.
+	if cq.Data == cbNoop {
+		b.answerCallback(ctx, cq.ID, "", log)
+		return
+	}
+
+	prefix, hash, index, ok := parseCallbackData(cq.Data)
+	if !ok {
+		// An old message from a previous build, or hand-crafted data. Neither
+		// deserves a crash, and both deserve an answer.
+		log.Debug("unrecognized callback data", "data", cq.Data)
+		b.answerCallback(ctx, cq.ID, "Ця кнопка більше не працює.", log)
+		return
+	}
+
+	switch prefix {
+	case cbNavigate:
+		b.handleNavigate(ctx, cq, hash, index, log)
+	default:
+		log.Debug("unknown callback prefix", "prefix", prefix)
+		b.answerCallback(ctx, cq.ID, "Ця кнопка більше не працює.", log)
 	}
 }
 
@@ -111,9 +136,7 @@ func (b *Bot) handleMessage(ctx context.Context, msg *telego.Message) {
 	case "/help":
 		b.reply(ctx, chatID, helpText(b.client.Username()), log)
 	case "/search":
-		b.reply(ctx, chatID,
-			"Пошук виконавців ще не готовий — це наступний етап.\n"+
-				"Скоро тут можна буде написати назву й обрати зі списку.", log)
+		b.handleSearch(ctx, chatID, args, log)
 	case "/list":
 		b.reply(ctx, chatID,
 			"Список підписок ще не готовий — він з'явиться разом із підписками.", log)
@@ -121,9 +144,8 @@ func (b *Bot) handleMessage(ctx context.Context, msg *telego.Message) {
 		b.reply(ctx, chatID,
 			"Поки що нема від чого відписуватися: підписки ще не реалізовані.", log)
 	case "":
-		// Plain text will become a search query in S2.
-		b.reply(ctx, chatID,
-			"Я поки що вмію тільки /start. Пошук виконавців — наступний етап.", log)
+		// Plain text is the common case: people type a name, not a command.
+		b.handleSearch(ctx, chatID, args, log)
 	default:
 		b.reply(ctx, chatID,
 			"Не знаю такої команди. Спробуй /help.", log)

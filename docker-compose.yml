@@ -34,7 +34,10 @@ services:
       USER_AGENT: ${USER_AGENT:-ReleaseRadar/0.1 ( unset@example.com )}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     ports:
-      - "8080:8080"
+      # Host port 8090, not 8080. 8080 is the most contended port on any dev
+      # machine, and losing the race for it on a host restart kills the
+      # container before it runs — see the note in CLAUDE.md.
+      - "8090:8080"
 
 volumes:
   pgdata:

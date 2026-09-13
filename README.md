@@ -8,8 +8,8 @@ message when a new album, single or EP lands.
 
 **Go · PostgreSQL · ListenBrainz / MusicBrainz**
 
-> Status: **S1 complete** — the bot answers, and CI now gates every change.
-> Artist search is next (S2).
+> Status: **S2 complete** — the bot searches MusicBrainz and shows a
+> browsable candidate card. Subscriptions are next (S3).
 
 ---
 
@@ -63,7 +63,7 @@ email is an evening, not a refactor.
 ```bash
 cp .env.example .env      # then fill in TELEGRAM_BOT_TOKEN and USER_AGENT
 docker compose up --build
-curl localhost:8080/healthz
+curl localhost:8090/healthz
 ```
 
 The database is published on host port **5433**, not 5432, to stay out of the
@@ -96,11 +96,13 @@ behind. Without `TEST_DATABASE_URL` they skip rather than fail, keeping
 | ✅ S0 | Skeleton: compose, migrations, `/healthz`, structured logging |
 | ✅ S7 | Spike: proved a Spicetify extension can `fetch()` this backend |
 | ✅ S1 | Bot answers `/start`, registers commands, tracks blocks |
-| ⬜ S2 | Artist search via MusicBrainz, paginated picker card |
+| ✅ S2 | Artist search via MusicBrainz, paginated picker card |
 | ⬜ S3 | Subscriptions, `/list`, `/stop` |
 | ⬜ S4 | Release detection |
 | ⬜ S5 | Delivery: outbox drain, pacing, failure classification |
-| ⬜ S6 | Production: VPS, backups, metrics — **v1 done** |
+| ⬜ S6 | Production: VPS, backups, and observability — **v1 done** |
+| ⬜ S11 | Rank search results by metadata completeness, not score |
+| ⬜ S12 | Dead-letter handling for poison messages (with the v2 broker) |
 | ⬜ S8–S10 | Extension: linking API, subscribe from Spotify, publish |
 
 ## Repo layout
