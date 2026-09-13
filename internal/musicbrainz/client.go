@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"strings"
@@ -32,7 +33,13 @@ const (
 	// busy" body, so they cannot be told apart. Verified empirically: every
 	// 503 seen during development resolved on retry, so 503 is always
 	// transient and never means "no results".
-	maxAttempts = 4
+	//
+	// Five rather than four: a live search gave up after ~7 seconds and the
+	// same query succeeded two minutes later. Since MusicBrainz 503s track
+	// load, a slightly wider window converts a visible failure into a slower
+	// answer. It stays bounded, because a search has to remain interactive —
+	// beyond this the stale-cache fallback takes over.
+	maxAttempts = 5
 
 	// Response bodies for a 5-artist search are a few KB; this is a sanity cap,
 	// not a tuning knob.
@@ -188,9 +195,11 @@ func (c *Client) get(ctx context.Context, endpoint string) ([]byte, error) {
 		}
 
 		if attempt < maxAttempts {
-			// 1s, 2s, 4s. Enough for a transient 503 without making a user
-			// wait forever for a search box to answer.
-			backoff := time.Duration(1<<(attempt-1)) * time.Second
+			// 1s, 2s, 4s, 8s, each jittered. Jitter matters more than the
+			// curve: without it every client that failed at the same moment
+			// retries at the same moment, and a service that is already
+			// struggling gets a synchronized wave instead of a trickle.
+			backoff := jitter(time.Duration(1<<(attempt-1)) * time.Second)
 			c.log.Warn("musicbrainz request failed, retrying",
 				"attempt", attempt, "backoff", backoff, "err", err)
 			select {
@@ -201,6 +210,21 @@ func (c *Client) get(ctx context.Context, endpoint string) ([]byte, error) {
 		}
 	}
 	return nil, fmt.Errorf("musicbrainz: giving up after %d attempts: %w", maxAttempts, lastErr)
+}
+
+// jitter spreads a backoff by ±25% so concurrent clients stop retrying in
+// lockstep. Without it, everyone who failed at the same moment retries at the
+// same moment, and a service that is already struggling gets a synchronized
+// wave instead of a trickle.
+//
+// math/rand rather than crypto/rand is deliberate: this is scheduling, not
+// security, and predictability here costs nothing.
+func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	spread := int64(d) / 2 // total width of the window: d/4 either side
+	return d - time.Duration(spread/2) + time.Duration(rand.Int64N(spread+1))
 }
 
 // doOnce reports whether the failure is worth retrying.
