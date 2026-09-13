@@ -8,8 +8,9 @@ message when a new album, single or EP lands.
 
 **Go · PostgreSQL · ListenBrainz / MusicBrainz**
 
-> Status: **S5 complete**, S6 in progress — the bot sends on its own, and an
-> external dead-man's switch now watches whether it still can.
+> Status: **S0–S5 merged**, S6 in progress — the bot sends on its own, an
+> external dead-man's switch watches whether it still can, and a week of real
+> use has been folded back in.
 
 ---
 

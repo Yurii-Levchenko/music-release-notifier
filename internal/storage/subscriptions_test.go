@@ -347,3 +347,83 @@ func TestSubscribingDoesNotRenumberTheExistingList(t *testing.T) {
 		t.Fatalf("the new subscription is at position %d, not last", len(after))
 	}
 }
+
+// Bulk removal is one statement: a loop that failed halfway would leave a list
+// the user has to reconcile by hand.
+func TestUnsubscribeManyRemovesExactlyTheGivenArtists(t *testing.T) {
+	ctx, subs := testSubs(t)
+
+	for _, sub := range []struct{ mbid, name string }{
+		{mbidA, "A"}, {mbidB, "B"}, {mbidC, "C"},
+	} {
+		if _, err := subs.Subscribe(ctx, testChatID,
+			storage.ArtistRef{MBID: sub.mbid, Name: sub.name}, "bot"); err != nil {
+			t.Fatalf("subscribe %s: %v", sub.name, err)
+		}
+	}
+
+	removed, err := subs.UnsubscribeMany(ctx, testChatID, []string{mbidA, mbidC})
+	if err != nil {
+		t.Fatalf("unsubscribe many: %v", err)
+	}
+	if removed != 2 {
+		t.Fatalf("removed = %d, want 2", removed)
+	}
+
+	items, total, err := subs.List(ctx, testChatID, 20, 0)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if total != 1 || items[0].MBID != mbidB {
+		t.Fatalf("left with %+v, want only B", items)
+	}
+}
+
+// One user's bulk removal must not touch another's subscriptions to the same
+// artists.
+func TestUnsubscribeManyIsScopedToOneUser(t *testing.T) {
+	ctx, subs := testSubs(t)
+	const otherChat int64 = testChatID - 1
+
+	for _, chat := range []int64{testChatID, otherChat} {
+		if _, err := subs.Subscribe(ctx, chat,
+			storage.ArtistRef{MBID: mbidA, Name: "Shared"}, "bot"); err != nil {
+			t.Fatalf("subscribe for %d: %v", chat, err)
+		}
+	}
+	t.Cleanup(func() { _, _ = subs.Forget(context.Background(), otherChat) })
+
+	if _, err := subs.UnsubscribeMany(ctx, testChatID, []string{mbidA}); err != nil {
+		t.Fatalf("unsubscribe many: %v", err)
+	}
+
+	_, total, err := subs.List(ctx, otherChat, 20, 0)
+	if err != nil {
+		t.Fatalf("list other: %v", err)
+	}
+	if total != 1 {
+		t.Fatalf("the other user has %d subscriptions left, want 1", total)
+	}
+}
+
+// An empty selection must not become "delete everything".
+func TestUnsubscribeManyWithNothingSelected(t *testing.T) {
+	ctx, subs := testSubs(t)
+
+	if _, err := subs.Subscribe(ctx, testChatID,
+		storage.ArtistRef{MBID: mbidA, Name: "A"}, "bot"); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	removed, err := subs.UnsubscribeMany(ctx, testChatID, nil)
+	if err != nil {
+		t.Fatalf("unsubscribe many: %v", err)
+	}
+	if removed != 0 {
+		t.Fatalf("removed %d with nothing selected", removed)
+	}
+
+	if _, total, _ := subs.List(ctx, testChatID, 20, 0); total != 1 {
+		t.Fatalf("subscriptions left = %d, want 1", total)
+	}
+}

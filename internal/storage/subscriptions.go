@@ -278,3 +278,25 @@ func (s *Subscriptions) ArtistsMissingLinks(ctx context.Context, limit, version 
 	}
 	return out, rows.Err()
 }
+
+// UnsubscribeMany removes several subscriptions at once and reports how many
+// existed.
+//
+// One statement rather than a loop: a partial result from a loop that failed
+// halfway is a list the user has to reconcile by hand, and there is no reason
+// to offer that when the database can do the whole set atomically.
+func (s *Subscriptions) UnsubscribeMany(ctx context.Context, chatID int64, mbids []string) (removed int, err error) {
+	if len(mbids) == 0 {
+		return 0, nil
+	}
+
+	tag, err := s.pool.Exec(ctx, `
+		DELETE FROM subscriptions
+		WHERE artist_mbid = ANY($2)
+		  AND user_id = (SELECT id FROM users WHERE telegram_chat_id = $1)`,
+		chatID, mbids)
+	if err != nil {
+		return 0, fmt.Errorf("unsubscribe %d artists for chat %d: %w", len(mbids), chatID, err)
+	}
+	return int(tag.RowsAffected()), nil
+}

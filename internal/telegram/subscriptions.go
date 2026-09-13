@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"html"
 	"log/slog"
-	"strconv"
 	"strings"
 
 	"github.com/mymmrac/telego"
@@ -36,6 +35,7 @@ type SubscriptionStore interface {
 	IsSubscribed(ctx context.Context, chatID int64, mbid string) (bool, error)
 	List(ctx context.Context, chatID int64, limit, offset int) (items []storage.Subscription, total int, err error)
 	Forget(ctx context.Context, chatID int64) (existed bool, err error)
+	UnsubscribeMany(ctx context.Context, chatID int64, mbids []string) (removed int, err error)
 	NeedsLinks(ctx context.Context, mbid string, version int) (bool, error)
 	SetArtistLinks(ctx context.Context, mbid string, links storage.ArtistLinks, version int) error
 }
@@ -101,7 +101,9 @@ func (b *Bot) catchUpOnRecentReleases(ctx context.Context, chatID int64, artist 
 		return
 	}
 	if queued == 0 {
-		// The common case, and deliberately silent: telling somebody "nothing\n// recent" every time they subscribe is noise about a non-event.
+		// The common case, and deliberately silent: telling somebody
+		// "nothing recent" every time they subscribe is noise about a
+		// non-event.
 		return
 	}
 	log.Info("queued recent releases for a new subscriber",
@@ -208,7 +210,7 @@ func (b *Bot) handleList(ctx context.Context, chatID int64, log *slog.Logger) {
 		return
 	}
 
-	text, markup := renderList(items, total, 0)
+	text, markup := renderList(items, total, 0, newSelection(0, items), "")
 	if _, err := b.client.api.SendMessage(ctx, &telego.SendMessageParams{
 		ChatID:             telego.ChatID{ID: chatID},
 		Text:               text,
@@ -220,8 +222,22 @@ func (b *Bot) handleList(ctx context.Context, chatID int64, log *slog.Logger) {
 	}
 }
 
-// renderList redraws an existing list message at the given page.
+// renderList redraws an existing list message at the given page with nothing
+// selected. Used after anything that changes the list, since a selection made
+// against the old contents no longer means what it did.
 func (b *Bot) renderList(ctx context.Context, cq *telego.CallbackQuery, page int, log *slog.Logger) {
+	b.renderListWith(ctx, cq, page, nil, "", log)
+}
+
+// renderListWith redraws the list, keeping a selection and an optional receipt.
+//
+// sel is nil for a fresh draw; passing one keeps the ticks across a redraw,
+// which is what makes selecting several rows possible at all — every tap
+// redraws the whole message.
+func (b *Bot) renderListWith(
+	ctx context.Context, cq *telego.CallbackQuery, page int,
+	sel *selection, notice string, log *slog.Logger,
+) {
 	msg := callbackMessage(cq)
 	if msg == nil {
 		return
@@ -239,16 +255,24 @@ func (b *Bot) renderList(ctx context.Context, cq *telego.CallbackQuery, page int
 	// The last item on the last page can disappear under the user, leaving the
 	// page out of range. Step back rather than showing an empty screen.
 	if len(items) == 0 && page > 0 {
-		b.renderList(ctx, cq, page-1, log)
+		b.renderListWith(ctx, cq, page-1, nil, notice, log)
 		return
+	}
+
+	drawn := newSelection(page, items)
+	if sel != nil {
+		drawn = *sel
 	}
 
 	var text string
 	var markup *telego.InlineKeyboardMarkup
 	if total == 0 {
 		text = "Ти більше ні на кого не підписаний."
+		if notice != "" {
+			text = notice + "\n\n" + text
+		}
 	} else {
-		text, markup = renderList(items, total, page)
+		text, markup = renderList(items, total, page, drawn, notice)
 	}
 
 	if _, err := b.client.api.EditMessageText(ctx, &telego.EditMessageTextParams{
@@ -268,54 +292,6 @@ func (b *Bot) renderList(ctx context.Context, cq *telego.CallbackQuery, page int
 // Numbers rather than names on the buttons: an artist name would either be
 // truncated to uselessness or make one button per row, and the number maps
 // straight to the line above it.
-func renderList(items []storage.Subscription, total, page int) (string, *telego.InlineKeyboardMarkup) {
-	var b strings.Builder
-	fmt.Fprintf(&b, "🔔 <b>Твої підписки</b> — %d\n\n", total)
-
-	offset := page * listPageSize
-	for i, item := range items {
-		fmt.Fprintf(&b, "%d. %s\n", offset+i+1, html.EscapeString(item.Name))
-	}
-	b.WriteString("\nНатисни номер, щоб відписатись.")
-
-	pages := (total + listPageSize - 1) / listPageSize
-	if pages > 1 {
-		fmt.Fprintf(&b, "\nСторінка %d з %d.", page+1, pages)
-	}
-
-	var rows [][]telego.InlineKeyboardButton
-	const perRow = 5
-	for i, item := range items {
-		if i%perRow == 0 {
-			rows = append(rows, nil)
-		}
-		rows[len(rows)-1] = append(rows[len(rows)-1], telego.InlineKeyboardButton{
-			Text:         strconv.Itoa(offset + i + 1),
-			CallbackData: cbUnsubscribe + ":" + item.MBID,
-		})
-	}
-
-	if pages > 1 {
-		var nav []telego.InlineKeyboardButton
-		if page > 0 {
-			nav = append(nav, telego.InlineKeyboardButton{
-				Text: "◀", CallbackData: cbList + ":" + strconv.Itoa(page-1),
-			})
-		}
-		nav = append(nav, telego.InlineKeyboardButton{
-			Text:         fmt.Sprintf("%d / %d", page+1, pages),
-			CallbackData: cbNoop,
-		})
-		if page < pages-1 {
-			nav = append(nav, telego.InlineKeyboardButton{
-				Text: "▶", CallbackData: cbList + ":" + strconv.Itoa(page+1),
-			})
-		}
-		rows = append(rows, nav)
-	}
-
-	return b.String(), &telego.InlineKeyboardMarkup{InlineKeyboard: rows}
-}
 
 // handleStop asks before deleting. /stop removes everything and cannot be
 // undone, so a single mistyped character should not cost someone their list.
