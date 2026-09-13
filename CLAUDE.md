@@ -186,6 +186,32 @@ make check    # fmt + vet + lint + тести з БД, у порядку CI
 Спека, яка відстала від коду, гірша за відсутність спеки — вона бреше з виглядом
 істини. Кожна зміна рішення чи обмеження → рядок у §16 «Журнал змін».
 
+## Оболонка — PowerShell, не bash
+
+Термінал у автора — **PowerShell**. Bash-однорядковики там не працюють, і це вже
+двічі коштувало зайвого кола. Найчастіші пастки:
+
+| Не працює | Правильно |
+|---|---|
+| `cmd1 && cmd2` | `cmd1; if ($?) { cmd2 }` |
+| `\| tail -5` | `\| Select-Object -Last 5` |
+| `\| head -20` | `\| Select-Object -First 20` |
+| `\| grep "x"` | `\| Select-String "x"` |
+| `2>/dev/null` | `2>$null` |
+| `export VAR=x` | `$env:VAR = "x"` |
+
+Готові команди для цього проєкту:
+
+```powershell
+docker compose logs -f app
+docker compose logs app | Select-Object -Last 20
+docker compose logs app | Select-String "poll complete","new release"
+docker compose exec -T db psql -U releaseradar -d releaseradar -c "SELECT * FROM poll_state;"
+```
+
+Свої власні команди Claude виконує через Bash-інструмент і може писати bash як
+завжди — це правило про те, **що віддавати автору на копіювання**.
+
 ## Робоче середовище
 
 - Windows 11, PowerShell (є і Bash). Go 1.26.2, Docker 28.3.2, compose v2.39.1.

@@ -334,3 +334,61 @@ func TestNewRequiresIdentifyingUserAgent(t *testing.T) {
 		}
 	}
 }
+
+// MusicBrainz editors leave notes to each other as ordinary tags, and those
+// notes get voted on — so they outrank real genres and land on the card. Seen
+// live: あいみょん came back as "singer-songwriter · j-pop · fixme label mess".
+func TestTopTagsDropsEditorNotes(t *testing.T) {
+	type mbTag = struct {
+		Name  string `json:"name"`
+		Count int    `json:"count"`
+	}
+
+	tags := []mbTag{
+		{"fixme label mess", 9}, // most-voted, and pure noise to a reader
+		{"j-pop", 5},
+		{"singer-songwriter", 4},
+		{"needs splitting", 3},
+		{"city pop", 2},
+	}
+
+	got := topTags(tags)
+	want := []string{"j-pop", "singer-songwriter", "city pop"}
+
+	if len(got) != len(want) {
+		t.Fatalf("topTags = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("topTags = %v, want %v", got, want)
+		}
+	}
+}
+
+// Filtering must not invent a floor: an artist whose only tags are notes shows
+// no tags, which is correct — the card has other fields.
+func TestTopTagsSurvivesAllNoise(t *testing.T) {
+	type mbTag = struct {
+		Name  string `json:"name"`
+		Count int    `json:"count"`
+	}
+
+	if got := topTags([]mbTag{{"fixme", 3}, {"todo: verify", 1}}); len(got) != 0 {
+		t.Fatalf("topTags = %v, want none", got)
+	}
+}
+
+// A genre must not be filtered because a marker appears mid-word.
+func TestTopTagsKeepsRealGenres(t *testing.T) {
+	type mbTag = struct {
+		Name  string `json:"name"`
+		Count int    `json:"count"`
+	}
+
+	for _, genre := range []string{"post-rock", "checkered pop", "spamdexcore"} {
+		got := topTags([]mbTag{{genre, 5}})
+		if len(got) != 1 || got[0] != genre {
+			t.Errorf("topTags dropped %q: %v", genre, got)
+		}
+	}
+}

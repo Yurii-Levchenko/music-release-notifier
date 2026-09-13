@@ -19,6 +19,7 @@ import (
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/httpx"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/listenbrainz"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/musicbrainz"
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/notifier"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/notify"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/poller"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/storage"
@@ -34,6 +35,15 @@ const searchCacheTTL = 7 * 24 * time.Hour
 // is a window, not a stream, and the poller looks back seven days (SPEC.md D15),
 // so a missed run costs nothing as long as the next one lands inside the window.
 const pollInterval = 24 * time.Hour
+
+// A claimed notification is hidden for this long. If the process dies mid-send,
+// the row becomes due again after it rather than needing a cleanup job.
+const claimLease = 5 * time.Minute
+
+// After this many attempts a notification is failed rather than retried
+// forever: a message nobody can receive should stop consuming rate-limit budget
+// that live ones need.
+const maxDeliveryAttempts = 5
 
 func main() {
 	// run() so every exit path can defer cleanly; main only sets the exit code.
@@ -141,6 +151,16 @@ func run() error {
 	}
 
 	g.Go(func() error { return releasePoller.Run(gctx) })
+
+	// The notifier drains whatever the poller queued. It starts even with no
+	// channels configured, so that "the queue is filling and nobody is draining
+	// it" is a log line rather than a discovery weeks later.
+	deliveries := notifier.New(
+		storage.NewNotifications(pool, claimLease, maxDeliveryAttempts),
+		channels,
+		log,
+	)
+	g.Go(func() error { return deliveries.Run(gctx) })
 
 	// Shut the HTTP server down when anything else asks us to stop; without
 	// this, ListenAndServe would keep the group waiting forever.
