@@ -8,8 +8,8 @@ message when a new album, single or EP lands.
 
 **Go · PostgreSQL · ListenBrainz / MusicBrainz**
 
-> Status: **S3 complete** — you can search, subscribe, list and delete.
-> Release detection is next (S4), and then the bot actually notifies.
+> Status: **S4 complete** — releases are detected and queued. Delivery is
+> next (S5), and then the bot finally sends something on its own.
 
 ---
 
@@ -98,7 +98,7 @@ behind. Without `TEST_DATABASE_URL` they skip rather than fail, keeping
 | ✅ S1 | Bot answers `/start`, registers commands, tracks blocks |
 | ✅ S2 | Artist search via MusicBrainz, paginated picker card |
 | ✅ S3 | Subscriptions, `/list`, `/stop` |
-| ⬜ S4 | Release detection |
+| ✅ S4 | Release detection |
 | ⬜ S5 | Delivery: outbox drain, pacing, failure classification |
 | ⬜ S6 | Production: VPS, backups, and observability — **v1 done** |
 | ⬜ S11 | Rank search results by metadata completeness, not score |
