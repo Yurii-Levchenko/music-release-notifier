@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"fmt"
 	"html"
 	"log/slog"
 	"strings"
@@ -9,9 +10,9 @@ import (
 	"github.com/mymmrac/telego"
 )
 
-// maxNamesInReceipt bounds the "removed these" line. Twenty names would push
-// the list itself off the screen, which is the thing the receipt sits above.
-const maxNamesInReceipt = 5
+// maxNamesInReceipt guards the receipt against a page size that grows later.
+// A selection is one page, so today it never trips.
+const maxNamesInReceipt = 30
 
 // handleSelection answers every selection button: flip a row, tick the page,
 // clear, or apply.
@@ -47,17 +48,17 @@ func (b *Bot) handleSelection(ctx context.Context, cq *telego.CallbackQuery, act
 	case cbPick:
 		b.answerCallback(ctx, cq.ID, "", log)
 		next := sel.toggle(index)
-		b.renderListWith(ctx, cq, sel.page, &next, "", log)
+		b.renderListWith(ctx, cq, sel.page, &next, log)
 
 	case cbPickAll:
 		b.answerCallback(ctx, cq.ID, "", log)
 		next := selectAll(sel.page, items)
-		b.renderListWith(ctx, cq, sel.page, &next, "", log)
+		b.renderListWith(ctx, cq, sel.page, &next, log)
 
 	case cbPickNone:
 		b.answerCallback(ctx, cq.ID, "", log)
 		next := newSelection(sel.page, items)
-		b.renderListWith(ctx, cq, sel.page, &next, "", log)
+		b.renderListWith(ctx, cq, sel.page, &next, log)
 
 	case cbPickApply:
 		b.applySelection(ctx, cq, sel, log)
@@ -97,13 +98,27 @@ func (b *Bot) applySelection(ctx context.Context, cq *telego.CallbackQuery, sel 
 	log.Info("bulk unsubscribed", "requested", len(mbids), "removed", removed)
 	b.answerCallback(ctx, cq.ID, "Відписано", log)
 
+	// A message of its own, not a line inside the list. The list is edited in
+	// place on every tap, so a receipt written into it would vanish the moment
+	// anything else is pressed — and a receipt exists precisely so a wrong
+	// choice stays visible afterwards, and so the names are there to re-add.
+	if err := b.client.SendHTML(ctx, cq.From.ID, unsubscribeReceipt(names)); err != nil {
+		// The unsubscribe already happened and the redrawn list shows it. A
+		// missing receipt is worth a log line, not an error to the user.
+		log.Warn("could not send the unsubscribe receipt", "err", err)
+	}
+
 	// Fresh selection, because every position after a removed row has shifted.
 	// Keeping the old ticks would leave them pointing at whoever moved up.
-	b.renderListWith(ctx, cq, sel.page, nil, unsubscribeReceipt(names), log)
+	b.renderListWith(ctx, cq, sel.page, nil, log)
 }
 
 // unsubscribeReceipt names what just went, so a mis-tap is visible rather than
-// merely counted.
+// merely counted — and so the names are at hand for subscribing again.
+//
+// Every name, not a sample: a selection is one page, so at most twenty, and
+// they are exactly what somebody needs to undo a mistake. The cap is a guard
+// against a page size that grows later, not a stylistic choice.
 func unsubscribeReceipt(names []string) string {
 	if len(names) == 0 {
 		return ""
@@ -113,12 +128,14 @@ func unsubscribeReceipt(names []string) string {
 	suffix := ""
 	if len(shown) > maxNamesInReceipt {
 		shown = shown[:maxNamesInReceipt]
-		suffix = "…"
+		suffix = fmt.Sprintf("\n…та ще %d.", len(names)-maxNamesInReceipt)
 	}
 
-	escaped := make([]string, len(shown))
+	var b strings.Builder
+	fmt.Fprintf(&b, "✅ Відписано від %d:\n\n", len(names))
 	for i, n := range shown {
-		escaped[i] = html.EscapeString(n)
+		fmt.Fprintf(&b, "%d. %s\n", i+1, html.EscapeString(n))
 	}
-	return "✅ Відписано: " + strings.Join(escaped, ", ") + suffix
+	b.WriteString(suffix)
+	return b.String()
 }

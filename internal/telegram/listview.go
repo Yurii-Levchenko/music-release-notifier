@@ -26,19 +26,15 @@ const (
 // mis-tap irreversible at the same time. Selecting first fixes both: several
 // artists can go at once, and nothing goes until a second, deliberate press.
 //
-// notice is a one-line receipt above the list — what a bulk unsubscribe just
-// removed. It goes here rather than in a separate message because the list has
-// to be redrawn anyway, and a second message per action turns a tidy-up into a
-// wall of confirmations.
+// What a bulk unsubscribe removed is reported in a message of its own rather
+// than here. This one is edited in place on every tap, so a receipt written
+// into it would vanish the moment somebody pressed anything else — and a
+// receipt exists precisely so a wrong choice stays visible afterwards.
 func renderList(
-	items []storage.Subscription, total, page int, sel selection, notice string,
+	items []storage.Subscription, total, page int, sel selection,
 ) (string, *telego.InlineKeyboardMarkup) {
 	var b strings.Builder
 
-	if notice != "" {
-		b.WriteString(notice)
-		b.WriteString("\n\n")
-	}
 	fmt.Fprintf(&b, "🔔 <b>Твої підписки</b> — %d\n\n", total)
 
 	offset := page * listPageSize

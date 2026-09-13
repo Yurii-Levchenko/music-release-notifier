@@ -41,7 +41,7 @@ func TestSubscriptionCallbackDataFitsLimit(t *testing.T) {
 	for i := range items {
 		items[i] = storage.Subscription{MBID: mbid, Name: fmt.Sprintf("Artist %d", i)}
 	}
-	_, listMarkup := renderList(items, 100, 3, newSelection(3, items), "")
+	_, listMarkup := renderList(items, 100, 3, newSelection(3, items))
 	assertCallbackBudget(t, listMarkup.InlineKeyboard)
 }
 
@@ -182,7 +182,7 @@ func TestRenderListNumbersContinueAcrossPages(t *testing.T) {
 		{MBID: "bbbbbbbb-0000-4000-8000-000000000002", Name: "Artist B"},
 	}
 
-	text, markup := renderList(items, 42, 1, newSelection(1, items), "")
+	text, markup := renderList(items, 42, 1, newSelection(1, items))
 
 	// Page 1 (zero-based) starts at 21.
 	if !strings.Contains(text, "21. Artist A") || !strings.Contains(text, "22. Artist B") {
@@ -238,7 +238,7 @@ func TestListNumbersSelectRatherThanDelete(t *testing.T) {
 		{MBID: "bbbbbbbb-0000-4000-8000-000000000002", Name: "Artist B"},
 	}
 
-	_, markup := renderList(items, 2, 0, newSelection(0, items), "")
+	_, markup := renderList(items, 2, 0, newSelection(0, items))
 
 	for _, row := range markup.InlineKeyboard {
 		for _, btn := range row {
@@ -258,7 +258,7 @@ func TestSelectedRowsGetAConfirmButton(t *testing.T) {
 	}
 	sel := newSelection(0, items).toggle(0).toggle(2)
 
-	text, markup := renderList(items, 3, 0, sel, "")
+	text, markup := renderList(items, 3, 0, sel)
 
 	if !strings.Contains(text, "Обрано: 2") {
 		t.Errorf("the count is missing from the text:\n%s", text)
@@ -291,7 +291,7 @@ func TestEmptySelectionOffersSelectAll(t *testing.T) {
 		{MBID: "bbbbbbbb-0000-4000-8000-000000000002", Name: "B"},
 	}
 
-	_, markup := renderList(items, 2, 0, newSelection(0, items), "")
+	_, markup := renderList(items, 2, 0, newSelection(0, items))
 
 	var prefixes []string
 	for _, row := range markup.InlineKeyboard {
@@ -309,7 +309,9 @@ func TestEmptySelectionOffersSelectAll(t *testing.T) {
 	}
 }
 
-// The receipt names what went, so a mis-tap is visible rather than counted.
+// The receipt names everything that went, because those names are what
+// somebody needs to subscribe again after a mis-tap. A count alone says
+// something happened; the names say whether it was what you meant.
 func TestUnsubscribeReceipt(t *testing.T) {
 	if got := unsubscribeReceipt(nil); got != "" {
 		t.Errorf("receipt for nothing = %q", got)
@@ -319,20 +321,46 @@ func TestUnsubscribeReceipt(t *testing.T) {
 	if !strings.Contains(got, "Simon &amp; Garfunkel") {
 		t.Errorf("name not escaped: %q", got)
 	}
-	if !strings.Contains(got, "Drake") {
-		t.Errorf("name missing: %q", got)
+	if !strings.Contains(got, "2. Drake") {
+		t.Errorf("name missing or unnumbered: %q", got)
+	}
+	if !strings.Contains(got, "2") {
+		t.Errorf("the count is missing: %q", got)
+	}
+}
+
+// A whole page listed in full, since that is the realistic maximum and every
+// one of those names is needed to undo the removal.
+func TestUnsubscribeReceiptListsAWholePage(t *testing.T) {
+	names := make([]string, listPageSize)
+	for i := range names {
+		names[i] = fmt.Sprintf("Artist %d", i)
 	}
 
-	many := make([]string, 9)
-	for i := range many {
-		many[i] = fmt.Sprintf("Artist %d", i)
+	got := unsubscribeReceipt(names)
+
+	for _, n := range names {
+		if !strings.Contains(got, n) {
+			t.Fatalf("%q was removed but is not in the receipt:\n%s", n, got)
+		}
 	}
-	long := unsubscribeReceipt(many)
-	if !strings.HasSuffix(long, "…") {
-		t.Errorf("a truncated receipt does not say so: %q", long)
+	if strings.Contains(got, "та ще") {
+		t.Errorf("a complete receipt claims to be truncated:\n%s", got)
 	}
-	if strings.Contains(long, "Artist 8") {
-		t.Errorf("the receipt is not bounded: %q", long)
+}
+
+// The cap exists for a page size that grows later; when it trips it has to say
+// so rather than hand back a list that looks complete.
+func TestUnsubscribeReceiptAdmitsTruncation(t *testing.T) {
+	names := make([]string, maxNamesInReceipt+4)
+	for i := range names {
+		names[i] = fmt.Sprintf("Artist %d", i)
+	}
+
+	got := unsubscribeReceipt(names)
+
+	if !strings.Contains(got, "та ще 4") {
+		t.Fatalf("truncation not admitted:\n%s", got)
 	}
 }
 
@@ -340,7 +368,7 @@ func TestUnsubscribeReceipt(t *testing.T) {
 // noise.
 func TestRenderListHidesPagerForOnePage(t *testing.T) {
 	items := []storage.Subscription{{MBID: "aaaaaaaa-0000-4000-8000-000000000001", Name: "Only"}}
-	text, markup := renderList(items, 1, 0, newSelection(0, items), "")
+	text, markup := renderList(items, 1, 0, newSelection(0, items))
 
 	if strings.Contains(text, "Сторінка") {
 		t.Fatalf("page indicator shown for a single page:\n%s", text)
@@ -359,7 +387,7 @@ func TestRenderListEscapesHTML(t *testing.T) {
 	items := []storage.Subscription{
 		{MBID: "aaaaaaaa-0000-4000-8000-000000000001", Name: "Simon & Garfunkel <duo>"},
 	}
-	text, _ := renderList(items, 1, 0, newSelection(0, items), "")
+	text, _ := renderList(items, 1, 0, newSelection(0, items))
 
 	if strings.Contains(text, "Simon & Garfunkel <duo>") {
 		t.Fatalf("unescaped name in list:\n%s", text)
@@ -379,7 +407,7 @@ func TestRenderListStaysUnderMessageLimit(t *testing.T) {
 			Name: long,
 		}
 	}
-	text, _ := renderList(items, 500, 9, newSelection(9, items), "")
+	text, _ := renderList(items, 500, 9, newSelection(9, items))
 	if n := len([]rune(text)); n > 4096 {
 		t.Fatalf("list page is %d characters, over Telegram's 4096 limit", n)
 	}

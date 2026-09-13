@@ -210,7 +210,7 @@ func (b *Bot) handleList(ctx context.Context, chatID int64, log *slog.Logger) {
 		return
 	}
 
-	text, markup := renderList(items, total, 0, newSelection(0, items), "")
+	text, markup := renderList(items, total, 0, newSelection(0, items))
 	if _, err := b.client.api.SendMessage(ctx, &telego.SendMessageParams{
 		ChatID:             telego.ChatID{ID: chatID},
 		Text:               text,
@@ -226,17 +226,17 @@ func (b *Bot) handleList(ctx context.Context, chatID int64, log *slog.Logger) {
 // selected. Used after anything that changes the list, since a selection made
 // against the old contents no longer means what it did.
 func (b *Bot) renderList(ctx context.Context, cq *telego.CallbackQuery, page int, log *slog.Logger) {
-	b.renderListWith(ctx, cq, page, nil, "", log)
+	b.renderListWith(ctx, cq, page, nil, log)
 }
 
-// renderListWith redraws the list, keeping a selection and an optional receipt.
+// renderListWith redraws the list, keeping a selection.
 //
 // sel is nil for a fresh draw; passing one keeps the ticks across a redraw,
 // which is what makes selecting several rows possible at all — every tap
 // redraws the whole message.
 func (b *Bot) renderListWith(
 	ctx context.Context, cq *telego.CallbackQuery, page int,
-	sel *selection, notice string, log *slog.Logger,
+	sel *selection, log *slog.Logger,
 ) {
 	msg := callbackMessage(cq)
 	if msg == nil {
@@ -255,7 +255,7 @@ func (b *Bot) renderListWith(
 	// The last item on the last page can disappear under the user, leaving the
 	// page out of range. Step back rather than showing an empty screen.
 	if len(items) == 0 && page > 0 {
-		b.renderListWith(ctx, cq, page-1, nil, notice, log)
+		b.renderListWith(ctx, cq, page-1, nil, log)
 		return
 	}
 
@@ -268,11 +268,8 @@ func (b *Bot) renderListWith(
 	var markup *telego.InlineKeyboardMarkup
 	if total == 0 {
 		text = "Ти більше ні на кого не підписаний."
-		if notice != "" {
-			text = notice + "\n\n" + text
-		}
 	} else {
-		text, markup = renderList(items, total, page, drawn, notice)
+		text, markup = renderList(items, total, page, drawn)
 	}
 
 	if _, err := b.client.api.EditMessageText(ctx, &telego.EditMessageTextParams{
