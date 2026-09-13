@@ -41,7 +41,7 @@ func run() error {
 	slog.SetDefault(log)
 	log.Info("starting release radar", "config", cfg.Redacted())
 
-	// Cancelled on SIGINT/SIGTERM so in-flight work can wind down.
+	// Canceled on SIGINT/SIGTERM so in-flight work can wind down.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -87,7 +87,7 @@ func run() error {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	// One errgroup per long-running worker. The group's context is cancelled as
+	// One errgroup per long-running worker. The group's context is canceled as
 	// soon as any worker returns an error, which is what makes the whole binary
 	// stop together instead of limping on half-dead.
 	g, gctx := errgroup.WithContext(ctx)
@@ -108,9 +108,12 @@ func run() error {
 	// this, ListenAndServe would keep the group waiting forever.
 	g.Go(func() error {
 		<-gctx.Done()
-		// Fresh context: gctx is already cancelled and shutdown must outlive it.
+		// Deliberately NOT derived from gctx: gctx is already canceled at this
+		// point, so a child of it would abort the shutdown instantly and drop
+		// in-flight requests. contextcheck cannot see that, hence the nolint.
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
+		//nolint:contextcheck // fresh context is required; see comment above
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			log.Warn("http shutdown", "err", err)
 		}

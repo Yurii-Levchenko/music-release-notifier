@@ -525,7 +525,7 @@ retry:        експоненційний backoff 1m → 5m → 30m → 2h → 
 | # | Етап | Обсяг | Definition of done |
 |---|---|---|---|
 | **S0** | Скелет | `docker compose` (app+postgres), міграції, `/healthz`, structured logging | `docker compose up` піднімає все, health віддає 200 |
-| **S1** | Бот відповідає | telego, long polling, `/start`, `setMyCommands`, `my_chat_member`, upsert користувача | **Код готовий 28.08.2026.** Бот підключений і полить (`music_release_radar_bot`, id 8656106994). Живу перевірку `/start` ще не зроблено |
+| **S1** | Бот відповідає | telego, long polling, `/start`, `setMyCommands`, `my_chat_member`, upsert користувача | **ВИКОНАНО 28.08.2026.** Бот відповідає на `/start` (`music_release_radar_bot`, id 8656106994). Ідемпотентність підтверджена живими даними: два `/start` → `user_id=32` обидва рази, один рядок у `users` |
 | **S2** | Пошук артиста | MusicBrainz search, rate limiter, `artist_search_cache`, картка з пагінацією | `radiohead` → 5 кандидатів з обкладинками й кнопками |
 | **S3** | Підписки | `subscriptions`, `INSERT … ON CONFLICT`, `/list`, `Unsubscribe`, `/stop` | Підписка створюється, повторна — no-op, список працює |
 | **S4** | Детекція релізів | ListenBrainz poller, матчинг, `releases`, фільтр типів, guard `release_date > today` | Ручний тригер поллера знаходить релізи для підписаних артистів |
@@ -577,6 +577,7 @@ retry:        експоненційний backoff 1m → 5m → 30m → 2h → 
 | Дата | Зміна |
 |---|---|
 | 19.08.2026 | Первинна версія після research-раунду (D1–D12, C1–C31) |
+| 28.08.2026 | **Процес змінено: тільки гілки й PR, `main` без прямих пушів.** Додано CI (lint / test з живим Postgres / build / docker build / spike), `golangci-lint` з 25 лінтерами запінений на v1.64.8 синхронно з локальним. **`depguard` тепер машинно стежить за межею `Notifier`** (D13) — імпорт `telego` поза `internal/telegram` валить CI; перевірено негативним тестом. Тести самі застосовують міграції, тож у CI вони **не скіпаються** (є окремий крок, що валить білд, якщо скіпнулись). Виправлено реальний баг: `os.Exit` у `TestMain` пропускав `defer` |
 | 28.08.2026 | **S1 реалізовано.** `internal/telegram` одразу як реалізація `notify.Notifier` (не «голий» бот-воркер) — щоб не було спокуси покликати `SendMessage` з домену. Класифікація помилок Bot API → `notify.Disposition` покрита 20 тестами; окремо зафіксовано, що **401 не є permanent** (інакше один поганий деплой вичистив би всі підписки). `errgroup` для воркерів. `UpsertUser` через `ON CONFLICT` з очищенням `blocked_at` — це і є шлях розблокування |
 | 23.08.2026 | **S7 пройдено на живому клієнті** — `fetch()` з extension і `ContextMenu.Item` працюють, two-predicate патерн перемикає пункт меню. Варіант A підтверджено. Порт БД на хості перенесено на **5433** (5432 зайнятий нативним PostgreSQL-сервісом). Module path → `github.com/Yurii-Levchenko/music-release-notifier` |
 | 22.08.2026 | **D15** вікно полінгу `days=7&past=true&future=false`; **C24** виправлено — `days=N` це ±N днів, а не «останні N»; **C24b/C24c** пагінації немає, фільтр за `release_date` а не за датою внесення; **C27** обкладинка вже в payload, виклик CAA не потрібен; **C27b** у 26% релізів обкладинки немає; **D14** переформульовано (нуль HTTP-викликів); FR-2.1 і FR-2.5 спрощено. Джерело: живі запити до API |

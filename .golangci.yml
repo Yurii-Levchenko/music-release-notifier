@@ -1,0 +1,177 @@
+# golangci-lint v2.13.2
+#
+# Pinned to the same version CI installs (env.GOLANGCI_LINT_VERSION in
+# .github/workflows/ci.yml). Upgrade both together.
+#
+# v2 and not v1 for a concrete reason: the official v1 release binaries are
+# built with Go 1.24 and refuse to run against a module targeting Go 1.26
+# ("the Go language version used to build golangci-lint is lower than the
+# targeted Go version"). Pinning a version *number* is not enough - the binary
+# must be built with a toolchain at least as new as go.mod's directive.
+
+version: "2"
+
+run:
+  tests: true
+
+issues:
+  # Report everything, not the default first-50-per-linter.
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+linters:
+  # v2 enables errcheck, govet, ineffassign, staticcheck and unused by default;
+  # gosimple was folded into staticcheck. Listing them again would be noise.
+  enable:
+    # --- correctness ---
+    - errorlint      # %v where %w belongs, == where errors.Is belongs
+    - nilerr         # returning nil after checking a non-nil error
+    - bodyclose      # unclosed HTTP response bodies
+    - rowserrcheck   # missing rows.Err()
+    - sqlclosecheck  # unclosed Rows / Stmt
+    - noctx          # HTTP requests built without a context
+    - contextcheck   # silently dropping an inherited context
+    - makezero
+    - durationcheck
+
+    # --- architecture ---
+    - depguard       # enforces the notify.Notifier boundary, see settings
+
+    # --- style and Go conventions ---
+    - revive         # golint's successor
+    - gocritic
+    - misspell
+    - unconvert
+    - unparam
+    - wastedassign
+    - whitespace
+    - goconst
+    - predeclared    # shadowing builtins such as len, cap, new
+
+    # --- security ---
+    - gosec
+
+  settings:
+    depguard:
+      rules:
+        # SPEC.md D13: the delivery channel is a plugin, and Telegram-specific
+        # types must never cross the notify.Notifier boundary. This turns that
+        # architectural rule into a build failure instead of a comment nobody
+        # re-reads - the point of the abstraction is that it cannot be bypassed
+        # by accident under deadline pressure. Verified by negative test.
+        notifier-boundary:
+          list-mode: lax
+          files:
+            - "**/internal/notify/**"
+            - "**/internal/storage/**"
+            - "**/internal/httpx/**"
+            - "**/internal/config/**"
+            - "**/internal/listenbrainz/**"
+            - "**/internal/musicbrainz/**"
+            - "**/cmd/**"
+          deny:
+            - pkg: github.com/mymmrac/telego
+              desc: >-
+                Only internal/telegram may import telego. Everything else talks
+                to notify.Notifier (SPEC.md D13). If you need this, you are
+                about to leak a chat_id into the domain.
+
+        # The interface must not know its implementations, or the dependency
+        # arrow points the wrong way and the abstraction is decorative.
+        notify-stays-abstract:
+          list-mode: lax
+          files:
+            - "**/internal/notify/**"
+          deny:
+            - pkg: github.com/Yurii-Levchenko/music-release-notifier/internal/telegram
+              desc: internal/notify defines the interface; it must not depend on an implementation.
+
+    errcheck:
+      # Deliberate fire-and-forget writes to an in-memory buffer, which cannot
+      # fail. Every other unchecked error stays an error.
+      exclude-functions:
+        - (*strings.Builder).WriteString
+        - (*strings.Builder).WriteByte
+        - (*strings.Builder).WriteRune
+
+    govet:
+      enable-all: true
+      disable:
+        # Struct field alignment micro-optimization; not worth the churn.
+        - fieldalignment
+        # Flags idiomatic Go - `if _, err := f(); err != nil` inside a function
+        # that already has an err. Famously noisy, and the workaround is uglier
+        # and no safer.
+        - shadow
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+      disabled-checks:
+        # Fires on a short if/else that reads better than a switch.
+        - ifElseChain
+        # Named returns are used in a few places for documentation value.
+        - unnamedResult
+        # Would push notify.Release behind a pointer. Value semantics keep the
+        # Notifier contract simple, and one 112-byte copy per delivered message
+        # is not worth complicating the interface for.
+        - hugeParam
+
+    revive:
+      rules:
+        - name: exported
+          arguments: [disableStutteringCheck]
+        - name: early-return
+        - name: unused-parameter
+        - name: indent-error-flow
+        - name: error-strings
+        - name: error-return
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: unreachable-code
+        - name: redefines-builtin-id
+
+    gosec:
+      excludes:
+        # G404: math/rand is only used where unpredictability does not matter.
+        # Link tokens use crypto/rand explicitly (see SPEC.md D6).
+        - G404
+
+    misspell:
+      # US English, matching the Go ecosystem.
+      locale: US
+
+    goconst:
+      min-len: 3
+      min-occurrences: 4
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # Test code legitimately repeats literals and builds throwaway values.
+      - path: _test\.go
+        linters:
+          - gosec
+          - unparam
+          - goconst
+          - dupl
+
+# v2 runs formatters itself, so there is one source of truth for formatting
+# rather than a separate gofmt step that can disagree with the linter.
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      # Keeps import blocks grouped stdlib / third-party / this module, which is
+      # the grouping the codebase already uses.
+      local-prefixes:
+        - github.com/Yurii-Levchenko/music-release-notifier

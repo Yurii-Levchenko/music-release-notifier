@@ -80,7 +80,7 @@ func (d Disposition) String() string {
 // cares about: what to do, and how long to wait.
 type DeliveryError struct {
 	Disposition Disposition
-	// RetryAfter is honoured verbatim when the channel supplies one. Telegram
+	// RetryAfter is honored verbatim when the channel supplies one. Telegram
 	// does, in seconds, and ignoring it escalates to longer lockouts.
 	RetryAfter time.Duration
 	Err        error
@@ -96,7 +96,7 @@ func (e *DeliveryError) Error() string {
 func (e *DeliveryError) Unwrap() error { return e.Err }
 
 // DispositionOf reports how the outbox should treat err. Anything that is not a
-// *DeliveryError is treated as Transient: an unrecognised failure must never
+// *DeliveryError is treated as Transient: an unrecognized failure must never
 // silently delete someone's subscriptions.
 func DispositionOf(err error) (Disposition, time.Duration) {
 	var de *DeliveryError

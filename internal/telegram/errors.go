@@ -17,7 +17,7 @@ import (
 // Two rules matter more than the table itself:
 //
 //  1. Never widen "permanent" by accident. A permanent verdict deletes
-//     someone's subscriptions, so anything unrecognised stays transient.
+//     someone's subscriptions, so anything unrecognized stays transient.
 //  2. 401 is never permanent. A bad token makes every send fail; treating that
 //     as "the user blocked us" would wipe the entire subscription table on one
 //     bad deploy.
@@ -36,7 +36,7 @@ func classify(err error) (notify.Disposition, time.Duration) {
 
 	switch apiErr.ErrorCode {
 	case 429:
-		// Honour retry_after verbatim. Ignoring it escalates to much longer
+		// Honor retry_after verbatim. Ignoring it escalates to much longer
 		// lockouts, so this value is not a suggestion.
 		var wait time.Duration
 		if apiErr.Parameters != nil && apiErr.Parameters.RetryAfter > 0 {
