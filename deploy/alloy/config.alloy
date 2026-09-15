@@ -1,0 +1,72 @@
+// Ships container logs to Loki.
+//
+// Alloy rather than Promtail: Promtail reached end of support in March 2026,
+// and Grafana's replacement for exactly this job is Alloy. Picking the
+// deprecated one for familiarity would be a decision to redo this within the
+// year.
+//
+// Logs are read through the Docker API rather than from files under
+// /var/lib/docker/containers, because on Docker Desktop that directory lives
+// inside a VM and is not mountable from the host.
+
+discovery.docker "containers" {
+	host             = "unix:///var/run/docker.sock"
+	refresh_interval = "15s"
+}
+
+discovery.relabel "containers" {
+	targets = discovery.docker.containers.targets
+
+	// Only this project's containers. Everything else on the machine is
+	// somebody else's noise, and this runs on a development laptop.
+	rule {
+		source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+		regex         = "music_release_notifier"
+		action        = "keep"
+	}
+
+	// The service name is the one label worth having: "show me the app" and
+	// "show me Postgres" are the two questions actually asked.
+	rule {
+		source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+		target_label  = "service"
+	}
+
+	rule {
+		source_labels = ["__meta_docker_container_name"]
+		regex         = "/(.*)"
+		target_label  = "container"
+	}
+}
+
+loki.source.docker "containers" {
+	host       = "unix:///var/run/docker.sock"
+	targets    = discovery.relabel.containers.output
+	labels     = {job = "docker"}
+	forward_to = [loki.process.app.receiver]
+}
+
+loki.process "app" {
+	forward_to = [loki.write.local.receiver]
+
+	// The application logs JSON (slog), so the level is worth lifting into a
+	// label — "show me the errors" is the first thing anybody asks, and
+	// filtering by label is what Loki is fast at.
+	stage.json {
+		expressions = {level = "level", msg = "msg"}
+	}
+
+	// Deliberately only the level. Every other field — chat_id, release_id,
+	// mbid — stays in the line and is searched with LogQL, because each of them
+	// is unbounded, and an unbounded label is how a Loki index becomes the
+	// thing that falls over.
+	stage.labels {
+		values = {level = ""}
+	}
+}
+
+loki.write "local" {
+	endpoint {
+		url = "http://loki:3100/loki/api/v1/push"
+	}
+}

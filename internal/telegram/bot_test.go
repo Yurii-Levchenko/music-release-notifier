@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -125,5 +126,57 @@ func TestReportProgressToIgnoresNil(t *testing.T) {
 
 	if err := b.consume(ctx, updates); err != nil {
 		t.Fatalf("consume: %v", err)
+	}
+}
+
+// The welcome message has to describe the bot that exists. Its last line said
+// "працює /start, решта — на підході" from S1 until now, telling everybody who
+// pressed start that search, subscriptions and delivery did not work.
+func TestHelpTextDescribesWhatWorks(t *testing.T) {
+	got := helpText("music_release_radar_bot")
+
+	for _, want := range []string{"/search", "/list", "/stop", "Підписатись"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("help text does not mention %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "працює /start") {
+		t.Fatalf("the help text still claims only /start works:\n%s", got)
+	}
+}
+
+// Plain text is how most people search, and it is invisible unless the help
+// says so.
+func TestHelpTextMentionsSearchingByTyping(t *testing.T) {
+	got := helpText("bot")
+
+	if !strings.Contains(got, "напиши ім'я") {
+		t.Fatalf("typing a name is not mentioned as a way to search:\n%s", got)
+	}
+}
+
+// The two things somebody would otherwise meet as a disappointment: a release
+// can arrive a day late, and subscribing pays off immediately.
+func TestHelpTextSetsExpectations(t *testing.T) {
+	got := helpText("bot")
+
+	if !strings.Contains(got, "раз на добу") {
+		t.Errorf("the daily cadence is not stated:\n%s", got)
+	}
+	if !strings.Contains(got, "3 дні") {
+		t.Errorf("the catch-up window is not stated:\n%s", got)
+	}
+}
+
+// Before Init the bot does not know its own username, and the help must still
+// read as a sentence.
+func TestHelpTextWithoutAUsername(t *testing.T) {
+	got := helpText("")
+
+	if strings.Contains(got, "@ ") || strings.Contains(got, "@<") {
+		t.Fatalf("a dangling @ with no username:\n%s", got)
+	}
+	if !strings.Contains(got, "Цей бот") {
+		t.Fatalf("no fallback name:\n%s", got)
 	}
 }

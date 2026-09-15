@@ -1,0 +1,54 @@
+# Single-binary Loki on local disk.
+#
+# Chosen over Elasticsearch after measuring the difference in what it costs to
+# run (SPEC §15a): Elasticsearch wants 2 GB of RAM on its own, which is more
+# than the application and Postgres together on a 5 USD VPS. Loki indexes only
+# labels rather than the log body and lives in about 100 MB — and the volume
+# here is hundreds of lines a day, not terabytes.
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  # Nothing publishes this port; Grafana and Alloy reach it over the compose
+  # network.
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2026-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  # Thirty days, matching Prometheus. The two are read together during an
+  # incident, and a metric with no log beside it is half an answer.
+  retention_period: 30d
+  # The app logs one line per event, not per request; these are well clear of
+  # anything it produces and exist to stop a runaway loop filling the disk.
+  ingestion_rate_mb: 4
+  ingestion_burst_size_mb: 8
+  # Alloy attaches only bounded labels, but a config mistake should fail loudly
+  # rather than quietly explode the index.
+  max_label_names_per_series: 15
+
+compactor:
+  working_directory: /loki/compactor
+  # Without this, retention_period is advisory and nothing ever deletes.
+  retention_enabled: true
+  delete_request_store: filesystem
