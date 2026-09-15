@@ -1,0 +1,15 @@
+apiVersion: 1
+
+deleteDatasources:
+  - name: Loki
+    orgId: 1
+
+datasources:
+  - name: Loki
+    type: loki
+    uid: releaseradar-loki
+    access: proxy
+    url: http://loki:3100
+    # Prometheus stays the default: a dashboard opens on metrics, and logs are
+    # what you switch to once a graph has told you where to look.
+    isDefault: false

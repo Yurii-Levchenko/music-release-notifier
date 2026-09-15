@@ -96,6 +96,7 @@ func (c *Client) SetCommands(ctx context.Context) error {
 		Commands: []telego.BotCommand{
 			{Command: "start", Description: "Що це і як користуватися"},
 			{Command: "search", Description: "Знайти виконавця за назвою"},
+			{Command: "help", Description: "Що вміє цей бот"},
 			{Command: "list", Description: "Мої підписки"},
 			{Command: "stop", Description: "Відписатися від усього і видалити дані"},
 		},

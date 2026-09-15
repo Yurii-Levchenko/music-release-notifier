@@ -80,12 +80,21 @@ way of a locally installed PostgreSQL.
 docker compose --profile observability up -d
 ```
 
-Grafana on **3001** (anonymous viewer). Neither Prometheus nor the app's
-`/metrics` is published to the host — Grafana reaches both over the compose
-network, `/metrics` carries queue depths and chat volumes, and every port not
-published is one fewer chance to lose a container to a bind race on startup.
-That is not hypothetical: Prometheus died that way on 9091 and stayed dead for
-six days.
+Grafana on **3001** (anonymous viewer) is the only published port. Prometheus,
+Loki and the app's `/metrics` all stay on the compose network — `/metrics`
+carries queue depths and chat volumes, and every port not published is one
+fewer chance to lose a container to a bind race on startup. That is not
+hypothetical: Prometheus died that way on 9091 and stayed dead for six days.
+
+Logs go to Loki through Grafana Alloy, read over the Docker API rather than
+from `/var/lib/docker/containers`, which on Docker Desktop lives inside a VM.
+Only `level` becomes a label; `chat_id`, `release_id` and the rest stay in the
+line and are searched with LogQL, because each of them is unbounded and an
+unbounded label is how a Loki index falls over.
+
+This exists because `docker compose logs` is wiped by every rebuild. Measured
+during one: 90 lines before, 10 after, and the same window still readable in
+Loki.
 
 Two collectors read Postgres when Prometheus scrapes rather than tracking a
 number in memory. That is not incidental — a gauge set from the drain loop is

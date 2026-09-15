@@ -118,6 +118,7 @@ func TestNopMetricsAreSafeToUse(t *testing.T) {
 	m.PollFailures.Inc()
 	m.MusicBrainzRequests.WithLabelValues("503").Inc()
 	m.SearchCache.WithLabelValues("cache").Inc()
+	m.SearchSeconds.WithLabelValues("cache").Observe(0.004)
 	m.BotUpdates.WithLabelValues("message").Inc()
 
 	if m.Notifications == nil {
@@ -166,4 +167,65 @@ func TestClosedLabelSetsExistFromStartup(t *testing.T) {
 	if got := testutil.CollectAndCount(m.TelegramRequests); got != 0 {
 		t.Errorf("telegram code series at startup = %d, want none invented", got)
 	}
+}
+
+// The duration was already measured for the log line and discarded, which left
+// the question the cache exists to answer — how much faster a hit is —
+// unanswerable from outside the process.
+func TestSearchDurationIsRecordedBySource(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := New(reg)
+
+	m.SearchSeconds.WithLabelValues("cache").Observe(0.004)
+	m.SearchSeconds.WithLabelValues("musicbrainz").Observe(0.8)
+
+	if got := testutil.CollectAndCount(m.SearchSeconds); got != 2 {
+		t.Fatalf("counted %d series, want one per source", got)
+	}
+
+	// The bucket set has to keep the two apart. If the smallest bucket
+	// swallowed a hit, the percentiles would report it taking as long as a
+	// miss, and the panel would say the cache does nothing.
+	buckets := bucketCounts(t, reg, "releaseradar_artist_search_seconds")
+
+	if buckets["cache"][0.005] != 1 {
+		t.Errorf("a 4 ms hit did not land in the smallest bucket: %v", buckets["cache"])
+	}
+	if buckets["musicbrainz"][0.005] != 0 {
+		t.Errorf("an 800 ms miss landed in the 5 ms bucket: %v", buckets["musicbrainz"])
+	}
+	if buckets["musicbrainz"][1] != 1 {
+		t.Errorf("an 800 ms miss is not counted by the 1 s bucket: %v", buckets["musicbrainz"])
+	}
+}
+
+// bucketCounts reads cumulative bucket counts per source out of a registry.
+func bucketCounts(t *testing.T, reg *prometheus.Registry, name string) map[string]map[float64]uint64 {
+	t.Helper()
+
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+
+	out := map[string]map[float64]uint64{}
+	for _, f := range families {
+		if f.GetName() != name {
+			continue
+		}
+		for _, metric := range f.GetMetric() {
+			var source string
+			for _, l := range metric.GetLabel() {
+				if l.GetName() == "source" {
+					source = l.GetValue()
+				}
+			}
+			counts := map[float64]uint64{}
+			for _, b := range metric.GetHistogram().GetBucket() {
+				counts[b.GetUpperBound()] = b.GetCumulativeCount()
+			}
+			out[source] = counts
+		}
+	}
+	return out
 }

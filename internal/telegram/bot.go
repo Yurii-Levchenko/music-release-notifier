@@ -386,24 +386,47 @@ func (b *Bot) reply(ctx context.Context, chatID int64, text string, log *slog.Lo
 	log.Warn("reply failed", "err", err)
 }
 
+// helpText is what /start and /help say.
+//
+// It has to describe what the bot does today. The line it used to end with —
+// "працює /start, решта — на підході" — was written when that was true and
+// stayed there through search, subscriptions, delivery and everything since,
+// telling every new person that nothing worked.
+//
+// The two facts under "Що варто знати" are there because they are the ones
+// somebody would otherwise discover as a disappointment: that a release can
+// arrive a day late (the poll is daily, by design — D15), and that subscribing
+// is worth doing today rather than tomorrow.
 func helpText(botUsername string) string {
-	name := botUsername
-	if name == "" {
-		name = "цей бот"
-	} else {
-		name = "@" + name
-	}
 	return "<b>Release Radar</b>\n\n" +
 		"Я повідомляю, коли виконавець, на якого ти підписаний, випускає новий " +
 		"альбом, сингл або EP.\n\n" +
 		"Spotify дає тобі підписатися на виконавця, але надійно не повідомляє " +
 		"про релізи. Я закриваю цю прогалину.\n\n" +
+		"<b>Як користуватись</b>\n" +
+		"Просто напиши ім'я виконавця — покажу картку з кнопкою «Підписатись».\n\n" +
 		"<b>Команди</b>\n" +
 		"/search — знайти виконавця\n" +
-		"/list — мої підписки\n" +
-		"/stop — відписатися від усього\n\n" +
-		"Дані про релізи — з MusicBrainz і ListenBrainz.\n" +
-		"<i>" + html.EscapeString(name) + " ще в розробці: працює /start, решта — на підході.</i>"
+		"/list — мої підписки: тисни номери, щоб обрати кількох, потім «Відписатись»\n" +
+		"/stop — видалити всі дані\n\n" +
+		"<b>Що варто знати</b>\n" +
+		"• Перевіряю релізи раз на добу, тож повідомлення може прийти наступного дня " +
+		"після виходу.\n" +
+		"• Щойно підпишешся — одразу надішлю, якщо в артиста був реліз за останні 3 дні.\n\n" +
+		"Дані — з MusicBrainz і ListenBrainz." + inDevelopmentNote(botUsername)
+}
+
+// inDevelopmentNote names what is genuinely not built yet, so the message stays
+// honest in the other direction too.
+func inDevelopmentNote(botUsername string) string {
+	name := botUsername
+	if name == "" {
+		name = "Цей бот"
+	} else {
+		name = "@" + name
+	}
+	return "\n<i>" + html.EscapeString(name) +
+		" ще росте: розширення для Spotify — у планах.</i>"
 }
 
 // splitCommand separates "/cmd@bot payload" into "/cmd" and "payload".

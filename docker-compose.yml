@@ -82,14 +82,60 @@ services:
       # a password nobody remembers is a dashboard nobody opens.
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      # Without this a Viewer has datasources:query but not datasources:explore,
+      # so Explore is missing from the nav entirely — which is how a stack with
+      # working logs looks like a stack with no logs. Viewers still cannot save
+      # anything; the edits are per-session.
+      GF_USERS_VIEWERS_CAN_EDIT: "true"
       GF_USERS_DEFAULT_THEME: dark
     volumes:
       - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafanadata:/var/lib/grafana
     ports:
-      - "3001:3000"
+      # Bound to the loopback address. Anonymous access with edit rights has no
+      # business being reachable from the rest of the network, and "3001:3000"
+      # publishes on every interface.
+      - "127.0.0.1:3001:3000"
+
+  loki:
+    image: grafana/loki:3.7.7
+    profiles: ["observability"]
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - ./deploy/loki:/etc/loki:ro
+      - lokidata:/loki
+    # Not published. Grafana and Alloy reach it over the compose network, and
+    # an unauthenticated log store on the host is a worse idea than an
+    # unauthenticated metrics endpoint.
+    #
+    # No healthcheck. The image carries the loki binary and nothing else — no
+    # wget, no curl, no shell tools — so every probe that can be written here
+    # fails regardless of whether Loki is fine, and reports "unhealthy" forever.
+    # A check that can only ever say the wrong thing is worse than none: the
+    # first time it matters, it will already have been ignored for weeks.
+
+  alloy:
+    image: grafana/alloy:v1.19.2
+    profiles: ["observability"]
+    restart: unless-stopped
+    depends_on: [loki]
+    command:
+      - run
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./deploy/alloy:/etc/alloy:ro
+      - alloydata:/var/lib/alloy/data
+      # Read-only, and it is the whole reason this works on Docker Desktop:
+      # container logs live inside the VM, so they are read through the API
+      # rather than from a bind-mounted directory that does not exist here.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
 
 volumes:
   pgdata:
+  lokidata:
+  alloydata:
   promdata:
   grafanadata:
