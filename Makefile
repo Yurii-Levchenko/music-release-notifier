@@ -1,4 +1,4 @@
-.PHONY: run build test test-db lint fmt vet check up down logs psql spike ci-local
+.PHONY: run build test test-db lint fmt vet check up down logs psql spike ci-local alert-chat-id
 
 # --- development ---
 run:      ; go run ./cmd/releaseradar
@@ -20,6 +20,15 @@ check: fmt vet lint test-db
 # --- docker ---
 up:       ; docker compose up -d --build
 down:     ; docker compose down
+
+# Prints the value for ALERT_CHAT_ID, so the bot token never goes into a browser
+# address bar — and from there into history, into whatever syncs it, and into
+# the occasional screenshot. Message the bot once first; Telegram only reports
+# chats that have spoken to it.
+alert-chat-id:
+	@docker run --rm --env-file .env \
+		-v "$(CURDIR)/deploy/alertmanager:/etc/alertmanager:ro" \
+		--entrypoint sh prom/alertmanager:v0.28.1 /etc/alertmanager/chat-id.sh
 logs:     ; docker compose logs -f app
 psql:     ; docker compose exec db psql -U releaseradar -d releaseradar
 
