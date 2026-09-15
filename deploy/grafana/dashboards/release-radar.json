@@ -1,0 +1,224 @@
+{
+  "uid": "release-radar",
+  "title": "Release Radar",
+  "description": "The numbers from SPEC 15a, in the order they are read during an incident: is anything stuck, is it being delivered, are the upstreams answering, and what did the logs say.",
+  "tags": ["release-radar"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "1m",
+  "time": { "from": "now-24h", "to": "now" },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Waiting to be delivered",
+      "description": "The leading indicator: this rises before anybody notices a delay. No data here means the queue could not be read at all - see the panel beside it.",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "releaseradar-prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "releaseradar_notifications_pending", "legendFormat": "pending" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 50 },
+              { "color": "red", "value": 200 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "title": "Queue readable",
+      "description": "1 when the outbox could be read at scrape time. When this is 0 the depth above is absent rather than zero, because a zero would read as an empty queue and silence the alert that should be firing.",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "releaseradar-prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "releaseradar_queue_readable", "legendFormat": "readable" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "NO", "color": "red", "index": 0 }, "1": { "text": "yes", "color": "green", "index": 1 } } }
+          ]
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "background", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "title": "Oldest notification waiting",
+      "description": "The delay somebody is actually experiencing, which is why this is the alert rather than depth.",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "releaseradar-prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "releaseradar_notification_queue_age_seconds", "legendFormat": "age" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1800 },
+              { "color": "red", "value": 3600 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "title": "Since the last successful poll",
+      "description": "Read from the database rather than from process memory, so a deploy does not reset it. Over 25 hours means releases are no longer being detected.",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "releaseradar-prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "time() - releaseradar_poller_last_success_timestamp_seconds", "legendFormat": "age" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 86400 },
+              { "color": "red", "value": 90000 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Delivery outcomes",
+      "description": "permanent is the one that costs somebody their subscriptions; catch_up says whether subscribing pays off immediately.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "releaseradar-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (disposition, kind) (increase(releaseradar_notifications_total[1h]))",
+          "legendFormat": "{{disposition}} / {{kind}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "stacking": { "mode": "normal" } } }, "overrides": [] }
+    },
+    {
+      "type": "timeseries",
+      "title": "Time to deliver one notification",
+      "description": "Per send, not per batch, so the percentiles answer how long a message takes rather than how long a drain took.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "releaseradar-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(releaseradar_notification_delivery_seconds_bucket[1h])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(releaseradar_notification_delivery_seconds_bucket[1h])))",
+          "legendFormat": "p50"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    },
+    {
+      "type": "timeseries",
+      "title": "Telegram results",
+      "description": "429 means the pacing is wrong rather than that Telegram is unhappy about one message. transport means the request may never have arrived.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "releaseradar-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (code) (increase(releaseradar_telegram_requests_total[1h]))",
+          "legendFormat": "{{code}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "stacking": { "mode": "normal" } } }, "overrides": [] }
+    },
+    {
+      "type": "timeseries",
+      "title": "MusicBrainz results",
+      "description": "transport, not 503, is what a stalled lookup looks like: the connection stood and no headers came. 60% of these once meant a 20s timeout was too tight for a cold url-rels lookup.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "releaseradar-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (code) (increase(releaseradar_musicbrainz_requests_total[1h]))",
+          "legendFormat": "{{code}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "stacking": { "mode": "normal" } } }, "overrides": [] }
+    },
+    {
+      "type": "timeseries",
+      "title": "Release artwork",
+      "description": "degraded_to_text is the share of releases that arrived without a cover. retried_ok is the share saved by asking Telegram a second time.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "releaseradar-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (increase(releaseradar_cover_sends_total[6h]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "stacking": { "mode": "normal" } } }, "overrides": [] }
+    },
+    {
+      "type": "timeseries",
+      "title": "Poller",
+      "description": "The Friday spike should be plainly visible in what the feed returns: Friday is 48.5% of all releases and 5.6x an average day.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 21 },
+      "datasource": { "type": "prometheus", "uid": "releaseradar-prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "increase(releaseradar_poller_releases_found_total[24h])", "legendFormat": "found in the feed" },
+        { "refId": "B", "expr": "increase(releaseradar_poller_releases_matched_total[24h])", "legendFormat": "matched a tracked artist" },
+        { "refId": "C", "expr": "increase(releaseradar_poller_failures_total[24h])", "legendFormat": "failed polls" }
+      ],
+      "fieldConfig": { "defaults": {}, "overrides": [] }
+    },
+    {
+      "type": "timeseries",
+      "title": "Artist search",
+      "description": "stale-cache means the upstream was down and an expired answer was served. It looks like success to the reader and must not look like success here.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 21 },
+      "datasource": { "type": "prometheus", "uid": "releaseradar-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (source) (increase(releaseradar_artist_search_total[6h]))",
+          "legendFormat": "{{source}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "stacking": { "mode": "normal" } } }, "overrides": [] }
+    },
+    {
+      "type": "logs",
+      "title": "Warnings and errors",
+      "description": "Only level is a label; everything else stays in the line. To trace one person or one release, edit this query: {service=\"app\"} |= \"365932759\".",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 29 },
+      "datasource": { "type": "loki", "uid": "releaseradar-loki" },
+      "targets": [
+        { "refId": "A", "expr": "{service=\"app\", level=~\"WARN|ERROR\"}" }
+      ],
+      "options": { "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true }
+    }
+  ]
+}

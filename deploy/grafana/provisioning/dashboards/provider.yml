@@ -1,0 +1,14 @@
+apiVersion: 1
+providers:
+  - name: release-radar
+    orgId: 1
+    folder: ""
+    type: file
+    # Checked into git rather than edited in the UI. A dashboard that only
+    # exists in Grafana's database is lost with the volume, and there is no
+    # record of why a panel shows what it shows.
+    disableDeletion: false
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

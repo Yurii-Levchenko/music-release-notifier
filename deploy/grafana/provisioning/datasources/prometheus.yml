@@ -1,7 +1,21 @@
 apiVersion: 1
+
+# Grafana refuses to start if a provisioned datasource changes uid while an
+# older copy of it exists in its database — "data source not found", and the
+# whole provisioning module fails. Deleting by name first is the documented way
+# round it, and it keeps this file the single source of truth: whatever is in
+# Grafana's database loses to what is written here.
+deleteDatasources:
+  - name: Prometheus
+    orgId: 1
+
 datasources:
   - name: Prometheus
     type: prometheus
+    # Fixed uid so a provisioned dashboard can reference it. Left to Grafana it
+    # is generated per install, and a dashboard checked into git would point at
+    # a datasource that only exists on the machine that made it.
+    uid: releaseradar-prometheus
     access: proxy
     url: http://prometheus:9090
     isDefault: true
