@@ -146,6 +146,11 @@ services:
       # bot.
       ALERT_BOT_TOKEN: ${ALERT_BOT_TOKEN:-}
       ALERT_CHAT_ID: ${ALERT_CHAT_ID:-}
+      # Alert messages print UTC and this zone side by side. A zone name rather
+      # than a fixed offset, so the October and March switches happen on their
+      # own and the printed abbreviation stays true — CEST now, CET later.
+      # Only this container is affected; everything else stays UTC.
+      TZ: ${ALERT_TZ:-Europe/Warsaw}
     # Alertmanager does not substitute environment variables into its config, so
     # a shell renders the template first. Invoked as `sh <script>` rather than
     # relying on the execute bit, which a Windows checkout does not preserve.

@@ -61,10 +61,29 @@ receivers:
         # precisely when alerting is broken, the gap is largest exactly when the
         # timestamp matters most.
         #
-        # Times are UTC and say so. Local time would need no arithmetic on a
-        # phone, but slog writes UTC, so every log line you would cross-check
-        # against is in UTC too, and having the one timestamp you read during an
-        # incident disagree with all the others is the worse trade.
+        # Both zones, because the two readers of this line want different
+        # things. UTC is what every log line you would cross-check against is
+        # written in, so an alert in local time alone would disagree with
+        # everything you read next. Local time is what the phone in your hand
+        # says, and subtracting an offset at 3am is exactly when arithmetic goes
+        # wrong.
+        #
+        # The local zone comes from TZ on the container (Europe/Warsaw by
+        # default) rather than a fixed offset, so the switch in late October
+        # happens on its own and the abbreviation stays truthful — CEST now,
+        # CET then. A hardcoded "+2" would be correct today and silently wrong
+        # for five months of the year.
+        #
+        # An unrecognised TZ falls back to UTC, and the line then reads
+        # "15:38 UTC (15:38 UTC)" — redundant, but it never claims a local time
+        # it did not compute. Verified, because a silent fallback that invented
+        # a plausible-looking wrong hour would be far worse than an ugly one.
+        #
+        # The date is repeated rather than printed once. It looks redundant, and
+        # it is, except between 22:00 and midnight UTC when the two zones are on
+        # different days — verified: 23:30 UTC Tue 15 Sep renders as 01:30 Wed
+        # 16 Sep local. That is the case where a single shared date would be
+        # wrong for one of the two times.
         message: |-
           {{ if eq .Status "firing" }}FIRING{{ else }}RESOLVED{{ end }} — {{ .Alerts | len }} alert(s)
           {{ range .Alerts }}
@@ -74,9 +93,9 @@ receivers:
           {{- with .Annotations.description }}
           {{ . }}
           {{- end }}
-          firing since {{ .StartsAt.UTC.Format "15:04 UTC, Mon 2 Jan" }}
+          firing since {{ .StartsAt.UTC.Format "15:04 UTC, Mon 2 Jan" }} ({{ .StartsAt.Local.Format "15:04 MST, Mon 2 Jan" }})
           {{- else }}
           {{ .Labels.alertname }} recovered
-          was firing {{ .StartsAt.UTC.Format "15:04" }} → {{ .EndsAt.UTC.Format "15:04 UTC, Mon 2 Jan" }}
+          was firing {{ .StartsAt.UTC.Format "15:04" }} → {{ .EndsAt.UTC.Format "15:04 UTC, Mon 2 Jan" }} ({{ .StartsAt.Local.Format "15:04" }} → {{ .EndsAt.Local.Format "15:04 MST, Mon 2 Jan" }})
           {{- end }}
           {{ end }}
