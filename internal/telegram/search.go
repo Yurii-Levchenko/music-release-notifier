@@ -274,16 +274,18 @@ func (b *Bot) finish(ctx context.Context, chatID int64, placeholder int, text st
 
 // logSearch emits the one line per search that makes cache behavior visible.
 func (b *Bot) logSearch(log *slog.Logger, query, source string, results int, started time.Time) {
-	// The same place the log line is emitted, so the metric cannot disagree
+	// The same place the log line is emitted, so the metrics cannot disagree
 	// with the logs about where an answer came from. `source` is one of a
 	// fixed set defined in this package, so the label stays bounded.
+	elapsed := time.Since(started)
 	b.metrics.SearchCache.WithLabelValues(source).Inc()
+	b.metrics.SearchSeconds.WithLabelValues(source).Observe(elapsed.Seconds())
 
 	log.Info("artist search",
 		"query", query,
 		"source", source,
 		"results", results,
-		"duration", time.Since(started).Round(time.Millisecond))
+		"duration", elapsed.Round(time.Millisecond))
 }
 
 // handleNavigate moves between candidates in an existing card.

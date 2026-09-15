@@ -71,6 +71,12 @@ type Metrics struct {
 	MusicBrainzRequests *prometheus.CounterVec
 	SearchCache         *prometheus.CounterVec
 
+	// SearchSeconds is how long one artist search took, split by where the
+	// answer came from. The duration was already measured for the log line and
+	// then thrown away — which left the one question the cache exists to
+	// answer, how much faster a hit is, unanswerable from the outside.
+	SearchSeconds *prometheus.HistogramVec
+
 	// --- bot ---
 
 	BotUpdates *prometheus.CounterVec
@@ -150,6 +156,17 @@ func New(reg prometheus.Registerer) *Metrics {
 			Namespace: namespace,
 			Name:      "artist_search_total",
 			Help:      "Artist searches by where the answer came from.",
+		}, "source"),
+
+		SearchSeconds: factory.histogramVec(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "artist_search_seconds",
+			Help:      "Time to answer one artist search, by where the answer came from.",
+			// Spanning four orders of magnitude on purpose: a cache hit is
+			// milliseconds, a cold MusicBrainz call is hundreds of them, and a
+			// call that survived retries is tens of seconds. One bucket set has
+			// to make all three legible.
+			Buckets: []float64{0.005, 0.02, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30},
 		}, "source"),
 
 		BotUpdates: factory.counterVec(prometheus.CounterOpts{
@@ -260,6 +277,12 @@ func (p promauto) counterVec(opts prometheus.CounterOpts, labels ...string) *pro
 
 func (p promauto) histogram(opts prometheus.HistogramOpts) prometheus.Histogram {
 	h := prometheus.NewHistogram(opts)
+	p.register(h)
+	return h
+}
+
+func (p promauto) histogramVec(opts prometheus.HistogramOpts, labels ...string) *prometheus.HistogramVec {
+	h := prometheus.NewHistogramVec(opts, labels)
 	p.register(h)
 	return h
 }
