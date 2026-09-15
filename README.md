@@ -192,7 +192,7 @@ behind. Without `TEST_DATABASE_URL` they skip rather than fail, keeping
 | ✅ S4 | Release detection |
 | ✅ S5 | Delivery: outbox drain, pacing, failure classification |
 | 🔄 S6 | Production: dead-man's switch ✅, metrics ✅, logs ✅, alert routing ✅, backups ✅, VPS — **v1 done** |
-| ⬜ S11 | Rank search results by metadata completeness, not score |
+| ❌ S11 | Ranking by metadata completeness — **measured and dropped**: the right artist was already first in 18 of 18 real searches |
 | ⬜ S12 | Dead-letter handling for poison messages (with the v2 broker) |
 | ⬜ S8–S10 | Extension: linking API, subscribe from Spotify, publish |
 
