@@ -19,7 +19,7 @@
       "description": "The leading indicator: this rises before anybody notices a delay. No data here means the queue could not be read at all - see the panel beside it.",
       "gridPos": {
         "h": 5,
-        "w": 6,
+        "w": 4,
         "x": 0,
         "y": 0
       },
@@ -72,8 +72,8 @@
       "description": "1 when the outbox could be read at scrape time. When this is 0 the depth above is absent rather than zero, because a zero would read as an empty queue and silence the alert that should be firing.",
       "gridPos": {
         "h": 5,
-        "w": 6,
-        "x": 6,
+        "w": 4,
+        "x": 4,
         "y": 0
       },
       "datasource": {
@@ -124,8 +124,8 @@
       "description": "The delay somebody is actually experiencing, which is why this is the alert rather than depth.",
       "gridPos": {
         "h": 5,
-        "w": 6,
-        "x": 12,
+        "w": 4,
+        "x": 8,
         "y": 0
       },
       "datasource": {
@@ -178,8 +178,8 @@
       "description": "Read from the database rather than from process memory, so a deploy does not reset it. Over 25 hours means releases are no longer being detected.",
       "gridPos": {
         "h": 5,
-        "w": 6,
-        "x": 18,
+        "w": 4,
+        "x": 12,
         "y": 0
       },
       "datasource": {
@@ -218,6 +218,119 @@
       },
       "options": {
         "colorMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Last backup",
+      "description": "Age of the newest verified dump on disk. Measured from the files themselves rather than from a record of the job, because a record keeps saying a backup happened after the directory has been deleted. No data means the directory could not be read at all, which is a different and worse answer than a large number.",
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 16,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "releaseradar-prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - releaseradar_backup_last_success_timestamp_seconds",
+          "legendFormat": "age"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 93600
+              },
+              {
+                "color": "red",
+                "value": 172800
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Dumps retained",
+      "description": "How many dumps rotation is currently keeping. Zero is published when the directory is readable but empty - which is the state that says rotation has eaten everything, and it only reads correctly because a zero here is a real answer rather than a missing one.",
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 20,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "releaseradar-prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "releaseradar_backups_retained",
+          "legendFormat": "kept"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "NONE",
+                  "color": "red",
+                  "index": 0
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 21
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"

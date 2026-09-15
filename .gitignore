@@ -19,3 +19,7 @@
 .DS_Store
 Thumbs.db
 .cursor/
+
+# database dumps — bind-mounted so they can be copied off this machine, which
+# also means they land inside the working tree
+/backups/

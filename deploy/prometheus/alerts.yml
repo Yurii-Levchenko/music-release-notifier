@@ -73,6 +73,43 @@ groups:
             New releases are not being detected. Subscribers are silently
             getting nothing.
 
+      - alert: BackupStale
+        # 48 hours, where the poller gets 25, and the gap is a consequence of a
+        # decision rather than a guess: there is no VPS yet (Q-OPEN-4, deferred
+        # 15.09.2026), so this runs on a laptop that sleeps overnight and is
+        # shut at weekends. A 26-hour threshold would fire every Monday, and an
+        # alert that is wrong every Monday is an alert nobody reads by March.
+        # Tighten it to 26h the day this moves to a machine that stays on.
+        #
+        # absent() is the half that matters most. A missing metric means the
+        # directory could not be read, BACKUP_DIR was never set, or the backup
+        # container is not running — and "there are no backups at all" has to be
+        # at least as loud as "the backups are old".
+        expr: >-
+          (time() - releaseradar_backup_last_success_timestamp_seconds > 172800)
+          or absent(releaseradar_backup_last_success_timestamp_seconds)
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: No verified database backup in over 48 hours
+          description: >-
+            Every subscription, artist and release lives in one Postgres volume
+            on one machine. Check the backup container's logs.
+
+      - alert: BackupRotationStuck
+        # Rotation only runs after a successful dump, which is deliberate — a
+        # failing job must never delete the last good backup it has. The cost of
+        # that choice is the opposite failure: if the prune step itself breaks,
+        # nothing bounds the directory, and a full disk takes down the database
+        # it was protecting.
+        expr: releaseradar_backups_retained > 20
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: More dumps are being kept than rotation should allow
+
       - alert: AlertDeliveryFailing
         # The one alert that cannot reach you by the route it is describing: if
         # Telegram delivery is broken, this notification takes the broken path

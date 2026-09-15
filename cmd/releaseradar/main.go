@@ -21,6 +21,7 @@ import (
 
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/config"
 
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/backup"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/health"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/httpx"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/listenbrainz"
@@ -101,6 +102,19 @@ func run() error {
 	}
 	if err := appMetrics.RegisterPollState(promReg, storage.NewReleases(pool)); err != nil {
 		return fmt.Errorf("register poll state metrics: %w", err)
+	}
+	// Optional, and it says so when it is off. An unpublished backup metric and
+	// a backup job that is not running look identical from the outside, so the
+	// difference has to be stated somewhere a person will see it.
+	if cfg.BackupDir != "" {
+		dumps := backup.NewDir(cfg.BackupDir)
+		if err := appMetrics.RegisterBackups(promReg, dumps); err != nil {
+			return fmt.Errorf("register backup metrics: %w", err)
+		}
+		log.Info("publishing backup freshness", "dir", dumps.Path())
+	} else {
+		log.Warn("backup metrics disabled: BACKUP_DIR is not set — " +
+			"nothing will notice if the dumps stop")
 	}
 
 	// Built here rather than inside the Telegram branch, because the poller's
