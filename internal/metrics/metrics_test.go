@@ -9,6 +9,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/backup"
 )
 
 type fakeQueue struct {
@@ -228,4 +230,109 @@ func bucketCounts(t *testing.T, reg *prometheus.Registry, name string) map[strin
 		}
 	}
 	return out
+}
+
+type fakeBackups struct {
+	state backup.State
+	err   error
+}
+
+func (f fakeBackups) State() (backup.State, error) { return f.state, f.err }
+
+// published reports which metric families the registry is currently exposing.
+func published(t *testing.T, reg *prometheus.Registry) map[string]bool {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	names := make(map[string]bool, len(families))
+	for _, f := range families {
+		names[f.GetName()] = true
+	}
+	return names
+}
+
+// The mirror of TestUnreadableQueueDoesNotLookEmpty, in the other direction. An
+// unreadable backup directory must publish nothing at all. A zero timestamp
+// would mean 1970, and "the last backup was 56 years ago" is a far louder claim
+// than "we could not look" — but a zero count would be worse still, because it
+// asserts there are no backups when there may be seven.
+func TestUnreadableBackupDirPublishesNothing(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := New(reg)
+
+	if err := m.RegisterBackups(reg, fakeBackups{err: errors.New("permission denied")}); err != nil {
+		t.Fatalf("register backups: %v", err)
+	}
+
+	names := published(t, reg)
+	for _, name := range []string{
+		"releaseradar_backup_last_success_timestamp_seconds",
+		"releaseradar_backup_size_bytes",
+		"releaseradar_backups_retained",
+	} {
+		if names[name] {
+			t.Errorf("published %s for an unreadable directory", name)
+		}
+	}
+}
+
+// An empty directory is a readable answer, and the only one that can say
+// rotation has deleted everything. So the count must appear, at zero, while the
+// timestamp must not: there is no backup to date.
+func TestEmptyBackupDirPublishesACountButNoTimestamp(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := New(reg)
+
+	if err := m.RegisterBackups(reg, fakeBackups{}); err != nil {
+		t.Fatalf("register backups: %v", err)
+	}
+
+	expected := `
+# HELP releaseradar_backups_retained How many dumps are currently kept.
+# TYPE releaseradar_backups_retained gauge
+releaseradar_backups_retained 0
+`
+	if err := testutil.GatherAndCompare(reg, strings.NewReader(expected),
+		"releaseradar_backups_retained"); err != nil {
+		t.Fatal(err)
+	}
+
+	if published(t, reg)["releaseradar_backup_last_success_timestamp_seconds"] {
+		t.Error("published a backup timestamp with no dumps on disk")
+	}
+}
+
+func TestBackupCollectorPublishesFreshness(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := New(reg)
+
+	at := time.Date(2026, 9, 15, 3, 0, 0, 0, time.UTC)
+	err := m.RegisterBackups(reg, fakeBackups{state: backup.State{
+		Newest: at, SizeBytes: 40400, Count: 7,
+	}})
+	if err != nil {
+		t.Fatalf("register backups: %v", err)
+	}
+
+	// Size and timestamp must describe the same file, which is why they are
+	// asserted together rather than one at a time.
+	expected := `
+# HELP releaseradar_backup_last_success_timestamp_seconds Unix time of the newest database dump on disk.
+# TYPE releaseradar_backup_last_success_timestamp_seconds gauge
+releaseradar_backup_last_success_timestamp_seconds 1.7894412e+09
+# HELP releaseradar_backup_size_bytes Size of the newest database dump.
+# TYPE releaseradar_backup_size_bytes gauge
+releaseradar_backup_size_bytes 40400
+# HELP releaseradar_backups_retained How many dumps are currently kept.
+# TYPE releaseradar_backups_retained gauge
+releaseradar_backups_retained 7
+`
+	if err := testutil.GatherAndCompare(reg, strings.NewReader(expected),
+		"releaseradar_backup_last_success_timestamp_seconds",
+		"releaseradar_backup_size_bytes",
+		"releaseradar_backups_retained"); err != nil {
+		t.Fatal(err)
+	}
 }

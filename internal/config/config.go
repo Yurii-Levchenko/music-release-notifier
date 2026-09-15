@@ -26,6 +26,13 @@ type Config struct {
 	// application is dead (SPEC §15a).
 	HeartbeatURL      string
 	HeartbeatInterval time.Duration
+
+	// BackupDir is where the backup container writes its dumps, mounted
+	// read-only. Optional: unset simply means the backup metrics are not
+	// published. It is a directory rather than a flag because what gets
+	// measured is the files themselves — a process that recorded "a backup
+	// happened" would keep saying so after the dumps were deleted.
+	BackupDir string
 }
 
 func Load() (Config, error) {
@@ -36,6 +43,7 @@ func Load() (Config, error) {
 		UserAgent:        os.Getenv("USER_AGENT"),
 		LogLevel:         parseLevel(envOr("LOG_LEVEL", "info")),
 		HeartbeatURL:     os.Getenv("HEARTBEAT_URL"),
+		BackupDir:        os.Getenv("BACKUP_DIR"),
 	}
 
 	interval, err := parseDuration(envOr("HEARTBEAT_INTERVAL", "5m"))
@@ -68,9 +76,10 @@ func Load() (Config, error) {
 // Redacted renders the config for logging with nothing secret in it.
 func (c Config) Redacted() string {
 	return fmt.Sprintf(
-		"http=%s db=%s telegram_token=%s user_agent=%q log_level=%s heartbeat=%s interval=%s",
+		"http=%s db=%s telegram_token=%s user_agent=%q log_level=%s heartbeat=%s interval=%s backups=%s",
 		c.HTTPAddr, redactDSN(c.DatabaseURL), present(c.TelegramBotToken),
 		c.UserAgent, c.LogLevel, present(c.HeartbeatURL), c.HeartbeatInterval,
+		present(c.BackupDir),
 	)
 }
 

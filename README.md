@@ -131,6 +131,32 @@ make test       # unit tests; database tests skip without TEST_DATABASE_URL
 make psql       # psql shell into the container
 ```
 
+### Backups
+
+A `backup` container dumps the database on a schedule. It is not behind the
+observability profile, because metrics are something you look at and backups
+decide whether there is anything left to look at.
+
+Three choices in it are worth stating. Every dump is verified by decoding the
+**whole** archive before it is renamed into place — `pg_restore --list` was the
+obvious check and it is not enough, because the table of contents sits at the
+front, so it accepts a dump whose tail has been overwritten. Rotation runs
+**only after a successful dump**, so a job that has been failing for a week
+cannot be the thing that deletes the last good backup it has. And the dumps go
+to `./backups` as a bind mount rather than a named volume, because
+`docker compose down -v` removes named volumes and the entire value of a backup
+on a laptop is being able to copy it off the laptop.
+
+The app reports on them without making them: `releaseradar_backup_*` is read
+from the directory at scrape time. Measuring the files rather than recording the
+job is the point — a row saying "backup succeeded at T" goes on saying so after
+the directory is deleted, and a listing cannot.
+
+```bash
+ls -lh backups/
+pg_restore --list backups/releaseradar-<stamp>.dump | head
+```
+
 ### Tests
 
 The interesting tests assert database invariants, because that is where
@@ -156,7 +182,7 @@ behind. Without `TEST_DATABASE_URL` they skip rather than fail, keeping
 | ✅ S3 | Subscriptions, `/list`, `/stop` |
 | ✅ S4 | Release detection |
 | ✅ S5 | Delivery: outbox drain, pacing, failure classification |
-| 🔄 S6 | Production: dead-man's switch ✅, metrics ✅, logs ✅, alert routing ✅, VPS — **v1 done** |
+| 🔄 S6 | Production: dead-man's switch ✅, metrics ✅, logs ✅, alert routing ✅, backups ✅, VPS — **v1 done** |
 | ⬜ S11 | Rank search results by metadata completeness, not score |
 | ⬜ S12 | Dead-letter handling for poison messages (with the v2 broker) |
 | ⬜ S8–S10 | Extension: linking API, subscribe from Spotify, publish |
@@ -170,6 +196,7 @@ internal/storage/      pool, migration runner, schema, invariant tests
 internal/notify/       the channel boundary — no Telegram types allowed here
 internal/notifier/     drains the outbox; decides what a failure costs
 internal/health/       worker liveness and the external dead-man's switch
+internal/backup/       reads the dump directory; makes no backups itself
 internal/metrics/      Prometheus collectors; two of them read at scrape time
 deploy/                Prometheus scrape config, alert rules, Alertmanager routing, Grafana
 internal/httpx/        HTTP surface (health now, extension API in S8)

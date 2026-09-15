@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/backup"
 )
 
 const namespace = "releaseradar"
@@ -344,4 +346,69 @@ func (c *pollStateCollector) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 	ch <- prometheus.MustNewConstMetric(c.last, prometheus.GaugeValue, float64(at.Unix()))
+}
+
+// BackupReader is the backup state the collector reads at scrape time.
+type BackupReader interface {
+	State() (backup.State, error)
+}
+
+// RegisterBackups publishes the age, size and count of the database dumps.
+//
+// Read at scrape time, like the queue and the poll state, and for a sharper
+// reason than either: the dumps are written by a different container, so there
+// is no in-process event to count. Anything this process remembered would be a
+// memory of a directory listing rather than the listing.
+//
+// Unlike the queue there is no readable gauge here, because there is no
+// ambiguous zero to guard against. A queue depth of zero reads as "nothing
+// waiting, all fine" and would silence the very alert that should fire, so the
+// queue has to say explicitly that it could not be read. A backup timestamp
+// has no such value: absent is absent, and the alert's absent() clause catches
+// an unreadable directory and an empty one alike.
+func (m *Metrics) RegisterBackups(reg prometheus.Registerer, backups BackupReader) error {
+	return reg.Register(&backupCollector{
+		backups: backups,
+		last: prometheus.NewDesc(
+			namespace+"_backup_last_success_timestamp_seconds",
+			"Unix time of the newest database dump on disk.", nil, nil),
+		size: prometheus.NewDesc(
+			namespace+"_backup_size_bytes",
+			"Size of the newest database dump.", nil, nil),
+		count: prometheus.NewDesc(
+			namespace+"_backups_retained",
+			"How many dumps are currently kept.", nil, nil),
+	})
+}
+
+type backupCollector struct {
+	backups           BackupReader
+	last, size, count *prometheus.Desc
+}
+
+func (c *backupCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.last
+	ch <- c.size
+	ch <- c.count
+}
+
+func (c *backupCollector) Collect(ch chan<- prometheus.Metric) {
+	st, err := c.backups.State()
+	if err != nil {
+		// Directory unreadable. Publish nothing at all, so the alert fires on
+		// absent() — a zero here would claim there are no backups, which is a
+		// different and much more alarming statement than "we could not look".
+		return
+	}
+
+	// Count is published even at zero. An empty directory is a real, readable
+	// answer, and it is the one that says rotation has eaten everything or the
+	// job has never run — which only reads correctly if zero can be shown.
+	ch <- prometheus.MustNewConstMetric(c.count, prometheus.GaugeValue, float64(st.Count))
+
+	if st.Newest.IsZero() {
+		return
+	}
+	ch <- prometheus.MustNewConstMetric(c.last, prometheus.GaugeValue, float64(st.Newest.Unix()))
+	ch <- prometheus.MustNewConstMetric(c.size, prometheus.GaugeValue, float64(st.SizeBytes))
 }

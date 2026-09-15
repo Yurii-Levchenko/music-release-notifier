@@ -35,11 +35,49 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       HEARTBEAT_URL: ${HEARTBEAT_URL:-}
       HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL:-5m}
+      # The app does not make backups; it reports on them, so the freshness of
+      # the dumps is a metric with an alert rather than something you remember
+      # to check by listing a directory.
+      BACKUP_DIR: /backups
+    volumes:
+      # Read-only. Nothing in the app should be able to touch a backup, and a
+      # process that can delete its own backups is one bug away from having
+      # none.
+      - ./backups:/backups:ro
     ports:
       # Host port 8090, not 8080. 8080 is the most contended port on any dev
       # machine, and losing the race for it on a host restart kills the
       # container before it runs — see the note in CLAUDE.md.
       - "8090:8080"
+
+  # Not behind the observability profile, on purpose: metrics are something you
+  # look at, and backups are the thing that decides whether there is anything
+  # left to look at. It runs whenever the database does.
+  backup:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGUSER: ${POSTGRES_USER:-releaseradar}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-change-me-locally}
+      PGDATABASE: ${POSTGRES_DB:-releaseradar}
+      BACKUP_KEEP: ${BACKUP_KEEP:-7}
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+    # Same image as the database, which is the point: pg_dump must never be
+    # older than the server it dumps. Pinning a separate image would let the two
+    # drift on the next Postgres bump, and the direction that fails silently is
+    # the one that produces an archive you find out about during a restore.
+    entrypoint: ["/bin/sh", "/backup.sh"]
+    volumes:
+      - ./deploy/backup/backup.sh:/backup.sh:ro
+      # A bind mount rather than a named volume. Named volumes are removed by
+      # `docker compose down -v`, which people run, and the whole value of a
+      # backup on a laptop is being able to copy it somewhere that is not the
+      # laptop. Gitignored.
+      - ./backups:/backups
 
   # Observability lives behind a profile, so `docker compose up` stays two
   # containers on a dev machine. Start it with:
