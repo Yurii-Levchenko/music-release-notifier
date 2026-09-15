@@ -242,6 +242,9 @@ func (b *Bot) handleCallback(ctx context.Context, cq *telego.CallbackQuery) {
 		b.answerCallback(ctx, cq.ID, "", log)
 		b.renderList(ctx, cq, page, log)
 
+	case cbPick, cbPickAll, cbPickNone, cbPickApply:
+		b.handleSelection(ctx, cq, prefix, rest, log)
+
 	case cbStop:
 		b.handleStopConfirm(ctx, cq, rest, log)
 

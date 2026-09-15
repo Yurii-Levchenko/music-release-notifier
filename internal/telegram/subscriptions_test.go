@@ -41,7 +41,7 @@ func TestSubscriptionCallbackDataFitsLimit(t *testing.T) {
 	for i := range items {
 		items[i] = storage.Subscription{MBID: mbid, Name: fmt.Sprintf("Artist %d", i)}
 	}
-	_, listMarkup := renderList(items, 100, 3)
+	_, listMarkup := renderList(items, 100, 3, newSelection(3, items))
 	assertCallbackBudget(t, listMarkup.InlineKeyboard)
 }
 
@@ -182,7 +182,7 @@ func TestRenderListNumbersContinueAcrossPages(t *testing.T) {
 		{MBID: "bbbbbbbb-0000-4000-8000-000000000002", Name: "Artist B"},
 	}
 
-	text, markup := renderList(items, 42, 1)
+	text, markup := renderList(items, 42, 1, newSelection(1, items))
 
 	// Page 1 (zero-based) starts at 21.
 	if !strings.Contains(text, "21. Artist A") || !strings.Contains(text, "22. Artist B") {
@@ -205,17 +205,162 @@ func TestRenderListNumbersContinueAcrossPages(t *testing.T) {
 		t.Fatalf("button labels = %v, want [21 22]", labels)
 	}
 
-	// And each must carry the MBID of the artist on its line.
-	var payloads []string
+	// And each must address its own row, on this page. The buttons no longer
+	// carry an MBID — they carry the selection plus the row to flip, so that a
+	// tap selects rather than deletes.
+	var rows []int
 	for _, row := range markup.InlineKeyboard {
-		for _, b := range row {
-			if strings.HasPrefix(b.CallbackData, cbUnsubscribe+":") {
-				payloads = append(payloads, strings.TrimPrefix(b.CallbackData, cbUnsubscribe+":"))
+		for _, btn := range row {
+			if !strings.HasPrefix(btn.CallbackData, cbPick+":") {
+				continue
+			}
+			sel, index, ok := decodeSelection(strings.TrimPrefix(btn.CallbackData, cbPick+":"))
+			if !ok {
+				t.Fatalf("undecodable button payload %q", btn.CallbackData)
+			}
+			if sel.page != 1 {
+				t.Errorf("button for row %d carries page %d", index, sel.page)
+			}
+			rows = append(rows, index)
+		}
+	}
+	if len(rows) != 2 || rows[0] != 0 || rows[1] != 1 {
+		t.Fatalf("button rows = %v, want [0 1] — positions within the page", rows)
+	}
+}
+
+// Numbers select; nothing is removed until a second, deliberate press. They
+// used to unsubscribe on the first tap, which made a mis-tap irreversible and
+// bulk tidying impossible at the same time.
+func TestListNumbersSelectRatherThanDelete(t *testing.T) {
+	items := []storage.Subscription{
+		{MBID: "aaaaaaaa-0000-4000-8000-000000000001", Name: "Artist A"},
+		{MBID: "bbbbbbbb-0000-4000-8000-000000000002", Name: "Artist B"},
+	}
+
+	_, markup := renderList(items, 2, 0, newSelection(0, items))
+
+	for _, row := range markup.InlineKeyboard {
+		for _, btn := range row {
+			if strings.HasPrefix(btn.CallbackData, cbUnsubscribe+":") {
+				t.Fatalf("a number still deletes on the first tap: %q", btn.CallbackData)
 			}
 		}
 	}
-	if len(payloads) != 2 || payloads[0] != items[0].MBID || payloads[1] != items[1].MBID {
-		t.Fatalf("button payloads = %v, want the two MBIDs in order", payloads)
+}
+
+// With something ticked, the confirm button appears and says how many.
+func TestSelectedRowsGetAConfirmButton(t *testing.T) {
+	items := []storage.Subscription{
+		{MBID: "aaaaaaaa-0000-4000-8000-000000000001", Name: "Artist A"},
+		{MBID: "bbbbbbbb-0000-4000-8000-000000000002", Name: "Artist B"},
+		{MBID: "cccccccc-0000-4000-8000-000000000003", Name: "Artist C"},
+	}
+	sel := newSelection(0, items).toggle(0).toggle(2)
+
+	text, markup := renderList(items, 3, 0, sel)
+
+	if !strings.Contains(text, "Обрано: 2") {
+		t.Errorf("the count is missing from the text:\n%s", text)
+	}
+	if !strings.Contains(text, "✓ 1. Artist A") || !strings.Contains(text, "✓ 3. Artist C") {
+		t.Errorf("ticked rows are not marked:\n%s", text)
+	}
+	if strings.Contains(text, "✓ 2. Artist B") {
+		t.Errorf("an unticked row is marked:\n%s", text)
+	}
+
+	var apply string
+	for _, row := range markup.InlineKeyboard {
+		for _, btn := range row {
+			if strings.HasPrefix(btn.CallbackData, cbPickApply+":") {
+				apply = btn.Text
+			}
+		}
+	}
+	if !strings.Contains(apply, "(2)") {
+		t.Fatalf("confirm button = %q, want the count", apply)
+	}
+}
+
+// Nothing ticked: offer to tick the page instead of a confirm button with
+// nothing to confirm.
+func TestEmptySelectionOffersSelectAll(t *testing.T) {
+	items := []storage.Subscription{
+		{MBID: "aaaaaaaa-0000-4000-8000-000000000001", Name: "A"},
+		{MBID: "bbbbbbbb-0000-4000-8000-000000000002", Name: "B"},
+	}
+
+	_, markup := renderList(items, 2, 0, newSelection(0, items))
+
+	var prefixes []string
+	for _, row := range markup.InlineKeyboard {
+		for _, btn := range row {
+			prefix, _, _ := strings.Cut(btn.CallbackData, ":")
+			prefixes = append(prefixes, prefix)
+		}
+	}
+	joined := strings.Join(prefixes, " ")
+	if !strings.Contains(joined, cbPickAll) {
+		t.Errorf("no select-all button: %s", joined)
+	}
+	if strings.Contains(joined, cbPickApply) {
+		t.Errorf("a confirm button with nothing selected: %s", joined)
+	}
+}
+
+// The receipt names everything that went, because those names are what
+// somebody needs to subscribe again after a mis-tap. A count alone says
+// something happened; the names say whether it was what you meant.
+func TestUnsubscribeReceipt(t *testing.T) {
+	if got := unsubscribeReceipt(nil); got != "" {
+		t.Errorf("receipt for nothing = %q", got)
+	}
+
+	got := unsubscribeReceipt([]string{"Simon & Garfunkel", "Drake"})
+	if !strings.Contains(got, "Simon &amp; Garfunkel") {
+		t.Errorf("name not escaped: %q", got)
+	}
+	if !strings.Contains(got, "2. Drake") {
+		t.Errorf("name missing or unnumbered: %q", got)
+	}
+	if !strings.Contains(got, "2") {
+		t.Errorf("the count is missing: %q", got)
+	}
+}
+
+// A whole page listed in full, since that is the realistic maximum and every
+// one of those names is needed to undo the removal.
+func TestUnsubscribeReceiptListsAWholePage(t *testing.T) {
+	names := make([]string, listPageSize)
+	for i := range names {
+		names[i] = fmt.Sprintf("Artist %d", i)
+	}
+
+	got := unsubscribeReceipt(names)
+
+	for _, n := range names {
+		if !strings.Contains(got, n) {
+			t.Fatalf("%q was removed but is not in the receipt:\n%s", n, got)
+		}
+	}
+	if strings.Contains(got, "та ще") {
+		t.Errorf("a complete receipt claims to be truncated:\n%s", got)
+	}
+}
+
+// The cap exists for a page size that grows later; when it trips it has to say
+// so rather than hand back a list that looks complete.
+func TestUnsubscribeReceiptAdmitsTruncation(t *testing.T) {
+	names := make([]string, maxNamesInReceipt+4)
+	for i := range names {
+		names[i] = fmt.Sprintf("Artist %d", i)
+	}
+
+	got := unsubscribeReceipt(names)
+
+	if !strings.Contains(got, "та ще 4") {
+		t.Fatalf("truncation not admitted:\n%s", got)
 	}
 }
 
@@ -223,7 +368,7 @@ func TestRenderListNumbersContinueAcrossPages(t *testing.T) {
 // noise.
 func TestRenderListHidesPagerForOnePage(t *testing.T) {
 	items := []storage.Subscription{{MBID: "aaaaaaaa-0000-4000-8000-000000000001", Name: "Only"}}
-	text, markup := renderList(items, 1, 0)
+	text, markup := renderList(items, 1, 0, newSelection(0, items))
 
 	if strings.Contains(text, "Сторінка") {
 		t.Fatalf("page indicator shown for a single page:\n%s", text)
@@ -242,7 +387,7 @@ func TestRenderListEscapesHTML(t *testing.T) {
 	items := []storage.Subscription{
 		{MBID: "aaaaaaaa-0000-4000-8000-000000000001", Name: "Simon & Garfunkel <duo>"},
 	}
-	text, _ := renderList(items, 1, 0)
+	text, _ := renderList(items, 1, 0, newSelection(0, items))
 
 	if strings.Contains(text, "Simon & Garfunkel <duo>") {
 		t.Fatalf("unescaped name in list:\n%s", text)
@@ -262,7 +407,7 @@ func TestRenderListStaysUnderMessageLimit(t *testing.T) {
 			Name: long,
 		}
 	}
-	text, _ := renderList(items, 500, 9)
+	text, _ := renderList(items, 500, 9, newSelection(9, items))
 	if n := len([]rune(text)); n > 4096 {
 		t.Fatalf("list page is %d characters, over Telegram's 4096 limit", n)
 	}
