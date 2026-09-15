@@ -1,0 +1,8 @@
+# Intentionally empty. Grafana logs an error at startup for every provisioning
+# directory it cannot open, and those two lines then show up in the "Warnings and
+# errors" panel on every restart. A panel with permanent benign errors in it is a
+# panel people stop reading, so the directory exists to keep it quiet.
+#
+# Alerting is deliberately not provisioned here: alert rules live in
+# deploy/prometheus/alerts.yml and are routed by Alertmanager, which keeps them
+# checkable by promtool in CI.

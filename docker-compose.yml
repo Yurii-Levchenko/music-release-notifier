@@ -98,6 +98,39 @@ services:
       # publishes on every interface.
       - "127.0.0.1:3001:3000"
 
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    profiles: ["observability"]
+    restart: unless-stopped
+    environment:
+      # A second bot, not the one users talk to. An alert about the main bot
+      # being blocked, throttled or misconfigured cannot be sent by the main
+      # bot.
+      ALERT_BOT_TOKEN: ${ALERT_BOT_TOKEN:-}
+      ALERT_CHAT_ID: ${ALERT_CHAT_ID:-}
+    # Alertmanager does not substitute environment variables into its config, so
+    # a shell renders the template first. Invoked as `sh <script>` rather than
+    # relying on the execute bit, which a Windows checkout does not preserve.
+    entrypoint: ["/bin/sh", "/etc/alertmanager/entrypoint.sh"]
+    volumes:
+      - ./deploy/alertmanager:/etc/alertmanager:ro
+      # Silences and the notification log. Without this, restarting the
+      # container re-sends everything that was already delivered and forgets
+      # every silence somebody set during an incident.
+      - alertmanagerdata:/alertmanager
+    # Not published, for the same reason as Prometheus and Loki: Prometheus
+    # reaches it over the compose network, and an unauthenticated endpoint that
+    # can silence alerts has no business on the host.
+    #
+    # Unlike Loki, this healthcheck is real — the image is busybox-based and
+    # genuinely has wget, so a failing probe means a failing Alertmanager rather
+    # than a missing binary.
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9093/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
   loki:
     image: grafana/loki:3.7.7
     profiles: ["observability"]
@@ -139,3 +172,4 @@ volumes:
   alloydata:
   promdata:
   grafanadata:
+  alertmanagerdata:

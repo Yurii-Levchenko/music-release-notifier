@@ -165,6 +165,16 @@ jobs:
         run: |
           docker run --rm -v "$PWD/deploy/prometheus:/etc/prometheus:ro"             --entrypoint promtool prom/prometheus:v3.7.3             check config /etc/prometheus/prometheus.yml
 
+      - name: amtool check-config
+        # Renders through the real entrypoint with throwaway credentials, then
+        # validates the result. Checking the template directly would not work
+        # and would not be worth much either: chat_id is an int64, so the
+        # unrendered ${ALERT_CHAT_ID} is not even valid, and the substitution is
+        # the part that can break silently. A config Alertmanager rejects means
+        # the container crash-loops and every alert goes nowhere.
+        run: |
+          docker run --rm             -v "$PWD/deploy/alertmanager:/etc/alertmanager:ro"             -e ALERT_BOT_TOKEN=123456:ci-not-a-real-token             -e ALERT_CHAT_ID=1             -e RENDER_ONLY=1             --entrypoint sh prom/alertmanager:v0.28.1             -c '/bin/sh /etc/alertmanager/entrypoint.sh && amtool check-config /tmp/alertmanager.yml'
+
   # The spike is a separate module and deliberately excluded from the main
   # build; check it still compiles so it does not rot before S8 deletes it.
   spike:

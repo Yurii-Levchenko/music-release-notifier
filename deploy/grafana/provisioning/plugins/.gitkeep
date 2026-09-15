@@ -1,0 +1,3 @@
+# Intentionally empty - see the note in ../alerting/.gitkeep. No Grafana plugins
+# are provisioned; the directory exists only so Grafana stops logging an error
+# about its absence on every start.

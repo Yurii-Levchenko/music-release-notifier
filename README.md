@@ -9,10 +9,11 @@ message when a new album, single or EP lands.
 **Go · PostgreSQL · ListenBrainz / MusicBrainz**
 
 > Status: **S0–S5 done**, S6 in progress. The bot detects releases, delivers
-> them, and reports on itself through metrics, logs and an external dead-man's
-> switch. What is left of S6 needs decisions rather than code: a
-> healthchecks.io URL, a second bot token for alert delivery, and a VPS —
-> until that last one, it runs only while this laptop does.
+> them, and reports on itself through metrics, logs, routed alerts and an
+> external dead-man's switch. What is left of S6 is configuration rather than
+> code — a healthchecks.io URL and a token for the alert bot, both in `.env` —
+> plus one deferred decision: there is no VPS, so it runs only while this
+> laptop does.
 
 ---
 
@@ -109,6 +110,21 @@ the alert that should be firing.
 `/status` shows what each worker is doing; `/healthz` stays liveness for the
 container.
 
+Alerts are routed by Alertmanager to a **second** Telegram bot, which is the
+whole point of the second bot: an alert saying the main one is blocked,
+throttled or holding a revoked token cannot be delivered by the main one. Set
+`ALERT_BOT_TOKEN` and `ALERT_CHAT_ID` in `.env` — without them the
+`alertmanager` container refuses to start, on purpose. The rest of the stack
+starts regardless, and the app degrades with a warning when its own
+`HEARTBEAT_URL` is missing, because an app with no heartbeat still does its
+job. Alertmanager has exactly one job, and an instance that runs without a way
+to reach anybody scrapes green on every dashboard while delivering nothing.
+
+Messages from it carry no parse mode at all. Every other message here can
+afford HTML for the formatting; this one cannot, because a stray character in
+somebody's alert text would make Telegram answer `400 can't parse entities` and
+drop the one message whose subject is that messages are not arriving.
+
 ```bash
 make run        # run against a local Go toolchain instead
 make test       # unit tests; database tests skip without TEST_DATABASE_URL
@@ -140,7 +156,7 @@ behind. Without `TEST_DATABASE_URL` they skip rather than fail, keeping
 | ✅ S3 | Subscriptions, `/list`, `/stop` |
 | ✅ S4 | Release detection |
 | ✅ S5 | Delivery: outbox drain, pacing, failure classification |
-| 🔄 S6 | Production: dead-man's switch ✅, metrics ✅, logs, VPS — **v1 done** |
+| 🔄 S6 | Production: dead-man's switch ✅, metrics ✅, logs ✅, alert routing ✅, VPS — **v1 done** |
 | ⬜ S11 | Rank search results by metadata completeness, not score |
 | ⬜ S12 | Dead-letter handling for poison messages (with the v2 broker) |
 | ⬜ S8–S10 | Extension: linking API, subscribe from Spotify, publish |
@@ -155,7 +171,7 @@ internal/notify/       the channel boundary — no Telegram types allowed here
 internal/notifier/     drains the outbox; decides what a failure costs
 internal/health/       worker liveness and the external dead-man's switch
 internal/metrics/      Prometheus collectors; two of them read at scrape time
-deploy/                Prometheus scrape config, alert rules, Grafana datasource
+deploy/                Prometheus scrape config, alert rules, Alertmanager routing, Grafana
 internal/httpx/        HTTP surface (health now, extension API in S8)
 spike/                 throwaway proof-of-concept; delete after S8
 SPEC.md                source of truth: requirements, constraints, decisions
