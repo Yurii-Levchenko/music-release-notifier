@@ -45,12 +45,38 @@ receivers:
         # the formatting. This one cannot: it is the message that reports that
         # messages are not arriving.
         parse_mode: ''
+        # Two things here were wrong in the first version, and only showed up
+        # once real messages arrived on a phone.
+        #
+        # A resolved alert used to repeat the firing text verbatim, so
+        # "RESOLVED" was followed by "delivery is failing, check the bot token"
+        # in the present tense. Annotations are written about a problem, and
+        # replaying them after it ends says the opposite of what happened. The
+        # resolved branch now reports only what recovered and when.
+        #
+        # And every message carries the alert's own start time, because
+        # Telegram's timestamp is the delivery time and the two are not the
+        # same. Measured on the first real alert: AlertDeliveryFailing began at
+        # 15:38 and was delivered at 16:19, 41 minutes later — since it fires
+        # precisely when alerting is broken, the gap is largest exactly when the
+        # timestamp matters most.
+        #
+        # Times are UTC and say so. Local time would need no arithmetic on a
+        # phone, but slog writes UTC, so every log line you would cross-check
+        # against is in UTC too, and having the one timestamp you read during an
+        # incident disagree with all the others is the worse trade.
         message: |-
           {{ if eq .Status "firing" }}FIRING{{ else }}RESOLVED{{ end }} — {{ .Alerts | len }} alert(s)
           {{ range .Alerts }}
+          {{- if eq .Status "firing" }}
           [{{ .Labels.severity }}] {{ .Labels.alertname }}
           {{ .Annotations.summary }}
           {{- with .Annotations.description }}
           {{ . }}
+          {{- end }}
+          firing since {{ .StartsAt.UTC.Format "15:04 UTC, Mon 2 Jan" }}
+          {{- else }}
+          {{ .Labels.alertname }} recovered
+          was firing {{ .StartsAt.UTC.Format "15:04" }} → {{ .EndsAt.UTC.Format "15:04 UTC, Mon 2 Jan" }}
           {{- end }}
           {{ end }}
