@@ -8,9 +8,11 @@ message when a new album, single or EP lands.
 
 **Go · PostgreSQL · ListenBrainz / MusicBrainz**
 
-> Status: **S0–S5 merged**, S6 in progress — the bot sends on its own, an
-> external dead-man's switch watches whether it still can, and a week of real
-> use has been folded back in.
+> Status: **S0–S5 done**, S6 in progress. The bot detects releases, delivers
+> them, and reports on itself through metrics, logs and an external dead-man's
+> switch. What is left of S6 needs decisions rather than code: a
+> healthchecks.io URL, a second bot token for alert delivery, and a VPS —
+> until that last one, it runs only while this laptop does.
 
 ---
 
