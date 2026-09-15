@@ -114,7 +114,16 @@ Alerts are routed by Alertmanager to a **second** Telegram bot, which is the
 whole point of the second bot: an alert saying the main one is blocked,
 throttled or holding a revoked token cannot be delivered by the main one. Set
 `ALERT_BOT_TOKEN` and `ALERT_CHAT_ID` in `.env` — without them the
-`alertmanager` container refuses to start, on purpose. The rest of the stack
+`alertmanager` container refuses to start, on purpose.
+
+```bash
+make alert-chat-id
+```
+
+Message the bot once first; Telegram only reports chats that have spoken to it,
+and a bot cannot message anyone first. Getting the id this way rather than by
+opening `api.telegram.org/bot<TOKEN>/getUpdates` keeps a live credential out of
+the browser address bar, and out of the history that syncs with it. The rest of the stack
 starts regardless, and the app degrades with a warning when its own
 `HEARTBEAT_URL` is missing, because an app with no heartbeat still does its
 job. Alertmanager has exactly one job, and an instance that runs without a way
