@@ -80,6 +80,15 @@ func (b *Bot) handleSearch(ctx context.Context, chatID int64, query string, log 
 		b.reply(ctx, chatID, "Занадто довгий запит. Спробуй лише назву виконавця.", log)
 		return
 	}
+	// A pasted link is never an artist name, and sending it upstream spends a
+	// rate-limited request to get five unrelated artists back — which is what
+	// happened on 12.09.2026 with a Spotify track URL. Answered here, before
+	// the cache and before MusicBrainz, because there is nothing to look up.
+	if link, spotify := classifyLink(query); link {
+		log.Info("query was a link, not a name", "spotify", spotify)
+		b.reply(ctx, chatID, linkText(spotify), log)
+		return
+	}
 
 	started := time.Now()
 

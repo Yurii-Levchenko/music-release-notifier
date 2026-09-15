@@ -34,3 +34,26 @@ func noResultsText(query string) string {
 			"Спробуй іншу назву — або перевір написання на musicbrainz.org.",
 		html.EscapeString(query))
 }
+
+// linkText answers a pasted URL.
+//
+// This is not a hypothetical input. A Spotify track link was pasted into this
+// bot on 12.09.2026, went upstream as a search query, and came back with five
+// unrelated artists — the search cache still holds the row. Reaching for a
+// Spotify link is the natural thing to do in a bot about music releases, and
+// answering it with nonsense teaches nothing about what would work.
+//
+// Spotify gets its own sentence because it is the link people actually have,
+// and because "not supported" and "not supported yet" are different promises.
+// Resolving one is not a small feature: the Web API needs an app owner with
+// active Premium (C12), and the developer terms forbid passing Spotify content
+// to another service (C28). The extension in S9 goes the other way round —
+// subscribing from inside Spotify — which is why this says nothing about when.
+func linkText(spotify bool) string {
+	if spotify {
+		return "Я шукаю виконавців за іменем, а не за посиланням — прочитати лінк " +
+			"Spotify я поки не вмію.\n\nНапиши ім'я виконавця, і я знайду його."
+	}
+	return "Це схоже на посилання. Я шукаю виконавців за іменем — " +
+		"напиши, будь ласка, саме ім'я."
+}
