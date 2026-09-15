@@ -1,0 +1,56 @@
+# Rendered at container start by entrypoint.sh. ${ALERT_BOT_TOKEN} and
+# ${ALERT_CHAT_ID} come from .env; the rendered copy lands in /tmp, so neither
+# the credential nor a personal Telegram id is ever written into this repo.
+#
+# The alert bot is deliberately a SECOND bot, not the one users talk to. If the
+# main token is revoked, rate limited or simply wrong, that is exactly the
+# incident worth hearing about — and it cannot be reported through the thing
+# that is broken.
+
+route:
+  receiver: telegram
+  # Grouped by name and severity, not by instance. There is one instance, so
+  # grouping by it would put every alert in its own message and undo the
+  # batching entirely.
+  group_by: [alertname, severity]
+  group_wait: 30s
+  group_interval: 5m
+  # 12h, against the 4h default. One operator who has already read the message
+  # does not need it four times a day, and a repeat that frequent trains you to
+  # swipe it away — which is how the real one gets missed.
+  repeat_interval: 12h
+  routes:
+    # Critical means delivery has stopped or somebody's subscriptions are being
+    # deleted. No batching delay, and a repeat frequent enough to stay
+    # uncomfortable until it is dealt with.
+    - matchers: ['severity="critical"']
+      receiver: telegram
+      group_wait: 0s
+      repeat_interval: 1h
+
+receivers:
+  - name: telegram
+    telegram_configs:
+      - bot_token: ${ALERT_BOT_TOKEN}
+        chat_id: ${ALERT_CHAT_ID}
+        # Recovery is information too: without it the only way to learn an
+        # alert cleared is that it stopped repeating, which is indistinguishable
+        # from alerting having broken.
+        send_resolved: true
+        # No parse mode, on purpose. HTML and MarkdownV2 both mean a message can
+        # fail to send because of a character inside alert text — Telegram
+        # answers 400 "can't parse entities" and the notification is simply
+        # dropped, which SPEC §10 classifies as our bug rather than something to
+        # retry. Every other message in this project can afford that risk for
+        # the formatting. This one cannot: it is the message that reports that
+        # messages are not arriving.
+        parse_mode: ''
+        message: |-
+          {{ if eq .Status "firing" }}FIRING{{ else }}RESOLVED{{ end }} — {{ .Alerts | len }} alert(s)
+          {{ range .Alerts }}
+          [{{ .Labels.severity }}] {{ .Labels.alertname }}
+          {{ .Annotations.summary }}
+          {{- with .Annotations.description }}
+          {{ . }}
+          {{- end }}
+          {{ end }}

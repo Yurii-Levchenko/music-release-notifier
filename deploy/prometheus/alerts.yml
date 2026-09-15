@@ -73,6 +73,30 @@ groups:
             New releases are not being detected. Subscribers are silently
             getting nothing.
 
+      - alert: AlertDeliveryFailing
+        # The one alert that cannot reach you by the route it is describing: if
+        # Telegram delivery is broken, this notification takes the broken path
+        # too. It is here anyway, because the counter still reaches Prometheus
+        # and the dashboard, so "alerting has been silently dead for a week"
+        # becomes something visible rather than something discovered during the
+        # next incident.
+        #
+        # absent() is the other half. A missing metric means Alertmanager is not
+        # being scraped at all — it refused to start for want of a bot token, or
+        # it is not running — and "no alerting configured" must be as loud as
+        # "alerting is erroring".
+        expr: >-
+          (sum(rate(alertmanager_notifications_failed_total[15m])) > 0)
+          or absent(alertmanager_notifications_total)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Alert delivery is failing, or Alertmanager is not running
+          description: >-
+            Alerts are being evaluated but may not be reaching anybody. Check
+            the alert bot token and that the alertmanager container is up.
+
       - alert: PermanentFailuresSpiking
         # Permanent means somebody's subscriptions were deleted. A handful is
         # normal churn; a spike means we are deleting subscriptions we should

@@ -442,8 +442,8 @@
       "description": "stale-cache means the upstream was down and an expired answer was served. It looks like success to the reader and must not look like success here.",
       "gridPos": {
         "h": 8,
-        "w": 8,
-        "x": 8,
+        "w": 12,
+        "x": 12,
         "y": 21
       },
       "datasource": {
@@ -467,6 +467,69 @@
           }
         },
         "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Alert delivery",
+      "description": "Whether alerting itself works. Failed Alertmanager notifications in the last hour; -1 means Alertmanager is not being scraped at all, which is what a missing bot token looks like. This is the one number that cannot report its own failure by Telegram, because that message would take the broken path - so it is here instead.",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 29
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "releaseradar-prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(alertmanager_notifications_failed_total[1h])) or vector(-1)",
+          "legendFormat": "failed"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "-1": {
+                  "text": "NOT RUNNING",
+                  "color": "red",
+                  "index": 0
+                },
+                "0": {
+                  "text": "delivering",
+                  "color": "green",
+                  "index": 1
+                }
+              }
+            },
+            {
+              "type": "range",
+              "options": {
+                "from": 1,
+                "to": null,
+                "result": {
+                  "color": "red",
+                  "index": 2
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
       }
     },
     {
@@ -501,9 +564,9 @@
       "description": "Share of searches answered without touching MusicBrainz. stale-cache is excluded from the numerator on purpose: it is a hit, but of expired data served because the upstream was down, and counting it as healthy would hide an outage.",
       "gridPos": {
         "h": 8,
-        "w": 4,
-        "x": 4,
-        "y": 21
+        "w": 6,
+        "x": 12,
+        "y": 29
       },
       "datasource": {
         "type": "prometheus",

@@ -7,7 +7,29 @@ global:
 rule_files:
   - /etc/prometheus/alerts.yml
 
+# Where a firing rule goes. Prometheus evaluates, Alertmanager decides who hears
+# about it — grouping, repeat intervals and silences all live there, which is
+# why the rules below stay declarative and say nothing about delivery.
+#
+# Unreachable is survivable: Prometheus keeps evaluating and retries delivery,
+# so an Alertmanager that is missing or restarting costs notifications, not
+# metrics. That is also why the compose file gives Prometheus no depends_on —
+# Alertmanager refuses to start without a bot token, and metrics must not stop
+# being collected because alert delivery is unconfigured.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
 scrape_configs:
   - job_name: releaseradar
     static_configs:
       - targets: ["app:8080"]
+
+  # Alertmanager reporting on itself. It cannot tell us through Telegram that
+  # Telegram delivery is failing — that message would take the broken path — but
+  # the counter still lands in Prometheus, so the dashboard can show whether
+  # alerting is actually working rather than merely running.
+  - job_name: alertmanager
+    static_configs:
+      - targets: ["alertmanager:9093"]
