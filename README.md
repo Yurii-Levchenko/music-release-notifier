@@ -140,6 +140,38 @@ make test       # unit tests; database tests skip without TEST_DATABASE_URL
 make psql       # psql shell into the container
 ```
 
+### Proving the dead-man's switch actually works
+
+The heartbeat's value is entirely in what it does **not** send, and that half is
+invisible in normal operation — a switch wired to nothing looks exactly like a
+healthy one until the day it matters. Verified end to end on 16.09.2026 against
+a local receiver, and reproducible:
+
+```bash
+docker run -d --name hb-receiver --network music_release_notifier_default python:3-alpine python -m http.server 8000
+HEARTBEAT_URL=http://hb-receiver:8000/ HEARTBEAT_INTERVAL=15s docker compose up -d app
+docker logs -f hb-receiver          # a GET every 15s, 200
+```
+
+Then take away the thing it reports on — **this stops Postgres**, so do it on a
+dev machine and not while anything matters:
+
+```bash
+docker compose stop db
+docker compose logs -f app | grep withholding
+```
+
+The pings stop and the app logs `withholding heartbeat: a worker is not healthy`
+with `unhealthy: database`. It is alive and could ping; it declines, because it
+cannot do its job. `docker compose start db` and the pings resume within
+seconds. Clean up with `docker rm -f hb-receiver` and `docker compose up -d app`
+to drop the override.
+
+One thing that fell out of doing this: pointing `HEARTBEAT_URL` at a path that
+returns 404 is treated as a **failed** ping, not a successful one. A typo in the
+URL therefore reads as a dead process rather than as health, which is the safe
+direction for it to fail in.
+
 ### Backups
 
 A `backup` container dumps the database on a schedule. It is not behind the
