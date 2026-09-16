@@ -20,11 +20,22 @@ type Server struct {
 	pool    *pgxpool.Pool
 	health  *health.Registry
 	metrics prometheus.Gatherer
+	api     *API
 	log     *slog.Logger
 }
 
 func New(pool *pgxpool.Pool, registry *health.Registry, gatherer prometheus.Gatherer, log *slog.Logger) *Server {
 	return &Server{pool: pool, health: registry, metrics: gatherer, log: log}
+}
+
+// WithAPI mounts the extension endpoints (SPEC §7).
+//
+// Optional rather than a constructor argument: without a bot token there is no
+// bot, and a /link/init that hands out deep links to a bot nobody is running
+// would be worse than a 404.
+func (s *Server) WithAPI(api *API) *Server {
+	s.api = api
+	return s
 }
 
 func (s *Server) Routes() http.Handler {
@@ -41,6 +52,10 @@ func (s *Server) Routes() http.Handler {
 			// one unreadable queue should not blind every other metric.
 			ErrorHandling: promhttp.ContinueOnError,
 		}))
+	}
+
+	if s.api != nil {
+		s.api.routes(mux)
 	}
 	return s.withLogging(mux)
 }
