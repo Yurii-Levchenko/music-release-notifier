@@ -15,6 +15,8 @@ import (
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/metrics"
 
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/notify"
+
+	"github.com/Yurii-Levchenko/music-release-notifier/internal/storage"
 )
 
 // UserStore is the slice of storage the bot actually needs. Declared here, as a
@@ -50,6 +52,10 @@ type Bot struct {
 
 	// catchUp is optional; nil disables the recent-release lookup on subscribe.
 	catchUp CatchUp
+
+	// linking is optional; nil means extension linking is unavailable, and the
+	// bot says so rather than accepting a code it cannot redeem.
+	linking LinkRedeemer
 }
 
 // CatchUp queues anything an artist released in the last few days for a
@@ -315,6 +321,14 @@ func (b *Bot) handleMessage(ctx context.Context, msg *telego.Message) {
 	case "/stop":
 		b.handleStop(ctx, chatID, args, log)
 	case "":
+		// A link code is six characters from an unambiguous alphabet, so ruling
+		// it out is free and saves a rate-limited MusicBrainz request. Shape
+		// alone decides nothing: only a code matching a live token is consumed,
+		// so a six-letter artist name still reaches the search.
+		if storage.LooksLikeShortCode(args) &&
+			b.tryRedeem(ctx, chatID, usernameOf(msg.From), args, log) {
+			return
+		}
 		// Plain text is the common case: people type a name, not a command.
 		b.handleSearch(ctx, chatID, args, log)
 	default:
@@ -339,12 +353,20 @@ func (b *Bot) onStart(ctx context.Context, chatID int64, from *telego.User, payl
 	log.Info("user started", "user_id", userID, "has_payload", payload != "")
 
 	if payload != "" {
-		// The extension linking flow lands here in S8. Acknowledge rather than
-		// silently ignore, so a stale deep link is not confusing.
-		log.Info("start payload received but linking is not implemented yet")
-		b.reply(ctx, chatID,
-			"Прив'язка розширення Spotify ще не готова — вона з'явиться пізніше.\n"+
-				"Але сам бот уже працює: /help", log)
+		// A deep link is unambiguously a link attempt, so a payload that does
+		// not redeem is told so. Falling through to the welcome text would look
+		// exactly like the button in the extension having done nothing.
+		if b.linking == nil {
+			log.Warn("start payload received but linking is not configured")
+			b.reply(ctx, chatID,
+				"Підключення розширення зараз недоступне. Сам бот працює: /help", log)
+			return
+		}
+		if b.tryRedeem(ctx, chatID, username, payload, log) {
+			return
+		}
+		log.Info("start payload did not redeem")
+		b.reply(ctx, chatID, linkExpiredText(), log)
 		return
 	}
 

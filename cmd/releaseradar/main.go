@@ -202,9 +202,25 @@ func run() error {
 		Client:        mb,
 	})
 
+	// The extension API (S8). Mounted only alongside a bot, because linking
+	// ends in Telegram: /link/init would otherwise hand out a deep link to a
+	// bot nobody is running, which fails at the one step the user can see.
+	httpServer := httpx.New(pool, healthReg, promReg, log)
+	if bot != nil {
+		linking := storage.NewLinking(pool)
+		bot.WithLinking(linking)
+		httpServer = httpServer.WithAPI(httpx.NewAPI(
+			linking,
+			storage.NewSubscriptions(pool),
+			bot.Username,
+			log,
+		))
+		log.Info("extension API mounted", "base", "/v1")
+	}
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpx.New(pool, healthReg, promReg, log).Routes(),
+		Handler:           httpServer.Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}

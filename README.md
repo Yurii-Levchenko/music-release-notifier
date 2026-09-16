@@ -226,7 +226,8 @@ behind. Without `TEST_DATABASE_URL` they skip rather than fail, keeping
 | 🔄 S6 | Production: dead-man's switch ✅, metrics ✅, logs ✅, alert routing ✅, backups ✅, VPS — **v1 done** |
 | ❌ S11 | Ranking by metadata completeness — **measured and dropped**: the right artist was already first in 18 of 18 real searches |
 | ⬜ S12 | Dead-letter handling for poison messages (with the v2 broker) |
-| ⬜ S8–S10 | Extension: linking API, subscribe from Spotify, publish |
+| 🔄 S8 | Linking API: `/v1/link/init`, redemption in the bot, `/v1/me`, CORS |
+| ⬜ S9–S10 | Extension: subscribe from Spotify, publish |
 
 ## Repo layout
 
@@ -240,7 +241,7 @@ internal/health/       worker liveness and the external dead-man's switch
 internal/backup/       reads the dump directory; makes no backups itself
 internal/metrics/      Prometheus collectors; two of them read at scrape time
 deploy/                Prometheus scrape config, alert rules, Alertmanager routing, Grafana
-internal/httpx/        HTTP surface (health now, extension API in S8)
+internal/httpx/        HTTP surface: health, plus the extension API under /v1
 spike/                 throwaway proof-of-concept; delete after S8
 SPEC.md                source of truth: requirements, constraints, decisions
 ```

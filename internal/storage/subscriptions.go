@@ -300,3 +300,17 @@ func (s *Subscriptions) UnsubscribeMany(ctx context.Context, chatID int64, mbids
 	}
 	return int(tag.RowsAffected()), nil
 }
+
+// CountForUser returns how many artists a user follows, by internal user id.
+//
+// Keyed by user_id rather than chat id, unlike everything else here: the caller
+// is the extension API, which has already resolved an install to a user and
+// would otherwise have to translate back into a chat id it has no use for.
+func (s *Subscriptions) CountForUser(ctx context.Context, userID int64) (int, error) {
+	var n int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM subscriptions WHERE user_id = $1`, userID).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count subscriptions for user %d: %w", userID, err)
+	}
+	return n, nil
+}
