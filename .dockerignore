@@ -1,0 +1,24 @@
+# What the image build may not see.
+#
+# The Dockerfile's COPY . . ships the whole context into a build layer, and
+# BuildKit caches layers. Without this file .env and full database dumps were
+# being copied into that cache on every build — and because each new dump
+# changed the context, the layer never hit, so every `make up` rebuilt from
+# scratch (review 16.09, Ops #6). The build needs go.mod, go.sum, cmd/ and
+# internal/ (migrations are embedded from there); nothing below is read by it.
+.env
+.env.*
+backups/
+.git/
+.github/
+.cursor/
+spike/
+deploy/
+docs/
+*.md
+*.excalidraw
+Makefile
+.golangci.yml
+.gitattributes
+.gitignore
+.dockerignore

@@ -219,9 +219,15 @@ func run() error {
 	}
 
 	srv := &http.Server{
-		Addr:              cfg.HTTPAddr,
-		Handler:           httpServer.Routes(),
+		Addr:    cfg.HTTPAddr,
+		Handler: httpServer.Routes(),
+		// ReadHeaderTimeout alone bounds only the header. A client sending its
+		// /link/init body one byte a minute could hold a connection for as
+		// long as it liked; ReadTimeout closes that, and WriteTimeout bounds a
+		// stalled /metrics scrape the same way (review 16.09, Security #3).
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 

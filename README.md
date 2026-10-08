@@ -83,10 +83,14 @@ way of a locally installed PostgreSQL.
 docker compose --profile observability up -d
 ```
 
-Grafana on **3001** (anonymous viewer) is the only published port. Prometheus,
-Loki and the app's `/metrics` all stay on the compose network — `/metrics`
-carries queue depths and chat volumes, and every port not published is one
-fewer chance to lose a container to a bind race on startup. That is not
+Every published port is bound to the loopback address — Grafana on **3001**,
+the app on **8090** (`/metrics`, `/status`, `/v1`) and Postgres on **5433** —
+so nothing is reachable from the network without a deliberate proxy. That was
+not true until 16.09: both the app and Postgres sat on `0.0.0.0`, and Postgres
+accepted the example password. Prometheus, Loki and Alertmanager are not
+published at all: `/metrics` carries queue depths and chat volumes, and every
+port not published is one fewer chance to lose a container to a bind race on
+startup. That is not
 hypothetical: Prometheus died that way on 9091 and stayed dead for six days.
 
 Logs go to Loki through Grafana Alloy, read over the Docker API rather than
@@ -213,7 +217,7 @@ The interesting tests assert database invariants, because that is where
 correctness lives:
 
 ```bash
-export TEST_DATABASE_URL='postgres://releaseradar:change-me-locally@localhost:5433/releaseradar?sslmode=disable'
+set -a; . ./.env; set +a      # TEST_DATABASE_URL lives in .env, with the real password
 go test ./... -count=1
 ```
 

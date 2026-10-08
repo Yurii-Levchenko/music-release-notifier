@@ -17,6 +17,30 @@ import (
 // number under each. Twenty numbered buttons is three rows and still scannable.
 const listPageSize = 20
 
+// maxListPage bounds a page number before it becomes an OFFSET. Nobody has two
+// million subscriptions: a number this large came from a forged callback, and
+// multiplying it by listPageSize would overflow into a negative offset that
+// Postgres rejects with an error rather than a page.
+const maxListPage = 100_000
+
+func clampPage(page int) int {
+	switch {
+	case page < 0:
+		return 0
+	case page > maxListPage:
+		return maxListPage
+	}
+	return page
+}
+
+// lastPage is the page holding the final item of a list of total rows.
+func lastPage(total int) int {
+	if total <= 0 {
+		return 0
+	}
+	return (total - 1) / listPageSize
+}
+
 // Callback prefixes for subscription actions. The unsubscribe button carries a
 // full MBID rather than a handle: "unsub:" plus 36 characters is 42 bytes, well
 // inside Telegram's 64-byte cap (SPEC.md C6), so there is no reason to add an
@@ -242,9 +266,7 @@ func (b *Bot) renderListWith(
 	if msg == nil {
 		return
 	}
-	if page < 0 {
-		page = 0
-	}
+	page = clampPage(page)
 
 	items, total, err := b.subs.List(ctx, cq.From.ID, listPageSize, page*listPageSize)
 	if err != nil {
@@ -252,11 +274,21 @@ func (b *Bot) renderListWith(
 		return
 	}
 
-	// The last item on the last page can disappear under the user, leaving the
-	// page out of range. Step back rather than showing an empty screen.
-	if len(items) == 0 && page > 0 {
-		b.renderListWith(ctx, cq, page-1, nil, log)
-		return
+	// The page can be out of range for two reasons: the last item on the last
+	// page vanished under the user, or the number came from a forged callback.
+	// One clamped re-query covers both. This used to step back a page and
+	// recurse, which made the depth equal to the page number: a callback of
+	// list:100000000 was a hundred million queries from one tap, on a loop
+	// that handles updates one at a time (review 16.09, Security #2).
+	if len(items) == 0 && total > 0 && page > 0 {
+		page = lastPage(total)
+		items, _, err = b.subs.List(ctx, cq.From.ID, listPageSize, page*listPageSize)
+		if err != nil {
+			log.Error("list subscriptions failed", "err", err)
+			return
+		}
+		// Whatever was ticked referred to a page that no longer exists.
+		sel = nil
 	}
 
 	drawn := newSelection(page, items)

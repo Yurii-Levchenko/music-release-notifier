@@ -1,5 +1,6 @@
-# Scrapes the app over the compose network. /metrics is never published to the
-# host, so queue depths and chat volumes are not readable from outside.
+# Scrapes the app over the compose network. /metrics reaches the host only on
+# the loopback address, so queue depths and chat volumes are not readable from
+# the network.
 global:
   scrape_interval: 15s
   evaluation_interval: 15s

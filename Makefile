@@ -9,9 +9,15 @@ lint:     ; golangci-lint run
 
 test:     ; go test ./... -count=1
 # Runs the database invariant tests too. Needs `make up` first.
+#
+# TEST_DATABASE_URL comes from .env, not from a literal here: the password is a
+# real one now that compose refuses the example value (review 16.09, Security
+# #1). No -race locally either — it needs cgo, which this Windows toolchain
+# lacks (CLAUDE.md); CI runs the suite with -race.
 test-db:
-	TEST_DATABASE_URL='postgres://releaseradar:change-me-locally@localhost:5433/releaseradar?sslmode=disable' \
-	go test ./... -race -count=1
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+	[ -n "$$TEST_DATABASE_URL" ] || { echo "TEST_DATABASE_URL is not set - put it in .env"; exit 1; }; \
+	go test ./... -count=1
 
 # Everything CI checks, in the order CI checks it. Run before opening a PR.
 check: fmt vet lint test-db

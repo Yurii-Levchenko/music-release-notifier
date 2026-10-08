@@ -2,9 +2,11 @@ package health
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -33,12 +35,12 @@ type Heartbeat struct {
 	log      *slog.Logger
 }
 
-func NewHeartbeat(url string, interval time.Duration, registry *Registry, log *slog.Logger) *Heartbeat {
+func NewHeartbeat(pingURL string, interval time.Duration, registry *Registry, log *slog.Logger) *Heartbeat {
 	if interval <= 0 {
 		interval = DefaultInterval
 	}
 	return &Heartbeat{
-		url:      url,
+		url:      pingURL,
 		interval: interval,
 		registry: registry,
 		client:   &http.Client{Timeout: pingTimeout},
@@ -98,7 +100,13 @@ func (h *Heartbeat) beatOnce(ctx context.Context) {
 		// A failed ping looks identical to a dead process from the outside, so
 		// there is nothing to do but say so. It resolves itself on the next
 		// interval if the network was the problem.
-		h.log.Warn("heartbeat ping failed", "err", err)
+		//
+		// The URL is stripped first. *url.Error prints the full request URL,
+		// and the ping URL is the secret here: whoever holds it can keep the
+		// monitor quiet while the process is down. Any network blip would
+		// otherwise copy it into stdout, and from there into Loki for 30 days
+		// (review 16.09, Security #6).
+		h.log.Warn("heartbeat ping failed", "err", withoutURL(err))
 		return
 	}
 	h.log.Debug("heartbeat sent")
@@ -132,4 +140,14 @@ type pingError struct{ code int }
 
 func (e *pingError) Error() string {
 	return "heartbeat endpoint returned " + http.StatusText(e.code)
+}
+
+// withoutURL unwraps a *url.Error to its cause so the ping URL never reaches a
+// log line. Anything else passes through unchanged.
+func withoutURL(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return ue.Err
+	}
+	return err
 }
