@@ -82,6 +82,15 @@ type Metrics struct {
 	// --- bot ---
 
 	BotUpdates *prometheus.CounterVec
+
+	// --- the monitoring itself ---
+
+	// HeartbeatEnabled is 1 while the process pings the external dead-man's
+	// switch. That switch is the only alarm that survives the whole machine
+	// going down, and on 16.09 a misspelled .env key turned it off twice in
+	// one evening without a sound — so whether it is on is itself worth an
+	// alert.
+	HeartbeatEnabled prometheus.Gauge
 }
 
 // New registers every collector on reg and returns them.
@@ -176,6 +185,12 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name:      "bot_updates_total",
 			Help:      "Telegram updates handled, by kind.",
 		}, "kind"),
+
+		HeartbeatEnabled: factory.gauge(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "heartbeat_enabled",
+			Help:      "1 if the external dead-man's switch is being pinged, 0 if it is disabled.",
+		}),
 	}
 
 	m.initSeries()
@@ -275,6 +290,12 @@ func (p promauto) counterVec(opts prometheus.CounterOpts, labels ...string) *pro
 	c := prometheus.NewCounterVec(opts, labels)
 	p.register(c)
 	return c
+}
+
+func (p promauto) gauge(opts prometheus.GaugeOpts) prometheus.Gauge {
+	g := prometheus.NewGauge(opts)
+	p.register(g)
+	return g
 }
 
 func (p promauto) histogram(opts prometheus.HistogramOpts) prometheus.Histogram {

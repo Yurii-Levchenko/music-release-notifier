@@ -167,6 +167,14 @@ jobs:
         run: |
           docker run --rm -v "$PWD/deploy/prometheus:/rules:ro"             --entrypoint promtool prom/prometheus:v3.7.3             check rules /rules/alerts.yml
 
+      - name: promtool test rules
+        # Behaviour, not syntax: each case in alerts_test.yml is a situation
+        # that has happened (a dead app, a 20-day backup gap). Against the
+        # rules before 08.10 the dead-app case fails — BackupStale and
+        # PollerStalled fired on a stale series and said something untrue.
+        run: |
+          docker run --rm -v "$PWD/deploy/prometheus:/rules:ro" -w /rules --entrypoint promtool prom/prometheus:v3.7.3 test rules alerts_test.yml
+
       - name: promtool check config
         # Also validates that alerts.yml is actually referenced by
         # prometheus.yml — a rules file nobody loads is worse than none.

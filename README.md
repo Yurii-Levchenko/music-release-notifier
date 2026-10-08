@@ -128,15 +128,34 @@ Message the bot once first; Telegram only reports chats that have spoken to it,
 and a bot cannot message anyone first. Getting the id this way rather than by
 opening `api.telegram.org/bot<TOKEN>/getUpdates` keeps a live credential out of
 the browser address bar, and out of the history that syncs with it. The rest of the stack
-starts regardless, and the app degrades with a warning when its own
-`HEARTBEAT_URL` is missing, because an app with no heartbeat still does its
-job. Alertmanager has exactly one job, and an instance that runs without a way
-to reach anybody scrapes green on every dashboard while delivering nothing.
+starts regardless. Alertmanager has exactly one job, and an instance that runs
+without a way to reach anybody scrapes green on every dashboard while
+delivering nothing.
 
-Messages from it carry no parse mode at all. Every other message here can
+The app is as strict about its own `HEARTBEAT_URL`: it refuses to start without
+one unless `HEARTBEAT_DISABLED=1` says so explicitly, and that state is itself
+an alert (`HeartbeatDisabled`). The first version degraded with one warning line
+instead, and a misspelled `.env` key switched the dead-man's switch off twice in
+one evening without anybody noticing.
+
+Alertmanager's messages carry no parse mode at all. Every other message here can
 afford HTML for the formatting; this one cannot, because a stray character in
 somebody's alert text would make Telegram answer `400 can't parse entities` and
 drop the one message whose subject is that messages are not arriving.
+
+Severity says what you have to do, not how bad it sounds: `critical` means
+people are not being notified right now and it will not heal on its own
+(repeats hourly); `warning` is a today problem (repeats once a day). Every
+firing message ends with the line that mutes it:
+
+```bash
+make silence ALERT=BackupStale FOR=24h
+make silences
+make unsilence ID=<id>
+```
+
+A silence expires on its own and survives restarts, which is why it is the
+tool for "I know, I'm on it" rather than editing the rule.
 
 ```bash
 make run        # run against a local Go toolchain instead

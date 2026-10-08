@@ -1,0 +1,140 @@
+# Unit tests for alerts.yml, run in CI with `promtool test rules`.
+#
+# The rules that matter most fire rarely, after a long `for:`, and only in the
+# situation they describe — which is the worst time to find out that one is
+# wrong. Each case here is a situation that has happened or nearly happened.
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # The app dies while Prometheus keeps running. Before AppDown existed this
+  # surfaced 30 minutes later as PollerStalled and BackupStale, both claiming
+  # something untrue, because absent() fired once the app's series went stale.
+  # Now: exactly one alert, and it says what happened.
+  - name: a dead app is AppDown and nothing else
+    interval: 1m
+    input_series:
+      - series: 'up{job="releaseradar", instance="app:8080"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: AppDown
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: AppDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: releaseradar
+              instance: app:8080
+            exp_annotations:
+              summary: The app is down
+              description: "Prometheus cannot scrape it. Nothing is being polled, delivered or answered. Check `docker compose ps` and the app's logs."
+      - eval_time: 45m
+        alertname: BackupStale
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: PollerStalled
+        exp_alerts: []
+
+  # A boot loses the race to a database that is still starting, and the app
+  # restarts for ~20 s. That is not an incident.
+  - name: a short restart is not AppDown
+    interval: 1m
+    input_series:
+      - series: 'up{job="releaseradar", instance="app:8080"}'
+        values: '1 0 0 1x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: AppDown
+        exp_alerts: []
+
+  # The app is up but publishes no backup metric: the directory is unreadable
+  # or BACKUP_DIR was never set. "No backups at all" must fire — as a warning.
+  - name: no backup metric while the app is up
+    interval: 1m
+    input_series:
+      - series: 'up{job="releaseradar", instance="app:8080"}'
+        values: '1x60'
+      - series: 'releaseradar_poller_last_success_timestamp_seconds{job="releaseradar", instance="app:8080"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: BackupStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: No verified database backup in over 48 hours
+              description: "Every subscription, artist and release lives in one Postgres volume on one machine. Check `docker compose logs backup`."
+
+  # The 16.09–06.10 case: the newest dump keeps getting older. Warning, not
+  # critical — it was ~134 hourly messages in 21 days as a critical.
+  # 5m, not coarser: Prometheus looks back 5 minutes for a sample, so a sparser
+  # series goes stale between points and keeps resetting `for:`.
+  - name: an old backup is a warning
+    interval: 5m
+    input_series:
+      - series: 'up{job="releaseradar", instance="app:8080"}'
+        values: '1x600'
+      - series: 'releaseradar_backup_last_success_timestamp_seconds{job="releaseradar", instance="app:8080"}'
+        values: '0x600'
+      - series: 'releaseradar_poller_last_success_timestamp_seconds{job="releaseradar", instance="app:8080"}'
+        values: '0+300x600'
+    alert_rule_test:
+      - eval_time: 47h
+        alertname: BackupStale
+        exp_alerts: []
+      - eval_time: 49h
+        alertname: BackupStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: releaseradar
+              instance: app:8080
+            exp_annotations:
+              summary: No verified database backup in over 48 hours
+              description: "Every subscription, artist and release lives in one Postgres volume on one machine. Check `docker compose logs backup`."
+      - eval_time: 49h
+        alertname: PollerStalled
+        exp_alerts: []
+
+  # The poller has not succeeded for over 25 hours while the app is up.
+  - name: a stalled poller is a warning
+    interval: 5m
+    input_series:
+      - series: 'up{job="releaseradar", instance="app:8080"}'
+        values: '1x400'
+      - series: 'releaseradar_poller_last_success_timestamp_seconds{job="releaseradar", instance="app:8080"}'
+        values: '0x400'
+    alert_rule_test:
+      - eval_time: 26h
+        alertname: PollerStalled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: releaseradar
+              instance: app:8080
+            exp_annotations:
+              summary: No successful poll in over 25 hours
+              description: "New releases are not being detected, so notifications are late. The 7-day window means nothing is lost if polling resumes this week."
+
+  # Running without the dead-man's switch is allowed, and never silent.
+  - name: a disabled heartbeat is a warning
+    interval: 1m
+    input_series:
+      - series: 'releaseradar_heartbeat_enabled{job="releaseradar", instance="app:8080"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: HeartbeatDisabled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: releaseradar
+              instance: app:8080
+            exp_annotations:
+              summary: The external dead-man's switch is off
+              description: "HEARTBEAT_DISABLED=1 is set, so nothing outside this machine will notice if it dies. Set HEARTBEAT_URL in .env."

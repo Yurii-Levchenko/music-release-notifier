@@ -134,7 +134,7 @@ func (p *Poller) Run(ctx context.Context) error {
 		if err != nil {
 			// A failed poll is not fatal. The window is wide enough that the
 			// next attempt still covers everything this one missed.
-			p.log.Error("poll failed", "err", err)
+			p.log.Error("poll failed", "err", err, "retry_in", p.nextPollIn(err).String())
 		} else {
 			p.log.Info("poll complete",
 				"fetched", stats.Fetched,
@@ -145,8 +145,24 @@ func (p *Poller) Run(ctx context.Context) error {
 				"notified", stats.Notified,
 				"seeded", stats.Seeded)
 		}
-		timer.Reset(p.interval)
+		timer.Reset(p.nextPollIn(err))
 	}
+}
+
+// failedPollRetry is how soon a failed poll is tried again.
+const failedPollRetry = time.Hour
+
+// nextPollIn is the full interval after a success and an hour after a failure.
+// The interval after a failure meant one ListenBrainz blip — or a laptop
+// resuming with no network yet — made every release a day late and kept
+// PollerStalled firing until the next day's attempt (review 16.09, Ops #8).
+// An hour, not minutes: the source is a daily feed, and the window is wide
+// enough that nothing is lost by waiting.
+func (p *Poller) nextPollIn(err error) time.Duration {
+	if err != nil && failedPollRetry < p.interval {
+		return failedPollRetry
+	}
+	return p.interval
 }
 
 func (p *Poller) initialDelay(ctx context.Context) time.Duration {

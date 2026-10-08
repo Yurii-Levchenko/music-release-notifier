@@ -662,7 +662,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "{service=\"app\", level=~\"WARN|ERROR\"}"
+          "expr": "{service=~\"app|backup\", level=~\"WARN|ERROR\"}"
         }
       ],
       "options": {

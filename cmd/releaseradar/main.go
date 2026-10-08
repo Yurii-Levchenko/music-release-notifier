@@ -264,6 +264,9 @@ func run() error {
 	// have caught the 14-hour outage on 29.08.2026, because it lives outside
 	// the process it watches.
 	beat := health.NewHeartbeat(cfg.HeartbeatURL, cfg.HeartbeatInterval, healthReg, log)
+	if cfg.HeartbeatURL != "" {
+		appMetrics.HeartbeatEnabled.Set(1)
+	}
 	g.Go(func() error { return beat.Run(gctx) })
 
 	// Shut the HTTP server down when anything else asks us to stop; without

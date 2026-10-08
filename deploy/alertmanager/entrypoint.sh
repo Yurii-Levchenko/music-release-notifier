@@ -49,6 +49,10 @@ if [ "${RENDER_ONLY:-}" = "1" ]; then
 	exit 0
 fi
 
+# An empty --cluster.listen-address turns HA gossip off. There is one
+# instance; with gossip on it advertised port 9094 to nobody and waited 10 s on
+# every start for peers that do not exist.
 exec /bin/alertmanager \
 	--config.file=/tmp/alertmanager.yml \
-	--storage.path=/alertmanager
+	--storage.path=/alertmanager \
+	--cluster.listen-address=

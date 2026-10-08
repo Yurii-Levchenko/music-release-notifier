@@ -21,11 +21,15 @@ type Config struct {
 	LogLevel  slog.Level
 
 	// HeartbeatURL is an external dead-man's switch (healthchecks.io or
-	// similar). Optional, and the process says so loudly when it is unset:
-	// an alert raised from inside the application cannot report that the
-	// application is dead (SPEC §15a).
+	// similar): an alert raised from inside the application cannot report
+	// that the application is dead (SPEC §15a). Required unless
+	// HeartbeatDisabled says otherwise — see Load.
 	HeartbeatURL      string
 	HeartbeatInterval time.Duration
+	// HeartbeatDisabled is the explicit way to run without the switch, for
+	// development. It is published as releaseradar_heartbeat_enabled = 0 and
+	// alerted on, so it cannot quietly outlive the reason it was set.
+	HeartbeatDisabled bool
 
 	// BackupDir is where the backup container writes its dumps, mounted
 	// read-only. Optional: unset simply means the backup metrics are not
@@ -44,6 +48,9 @@ func Load() (Config, error) {
 		LogLevel:         parseLevel(envOr("LOG_LEVEL", "info")),
 		HeartbeatURL:     os.Getenv("HEARTBEAT_URL"),
 		BackupDir:        os.Getenv("BACKUP_DIR"),
+		// "1" only. A truthiness parser would accept "false" or "0" as set,
+		// which is the opposite of what anybody typing them meant.
+		HeartbeatDisabled: os.Getenv("HEARTBEAT_DISABLED") == "1",
 	}
 
 	interval, err := parseDuration(envOr("HEARTBEAT_INTERVAL", "5m"))
@@ -66,6 +73,22 @@ func Load() (Config, error) {
 			"USER_AGENT should include a contact email, e.g. ReleaseRadar/0.1 ( you@example.com )")
 	}
 	// TELEGRAM_BOT_TOKEN is deliberately not required yet — S0 has no bot.
+
+	// An empty HEARTBEAT_URL used to mean one WARN line and an unmonitored
+	// process. On 16.09 the .env key was misspelled HEARTHBEAT_URL, fixed, and
+	// regressed by an editor saving a stale buffer — twice in one evening, each
+	// time switching the dead-man's switch off with nothing louder than that
+	// line, and healthchecks.io then reporting a live app as down. Refusing to
+	// start turns a typo into a crash loop, which AppDown and the switch itself
+	// both see at once.
+	if c.HeartbeatURL == "" && !c.HeartbeatDisabled {
+		problems = append(problems,
+			"HEARTBEAT_URL is required (set HEARTBEAT_DISABLED=1 to run without the dead-man's switch, e.g. in development)")
+	}
+	if c.HeartbeatURL != "" && c.HeartbeatDisabled {
+		problems = append(problems,
+			"HEARTBEAT_URL and HEARTBEAT_DISABLED=1 are both set; pick one")
+	}
 
 	if len(problems) > 0 {
 		return Config{}, errors.New("config: " + strings.Join(problems, "; "))

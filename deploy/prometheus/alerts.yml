@@ -2,13 +2,59 @@
 # the first Friday with real data (C36: Friday is 48.5% of releases and 5.6x an
 # average day, so a threshold tuned on a Tuesday will cry wolf on a Friday).
 #
-# Note what is deliberately NOT here: "the application is down". An alert
-# evaluated by a Prometheus that scrapes one target cannot distinguish a dead
-# app from a dead Prometheus. That job belongs to the external dead-man's
-# switch (S6.1), which lives outside this machine entirely.
+# Severity is about what the reader has to do, not how bad it sounds:
+#
+#   critical — people are not being notified right now, or are losing data
+#              right now, and it will not heal on its own. Repeats hourly.
+#   warning  — something degrades over hours or days and wants fixing today.
+#              Repeats once a day.
+#
+# BackupStale was critical until 08.10. It was always true when it fired —
+# backups really had failed for 20 days — but a backup that is two days old is
+# a today problem, not a this-minute one, and an hourly repeat turned one true
+# alert into ~134 messages in 21 days. That is how the next real one gets
+# swiped away.
+#
+# The machine being down is not here, and cannot be: a Prometheus on the same
+# machine dies with it. That is the external dead-man's switch's job (S6.1).
+# The app being down while Prometheus runs is here — see AppDown.
 groups:
   - name: releaseradar
     rules:
+      - alert: AppDown
+        # Prometheus sees a dead app perfectly well: up drops to 0. Before this
+        # rule a crashed app surfaced 30 minutes later as PollerStalled and
+        # BackupStale, both saying something untrue ("no poll in 25 hours"),
+        # because their absent() clauses fired once the series went stale.
+        # Those clauses are now guarded on up == 1, so a dead app reports as
+        # exactly one alert that says what happened.
+        #
+        # 3 minutes: on boot the app loses the race to a database that is still
+        # starting and restarts for ~20 s; that is not an incident.
+        expr: up{job="releaseradar"} == 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: The app is down
+          description: >-
+            Prometheus cannot scrape it. Nothing is being polled, delivered or
+            answered. Check `docker compose ps` and the app's logs.
+
+      - alert: HeartbeatDisabled
+        # Running without the dead-man's switch is allowed (HEARTBEAT_DISABLED=1,
+        # for development) but must not go unnoticed: it is the only alarm that
+        # survives the whole machine going down.
+        expr: releaseradar_heartbeat_enabled == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: The external dead-man's switch is off
+          description: >-
+            HEARTBEAT_DISABLED=1 is set, so nothing outside this machine will
+            notice if it dies. Set HEARTBEAT_URL in .env.
+
       - alert: QueueNotReadable
         expr: releaseradar_queue_readable == 0
         for: 2m
@@ -60,18 +106,23 @@ groups:
         # The timestamp comes from the database rather than from process
         # memory, so a deploy does not reset it. The absent() clause covers the
         # other case: the metric disappears when the poller has never
-        # succeeded, and "never ran" must alert as loudly as "stopped running".
+        # succeeded, and "never ran" must alert as loudly as "stopped running" —
+        # but only while the app is up; a dead app is AppDown's to report.
+        #
+        # Warning, not critical: the feed is read with a 7-day window, so a
+        # poll that resumes within the week loses nothing — releases arrive
+        # late, not never.
         expr: >-
           (time() - releaseradar_poller_last_success_timestamp_seconds > 90000)
-          or absent(releaseradar_poller_last_success_timestamp_seconds)
+          or (absent(releaseradar_poller_last_success_timestamp_seconds) and on() up{job="releaseradar"} == 1)
         for: 30m
         labels:
-          severity: critical
+          severity: warning
         annotations:
           summary: No successful poll in over 25 hours
           description: >-
-            New releases are not being detected. Subscribers are silently
-            getting nothing.
+            New releases are not being detected, so notifications are late. The
+            7-day window means nothing is lost if polling resumes this week.
 
       - alert: BackupStale
         # 48 hours, where the poller gets 25, and the gap is a consequence of a
@@ -82,20 +133,24 @@ groups:
         # Tighten it to 26h the day this moves to a machine that stays on.
         #
         # absent() is the half that matters most. A missing metric means the
-        # directory could not be read, BACKUP_DIR was never set, or the backup
-        # container is not running — and "there are no backups at all" has to be
-        # at least as loud as "the backups are old".
+        # directory could not be read or BACKUP_DIR was never set — and "there
+        # are no backups at all" has to be at least as loud as "the backups are
+        # old". Guarded on up == 1: the metric is published by the app, so a
+        # dead app makes it absent too, and that is AppDown's to report.
+        #
+        # Warning: nothing is lost while it fires, only exposed. A daily repeat
+        # is enough to get it fixed; an hourly one was enough to get it ignored.
         expr: >-
           (time() - releaseradar_backup_last_success_timestamp_seconds > 172800)
-          or absent(releaseradar_backup_last_success_timestamp_seconds)
+          or (absent(releaseradar_backup_last_success_timestamp_seconds) and on() up{job="releaseradar"} == 1)
         for: 30m
         labels:
-          severity: critical
+          severity: warning
         annotations:
           summary: No verified database backup in over 48 hours
           description: >-
             Every subscription, artist and release lives in one Postgres volume
-            on one machine. Check the backup container's logs.
+            on one machine. Check `docker compose logs backup`.
 
       - alert: BackupRotationStuck
         # Rotation only runs after a successful dump, which is deliberate — a
