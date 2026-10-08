@@ -175,6 +175,25 @@ jobs:
         run: |
           docker run --rm             -v "$PWD/deploy/alertmanager:/etc/alertmanager:ro"             -e ALERT_BOT_TOKEN=123456:ci-not-a-real-token             -e ALERT_CHAT_ID=1             -e RENDER_ONLY=1             --entrypoint sh prom/alertmanager:v0.28.1             -c '/bin/sh /etc/alertmanager/entrypoint.sh && amtool check-config /tmp/alertmanager.yml'
 
+  # The deploy scripts run as PID 1 or as entrypoints, where a mistake does not
+  # crash anything visible: backup.sh slept through 20 days of failed dumps.
+  # sh -n catches what shellcheck parses differently from busybox ash.
+  scripts:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: |
+          docker run --rm -v "$PWD/deploy:/deploy:ro" koalaman/shellcheck:v0.10.0 -s sh /deploy/backup/backup.sh /deploy/alertmanager/entrypoint.sh /deploy/alertmanager/chat-id.sh
+
+      - name: busybox sh -n
+        run: |
+          for f in deploy/backup/backup.sh deploy/alertmanager/entrypoint.sh deploy/alertmanager/chat-id.sh; do
+            docker run --rm -v "$PWD/deploy:/deploy:ro" --entrypoint sh postgres:17-alpine -n "/$f" || exit 1
+          done
+
   # The spike is a separate module and deliberately excluded from the main
   # build; check it still compiles so it does not rot before S8 deletes it.
   spike:

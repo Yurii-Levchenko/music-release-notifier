@@ -188,6 +188,15 @@ to `./backups` as a bind mount rather than a named volume, because
 `docker compose down -v` removes named volumes and the entire value of a backup
 on a laptop is being able to copy it off the laptop.
 
+The schedule counts from the newest dump, not from the container's start, and a
+failed attempt is retried in five minutes (doubling up to an hour) rather than a
+day later. Both matter on a machine that reboots: Docker restarts `db` and
+`backup` at the same moment on boot — `depends_on` is honoured by
+`compose up`, not by the daemon's restart policy — so the worker waits for
+`pg_isready` before dumping. Before this, the one attempt per boot hit a
+database that was still starting, the next attempt was a day away, and from
+16.09 to 06.10 no dump succeeded at all.
+
 The app reports on them without making them: `releaseradar_backup_*` is read
 from the directory at scrape time. Measuring the files rather than recording the
 job is the point — a row saying "backup succeeded at T" goes on saying so after
