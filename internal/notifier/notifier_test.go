@@ -24,11 +24,17 @@ type fakeChannel struct {
 	err  error
 	// errs lets a test return a different error per call.
 	errs []error
+	// during runs inside Send, standing in for whatever happens while the
+	// request is on the wire — a SIGTERM, for one.
+	during func(ctx context.Context)
 }
 
 func (f *fakeChannel) Kind() string { return "telegram" }
 
-func (f *fakeChannel) Send(_ context.Context, to notify.Recipient, rel notify.Release) error {
+func (f *fakeChannel) Send(ctx context.Context, to notify.Recipient, rel notify.Release) error {
+	if f.during != nil {
+		f.during(ctx)
+	}
 	f.sent = append(f.sent, sentMessage{to: to, rel: rel})
 	if len(f.errs) > 0 {
 		err := f.errs[0]
@@ -72,22 +78,34 @@ func (q *fakeQueue) Claim(context.Context, int) ([]storage.Pending, error) {
 	return b, nil
 }
 
-func (q *fakeQueue) MarkSent(_ context.Context, id int64) error {
+func (q *fakeQueue) MarkSent(ctx context.Context, id int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	q.marked = append(q.marked, id)
 	return nil
 }
 
-func (q *fakeQueue) Retry(_ context.Context, id int64, attempts int, retryAfter time.Duration, reason string) (bool, error) {
+func (q *fakeQueue) Retry(ctx context.Context, id int64, attempts int, retryAfter time.Duration, reason string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	q.retries = append(q.retries, retryCall{id, attempts, retryAfter, reason})
 	return q.gaveUpOn[id], nil
 }
 
-func (q *fakeQueue) Fail(_ context.Context, id int64, _ string) error {
+func (q *fakeQueue) Fail(ctx context.Context, id int64, _ string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	q.failed = append(q.failed, id)
 	return nil
 }
 
-func (q *fakeQueue) DropRecipient(_ context.Context, userID int64, _ string) error {
+func (q *fakeQueue) DropRecipient(ctx context.Context, userID int64, _ string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	q.dropped = append(q.dropped, userID)
 	return nil
 }
@@ -314,6 +332,74 @@ func TestDeliveredButUnrecordedIsNotRetried(t *testing.T) {
 }
 
 type failingMarkQueue struct{ fakeQueue }
+
+// SIGTERM while a message is on the wire. Telegram accepts it, so the outcome
+// must still be written down: a MarkSent on the canceled context failed
+// instantly, the row stayed leased, and the user got the release a second time
+// five minutes after the restart.
+func TestShutdownMidSendStillRecordsTheDelivery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := &fakeChannel{during: func(context.Context) { cancel() }}
+	q := &fakeQueue{}
+	n, _, _ := testNotifier(q, ch)
+
+	p := pending(1, 10, 999, 1)
+	n.deliver(ctx, &p)
+
+	if len(q.marked) != 1 || q.marked[0] != 1 {
+		t.Fatalf("marked = %v after a send that completed during shutdown, want [1]", q.marked)
+	}
+}
+
+// The same for every other outcome: a failure seen during shutdown must be
+// recorded too, or the row comes back with its attempt uncounted.
+func TestShutdownMidSendStillRecordsAFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := &fakeChannel{
+		during: func(context.Context) { cancel() },
+		err:    errors.New("connection reset"),
+	}
+	q := &fakeQueue{}
+	n, _, _ := testNotifier(q, ch)
+
+	p := pending(1, 10, 999, 1)
+	n.deliver(ctx, &p)
+
+	if len(q.retries) != 1 {
+		t.Fatalf("retries = %d after a failed send during shutdown, want 1", len(q.retries))
+	}
+}
+
+// A send has a deadline of its own, and shutdown does not cut it short. With
+// no deadline one hung request stalled the only drain loop for good; cut short
+// by shutdown, nobody could say whether the message had gone out.
+func TestSendHasItsOwnDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var (
+		deadline     time.Time
+		hasDeadline  bool
+		errAfterStop error
+	)
+	ch := &fakeChannel{during: func(c context.Context) {
+		cancel() // shutdown arrives while the request is on the wire
+		deadline, hasDeadline = c.Deadline()
+		errAfterStop = c.Err()
+	}}
+	n, _, _ := testNotifier(&fakeQueue{}, ch)
+
+	p := pending(1, 10, 999, 1)
+	n.deliver(ctx, &p)
+
+	if !hasDeadline {
+		t.Fatal("the send had no deadline")
+	}
+	if left := time.Until(deadline); left <= 0 || left > sendTimeout {
+		t.Fatalf("time to deadline = %v, want within (0, %v]", left, sendTimeout)
+	}
+	if errAfterStop != nil {
+		t.Fatalf("shutdown canceled a send in flight: %v", errAfterStop)
+	}
+}
 
 func (q *failingMarkQueue) MarkSent(context.Context, int64) error {
 	return errors.New("database unreachable")

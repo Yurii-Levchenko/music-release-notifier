@@ -85,9 +85,32 @@ func NewBot(
 	}
 }
 
-// botAliveInterval is how often an idle bot reports that it is still listening.
-// Comfortably inside the health budget so one missed tick is not an alert.
-const botAliveInterval = time.Minute
+const (
+	// pollTimeout is how long Telegram holds a getUpdates open when there is
+	// nothing to deliver. It is also the beat rhythm of an idle bot: one
+	// successful poll at least every 30 s, well inside the health budget.
+	pollTimeout = 30 * time.Second
+
+	// pollDeadline bounds one getUpdates end to end. telego's fasthttp caller
+	// honors a context deadline and nothing else, so without one a connection
+	// that stops answering would hold the loop for good.
+	pollDeadline = pollTimeout + 15*time.Second
+
+	// A failed poll is retried after pollRetryMin, doubling up to pollRetryMax.
+	// The cap keeps recovery prompt once Telegram is back; the doubling keeps a
+	// long outage from becoming a log line every second.
+	pollRetryMin = time.Second
+	pollRetryMax = 30 * time.Second
+)
+
+// allowedUpdates is deliberately narrow. my_chat_member is what tells us a user
+// blocked the bot, which is cheaper and earlier than waiting for a 403 on the
+// next send.
+var allowedUpdates = []string{"message", "callback_query", "my_chat_member"}
+
+// getUpdatesFunc is telego's GetUpdates, injectable so the loop's failure
+// handling can be tested without Telegram.
+type getUpdatesFunc func(ctx context.Context, params *telego.GetUpdatesParams) ([]telego.Update, error)
 
 // WithMetrics attaches collectors. Separate from the constructor because the
 // bot already takes six dependencies, and metrics are not one of them in the
@@ -116,62 +139,104 @@ func (b *Bot) Run(ctx context.Context) error {
 		b.log.Warn("could not register command list", "err", err)
 	}
 
-	// allowed_updates is deliberately narrow. my_chat_member is what tells us a
-	// user blocked the bot, which is cheaper and earlier than waiting for a 403
-	// on the next send.
-	updates, err := b.client.api.UpdatesViaLongPolling(ctx, &telego.GetUpdatesParams{
-		Timeout:        30,
-		AllowedUpdates: []string{"message", "callback_query", "my_chat_member"},
-	})
-	if err != nil {
-		return fmt.Errorf("start long polling: %w", err)
-	}
-
 	b.log.Info("bot polling for updates", "bot", b.client.Username())
 
-	return b.consume(ctx, updates)
+	return b.poll(ctx, b.client.api.GetUpdates)
 }
 
-// consume is the update loop, split out from Run so it can be driven by a test
-// channel. Long polling is created inside telego, so without this seam the
-// most important behavior here — what happens when polling dies — could only
-// be verified by reading it.
-func (b *Bot) consume(ctx context.Context, updates <-chan telego.Update) error {
-	// A tick that only exists to prove this loop is alive and the updates
-	// channel is still open. Without it an idle bot never beats — long polling
-	// delivers nothing when nobody is typing — and a healthy bot would be
-	// reported as wedged.
-	alive := time.NewTicker(botAliveInterval)
-	defer alive.Stop()
-
-	b.beat()
+// poll is the update loop. Its own rather than telego's UpdatesViaLongPolling,
+// because that one retries a failed getUpdates every 8 s, forever, behind a
+// channel that never closes — while a ticker here reported the bot alive once
+// a minute regardless. A revoked token (401), a second instance polling (409)
+// or a connection that stopped answering all looked like an idle bot, and the
+// heartbeat stayed green through exactly the failure it exists to catch
+// (review 16.09, Resilience #3).
+//
+// So progress is reported only after Telegram has answered. A getUpdates that
+// succeeds returns within pollTimeout even when nobody is typing, which keeps
+// an idle bot beating; one that cannot reach Telegram stops beating, goes
+// unhealthy past its budget and withholds the heartbeat. The loop itself keeps
+// retrying rather than exiting: a restart fixes none of 401, 409 or an
+// outage, and would take the notifier and the poller down with it.
+func (b *Bot) poll(ctx context.Context, getUpdates getUpdatesFunc) error {
+	params := &telego.GetUpdatesParams{
+		Timeout:        int(pollTimeout / time.Second),
+		AllowedUpdates: allowedUpdates,
+	}
+	retry := pollRetryMin
+	var wait time.Duration
 
 	for {
+		// Cancellation arrives as a channel receive, the same shape the
+		// notifier and the poller use, so a clean stop is never "there was an
+		// error and we returned nil".
+		if wait > 0 {
+			select {
+			case <-ctx.Done():
+				b.log.Info("bot stopping")
+				return nil
+			case <-time.After(wait):
+			}
+		}
+
+		updates, err := b.getUpdatesOnce(ctx, getUpdates, params)
 		select {
 		case <-ctx.Done():
 			b.log.Info("bot stopping")
 			return nil
+		default:
+		}
+		if err != nil {
+			b.log.Warn("getUpdates failed, retrying", "err", err, "retry_in", retry.String())
+			wait = retry
+			retry = min(retry*2, pollRetryMax)
+			continue
+		}
+		wait = 0
+		retry = pollRetryMin
+		b.beat()
 
-		case <-alive.C:
-			b.beat()
-
-		case update, ok := <-updates:
-			if !ok {
-				if ctx.Err() != nil {
-					// Expected: telego closes the channel on shutdown.
-					b.log.Info("bot stopping")
-					return nil
-				}
-				// Long polling died on its own. Returning nil here would look
-				// like a clean exit to the errgroup: the process would keep
-				// running with no bot, and nobody would find out — which is
-				// exactly how the 14-hour silence happened. Fail loudly so the
-				// group cancels and the restart policy does its job.
-				return errors.New("telegram long polling stopped unexpectedly")
+		for i := range updates {
+			// The next call's offset confirms everything before it, so an
+			// update is acknowledged only once this loop has come back round —
+			// a crash mid-handle gets it redelivered, as with telego.
+			if updates[i].UpdateID < params.Offset {
+				continue
 			}
-			b.handle(ctx, &update)
+			params.Offset = updates[i].UpdateID + 1
+			b.handle(ctx, &updates[i])
 			b.beat()
 		}
+	}
+}
+
+// getUpdatesOnce runs one getUpdates under pollDeadline, and returns as soon as
+// ctx is canceled. The call itself cannot be interrupted — the fasthttp caller
+// checks the context only before sending — so on shutdown it is left to finish
+// against its own deadline instead of holding the process for up to
+// pollTimeout. Its result is discarded; the updates it may carry are not
+// confirmed and come back on the next start.
+func (b *Bot) getUpdatesOnce(ctx context.Context, getUpdates getUpdatesFunc, params *telego.GetUpdatesParams) ([]telego.Update, error) {
+	type result struct {
+		updates []telego.Update
+		err     error
+	}
+	// A copy, because an abandoned call would otherwise share the params the
+	// next one is built from.
+	p := *params
+	done := make(chan result, 1)
+	go func() {
+		callCtx, cancel := context.WithTimeout(ctx, pollDeadline)
+		defer cancel()
+		updates, err := getUpdates(callCtx, &p)
+		done <- result{updates, err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-done:
+		return r.updates, r.err
 	}
 }
 

@@ -41,6 +41,15 @@ const (
 	// busyInterval is the pause after a full batch: keep draining, but let the
 	// rate limiters breathe.
 	busyInterval = time.Second
+
+	// sendTimeout bounds one delivery. Telegram fetches a cover itself before it
+	// answers a sendPhoto, so a slow image host is a slow send — and with no
+	// bound at all, one hung request stalled the only drain loop indefinitely,
+	// since the lease cannot help when the stuck worker is the only claimer.
+	sendTimeout = 30 * time.Second
+
+	// recordTimeout bounds writing down what a delivery did.
+	recordTimeout = 5 * time.Second
 )
 
 // outcome is what one delivery attempt means for the rest of the batch. Most
@@ -268,8 +277,18 @@ func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) outcome {
 		return outcomeDone
 	}
 
+	// Detached from shutdown, bounded by its own deadline. A send already
+	// started finishes and its outcome is recorded; a canceled one would leave
+	// "did Telegram get it?" unanswerable, which is the duplicate this avoids.
+	// The drain loop checks ctx before every row, so shutdown still stops the
+	// batch after this one message.
+	sendCtx, cancelSend := context.WithTimeout(context.WithoutCancel(ctx), sendTimeout)
+	defer cancelSend()
+	rec, cancelRec := recordContext(ctx)
+	defer cancelRec()
+
 	start := n.now()
-	sendErr := channel.Send(ctx, notify.Recipient{
+	sendErr := channel.Send(sendCtx, notify.Recipient{
 		UserID:  p.UserID,
 		Kind:    channel.Kind(),
 		Address: strconv.FormatInt(p.ChatID, 10),
@@ -293,7 +312,7 @@ func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) outcome {
 
 	if sendErr == nil {
 		n.metrics.Notifications.WithLabelValues("sent", kindLabel(p)).Inc()
-		if err := n.queue.MarkSent(ctx, p.ID); err != nil {
+		if err := n.queue.MarkSent(rec, p.ID); err != nil {
 			// The message went out. Failing to record that means it will be sent
 			// again when the lease expires — worth an error, not a retry.
 			log.Error("delivered but could not mark sent", "err", err)
@@ -310,7 +329,7 @@ func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) outcome {
 		// The chat is gone for good. Drop the subscriptions rather than
 		// rediscovering this on every release for the rest of time.
 		log.Info("recipient is unreachable, dropping subscriptions", "err", sendErr)
-		if err := n.queue.DropRecipient(ctx, p.UserID, sendErr.Error()); err != nil {
+		if err := n.queue.DropRecipient(rec, p.UserID, sendErr.Error()); err != nil {
 			log.Error("could not drop recipient", "err", err)
 			// The drop did not stick, so the rest of this batch cannot be
 			// treated as already handled.
@@ -323,14 +342,14 @@ func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) outcome {
 		// Our bug, not their fault. The subscription stays: a malformed caption
 		// must not cost somebody the artists they follow.
 		log.Error("message rejected, dropping this notification only", "err", sendErr)
-		if err := n.queue.Fail(ctx, p.ID, sendErr.Error()); err != nil {
+		if err := n.queue.Fail(rec, p.ID, sendErr.Error()); err != nil {
 			log.Error("could not mark failed", "err", err)
 		}
 		return outcomeDone
 
 	default: // notify.Transient
 		n.metrics.Notifications.WithLabelValues("transient", kindLabel(p)).Inc()
-		gaveUp, err := n.queue.Retry(ctx, p.ID, p.Attempts, retryAfter, sendErr.Error())
+		gaveUp, err := n.queue.Retry(rec, p.ID, p.Attempts, retryAfter, sendErr.Error())
 		if err != nil {
 			log.Error("could not reschedule", "err", err)
 			return outcomeDone
@@ -349,6 +368,16 @@ func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) outcome {
 		}
 		return outcomeDone
 	}
+}
+
+// recordContext is for writing down the outcome of a send that has already
+// happened. It survives cancellation of ctx on purpose: SIGTERM during a send
+// used to let the message go out and then fail MarkSent instantly on the
+// canceled context, leaving the row leased — and re-sent five minutes after
+// the restart (review 16.09, Resilience #1). The deadline keeps a dead
+// database from holding shutdown open.
+func recordContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), recordTimeout)
 }
 
 // waitForSlot honors both rate limits: the global bucket and the per-chat gap.

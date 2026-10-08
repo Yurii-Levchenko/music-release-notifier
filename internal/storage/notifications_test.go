@@ -201,6 +201,43 @@ func TestExpiredLeaseBecomesClaimableAgain(t *testing.T) {
 	}
 }
 
+// A worker that dies mid-send never reaches Retry, which is where the attempt
+// ceiling lived — so a row whose sends kept crashing came back every lease,
+// forever. Once its attempts are spent it must be failed, not sent again.
+func TestClaimFailsARowWhoseLastAttemptNeverReportedBack(t *testing.T) {
+	ctx, tx := testTx(t)
+	f := outboxFixtures(ctx, t, tx, -999000120,
+		"aaaa1111-0000-4000-8000-000000000120", "bbbb1111-0000-4000-8000-000000000120")
+
+	// Two attempts allowed, and a lease that has elapsed by the next claim:
+	// each claim stands in for a send that crashed before recording anything.
+	outbox := storage.NewNotifications(tx, time.Nanosecond, 2)
+	for i := 1; i <= 2; i++ {
+		batch, err := outbox.Claim(ctx, outboxLimit)
+		if err != nil {
+			t.Fatalf("claim %d: %v", i, err)
+		}
+		if find(batch, f.notifID) == nil {
+			t.Fatalf("claim %d did not take the row while it had attempts left", i)
+		}
+	}
+
+	batch, err := outbox.Claim(ctx, outboxLimit)
+	if err != nil {
+		t.Fatalf("third claim: %v", err)
+	}
+	if find(batch, f.notifID) != nil {
+		t.Fatal("a row with its attempts spent was claimed again; it would be re-sent every lease")
+	}
+	state, attempts, lastErr := notifState(ctx, t, tx, f.notifID)
+	if state != "failed" || attempts != 2 {
+		t.Errorf("state = %q, attempts = %d; want failed after 2", state, attempts)
+	}
+	if lastErr == nil || !strings.Contains(*lastErr, "never reported") {
+		t.Errorf("last_error = %v, want the reason it was given up", lastErr)
+	}
+}
+
 // Blocked users are excluded rather than claimed and skipped: their rows stay
 // pending and cost nothing until they unblock the bot, at which point the
 // release goes out.

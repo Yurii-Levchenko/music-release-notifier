@@ -100,6 +100,24 @@ func (n *Notifications) Claim(ctx context.Context, limit int) ([]Pending, error)
 		limit = 50
 	}
 
+	// A row that comes back with its attempts spent was claimed for the last
+	// time and never reported an outcome: the process died mid-send, or the
+	// answer was lost. The only ceiling used to be in Retry, which such an
+	// attempt never reaches, so the row was re-sent every lease, forever
+	// (review 16.09, Resilience #1). Whether any of those sends reached the
+	// chat is unknowable, and Telegram has no idempotency key — so it is
+	// failed rather than tried once more. The same bound in the CTE below
+	// closes the gap between the two statements.
+	if _, err := n.db.Exec(ctx, `
+		UPDATE notifications
+		SET state = 'failed', last_error = $2
+		WHERE state = 'pending'
+		  AND attempts >= $1
+		  AND next_attempt_at <= now()`,
+		n.maxAttempts, "gave up: the last attempt never reported an outcome"); err != nil {
+		return nil, fmt.Errorf("fail exhausted notifications: %w", err)
+	}
+
 	rows, err := n.db.Query(ctx, `
 		WITH due AS (
 			SELECT n.id
@@ -107,6 +125,7 @@ func (n *Notifications) Claim(ctx context.Context, limit int) ([]Pending, error)
 			JOIN users u ON u.id = n.user_id
 			WHERE n.state = 'pending'
 			  AND n.next_attempt_at <= now()
+			  AND n.attempts < $3
 			  AND u.blocked_at IS NULL
 			ORDER BY n.next_attempt_at
 			LIMIT $1
@@ -127,7 +146,7 @@ func (n *Notifications) Claim(ctx context.Context, limit int) ([]Pending, error)
 		          coalesce(a.links->>'youtube', ''),
 		          coalesce(a.links->>'apple_music', ''),
 		          coalesce(a.links->>'instagram', '')`,
-		limit, n.lease.Seconds())
+		limit, n.lease.Seconds(), n.maxAttempts)
 	if err != nil {
 		return nil, fmt.Errorf("claim notifications: %w", err)
 	}
