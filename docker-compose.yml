@@ -1,16 +1,37 @@
+# Pinned so the project name does not depend on the checkout directory. Alloy
+# keeps only containers labelled with this exact project (deploy/alloy/
+# config.alloy), so a clone into "music-release-notifier" would ship zero log
+# lines and say nothing about it.
+name: music_release_notifier
+
+# Bounded container logs. Docker's json-file driver keeps everything forever
+# by default; Loki already holds 30 days, and after a restart Alloy re-reads a
+# container's whole file from the start, which is how lines from August were
+# re-sent and rejected as too old.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "3"
+
 services:
   db:
     image: postgres:17-alpine
     restart: unless-stopped
+    logging: *default-logging
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-releaseradar}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-locally}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env - compose no longer falls back to the example password}
       POSTGRES_DB: ${POSTGRES_DB:-releaseradar}
     ports:
       # Host port is 5433, NOT 5432: this machine runs a native PostgreSQL
       # service that already owns 5432. The app container still talks to
       # db:5432 over the compose network, so only host access is remapped.
-      - "5433:5432"
+      # Loopback only. Published on every interface, this accepted the example
+      # password from the whole LAN (review 16.09, Security #1); on a VPS it
+      # would have been the internet. The app and the backup reach db:5432 over
+      # the compose network and never needed the host port at all.
+      - "127.0.0.1:5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -24,11 +45,20 @@ services:
   app:
     build: .
     restart: unless-stopped
+    logging: *default-logging
+    # The binary is static, runs as nonroot, writes nothing to disk and needs no
+    # capability. Saying so here means a compromise of the process stays a
+    # compromise of the process.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     depends_on:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-releaseradar}:${POSTGRES_PASSWORD:-change-me-locally}@db:5432/${POSTGRES_DB:-releaseradar}?sslmode=disable
+      DATABASE_URL: postgres://${POSTGRES_USER:-releaseradar}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env - compose no longer falls back to the example password}@db:5432/${POSTGRES_DB:-releaseradar}?sslmode=disable
       HTTP_ADDR: ":8080"
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       USER_AGENT: ${USER_AGENT:-ReleaseRadar/0.1 ( unset@example.com )}
@@ -48,7 +78,10 @@ services:
       # Host port 8090, not 8080. 8080 is the most contended port on any dev
       # machine, and losing the race for it on a host restart kills the
       # container before it runs — see the note in CLAUDE.md.
-      - "8090:8080"
+      # Loopback only. /metrics carries queue depths and chat volumes and /status
+      # the worker state; neither belongs on every interface, and /v1 will sit
+      # behind a TLS proxy on the VPS rather than on this port.
+      - "127.0.0.1:8090:8080"
 
   # Not behind the observability profile, on purpose: metrics are something you
   # look at, and backups are the thing that decides whether there is anything
@@ -56,13 +89,14 @@ services:
   backup:
     image: postgres:17-alpine
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       db:
         condition: service_healthy
     environment:
       PGHOST: db
       PGUSER: ${POSTGRES_USER:-releaseradar}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-change-me-locally}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env - compose no longer falls back to the example password}
       PGDATABASE: ${POSTGRES_DB:-releaseradar}
       BACKUP_KEEP: ${BACKUP_KEEP:-7}
       BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
@@ -87,6 +121,7 @@ services:
     image: prom/prometheus:v3.7.3
     profiles: ["observability"]
     restart: unless-stopped
+    logging: *default-logging
     volumes:
       - ./deploy/prometheus:/etc/prometheus:ro
       - promdata:/prometheus
@@ -115,6 +150,7 @@ services:
     image: grafana/grafana:12.3.1
     profiles: ["observability"]
     restart: unless-stopped
+    logging: *default-logging
     depends_on: [prometheus]
     environment:
       # Anonymous read-only viewing: this is a single-operator deployment, and
@@ -141,6 +177,7 @@ services:
     image: prom/alertmanager:v0.28.1
     profiles: ["observability"]
     restart: unless-stopped
+    logging: *default-logging
     environment:
       # A second bot, not the one users talk to. An alert about the main bot
       # being blocked, throttled or misconfigured cannot be sent by the main
@@ -179,6 +216,7 @@ services:
     image: grafana/loki:3.7.7
     profiles: ["observability"]
     restart: unless-stopped
+    logging: *default-logging
     command: ["-config.file=/etc/loki/loki.yml"]
     volumes:
       - ./deploy/loki:/etc/loki:ro
@@ -197,6 +235,7 @@ services:
     image: grafana/alloy:v1.19.2
     profiles: ["observability"]
     restart: unless-stopped
+    logging: *default-logging
     depends_on: [loki]
     command:
       - run

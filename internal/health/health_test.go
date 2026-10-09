@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -207,5 +209,43 @@ func TestShutdownDoesNotPing(t *testing.T) {
 
 	if got := pings.Load(); got != 1 {
 		t.Fatalf("sent %d pings, want exactly the one at startup", got)
+	}
+}
+
+// The ping URL is the secret: whoever holds it can keep the monitor quiet while
+// the process is down. *url.Error prints the whole URL, so a plain dial failure
+// used to copy it into the log — and from there into Loki for 30 days.
+func TestPingFailureLogsWithoutTheURL(t *testing.T) {
+	var buf strings.Builder
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+
+	r := NewRegistry()
+	r.Register("bot", time.Minute).Beat()
+
+	const secret = "SECRET-PING-TOKEN-7f3a"
+	hb := NewHeartbeat("http://127.0.0.1:1/"+secret, time.Minute, r, log)
+	hb.beatOnce(context.Background())
+
+	out := buf.String()
+	if !strings.Contains(out, "heartbeat ping failed") {
+		t.Fatalf("expected the failure to be logged, got:\n%s", out)
+	}
+	if strings.Contains(out, secret) {
+		t.Fatalf("the ping URL leaked into the log:\n%s", out)
+	}
+}
+
+func TestWithoutURLUnwrapsOnlyURLErrors(t *testing.T) {
+	inner := errors.New("dial tcp: connection refused")
+	wrapped := &url.Error{Op: "Get", URL: "https://hc-ping.com/secret", Err: inner}
+	// errors.Is alone would pass on the wrapped error too, since *url.Error
+	// unwraps to inner; what matters is that the URL is gone from the text.
+	got := withoutURL(wrapped)
+	if !errors.Is(got, inner) || strings.Contains(got.Error(), "hc-ping.com") {
+		t.Fatalf("withoutURL(*url.Error) = %q, want the cause without the URL", got)
+	}
+	plain := errors.New("heartbeat endpoint returned Not Found")
+	if got := withoutURL(plain); !errors.Is(got, plain) || got.Error() != plain.Error() {
+		t.Fatalf("withoutURL changed a non-URL error: %v", got)
 	}
 }

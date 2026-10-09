@@ -117,8 +117,11 @@ func decodeSelection(rest string) (s selection, index int, ok bool) {
 		return selection{}, 0, false
 	}
 
+	// Bounded above as well as below: the page becomes an OFFSET multiplier in
+	// handleSelection, and a forged value large enough to overflow it would
+	// reach Postgres as a negative offset (review 16.09, Security #2).
 	page, err := strconv.Atoi(parts[0])
-	if err != nil || page < 0 {
+	if err != nil || page < 0 || page > maxListPage {
 		return selection{}, 0, false
 	}
 	mask, err := strconv.ParseUint(parts[1], 16, 32)

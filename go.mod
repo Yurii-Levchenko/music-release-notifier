@@ -1,6 +1,6 @@
 module github.com/Yurii-Levchenko/music-release-notifier
 
-go 1.26.2
+go 1.26.9
 
 require (
 	github.com/jackc/pgx/v5 v5.10.0
@@ -35,6 +35,6 @@ require (
 	github.com/valyala/fastjson v1.6.10 // indirect
 	golang.org/x/arch v0.0.0-20210923205945-b76863e36670 // indirect
 	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.40.0 // indirect
+	golang.org/x/text v0.41.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )

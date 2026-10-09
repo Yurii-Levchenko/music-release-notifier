@@ -214,7 +214,7 @@ docker compose exec -T db psql -U releaseradar -d releaseradar -c "SELECT * FROM
 
 ## Робоче середовище
 
-- Windows 11, PowerShell (є і Bash). Go 1.26.2, Docker 28.3.2, compose v2.39.1.
+- Windows 11, PowerShell (є і Bash). Go 1.26.9 (go.mod з 08.10; до того 1.26.2), Docker 28.3.2, compose v2.39.1.
 - **Порт 5432 зайнятий нативним Windows-сервісом PostgreSQL.** Контейнер БД
   замаплений на **5433** на хості. `localhost:5432` веде в чужий Postgres —
   не в наш. Усередині compose-мережі app звертається до `db:5432` як звичайно.

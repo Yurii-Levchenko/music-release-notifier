@@ -135,3 +135,15 @@ func TestDecodeRejectsGarbage(t *testing.T) {
 		}
 	}
 }
+
+// The page inside a pick: callback is multiplied into an OFFSET too, so it gets
+// the same upper bound as list: — a forged value past it is malformed, not a
+// page (review 16.09, Security #2).
+func TestDecodeSelectionRejectsAnAbsurdPage(t *testing.T) {
+	if _, _, ok := decodeSelection("100000000:0:0:abcd"); ok {
+		t.Fatal("a page far past any real list decoded as valid")
+	}
+	if _, _, ok := decodeSelection("3:0:0:abcd"); !ok {
+		t.Fatal("an ordinary page was rejected")
+	}
+}

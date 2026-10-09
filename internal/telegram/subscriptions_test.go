@@ -492,3 +492,31 @@ func TestFarewellListSaysNothingExtraWhenComplete(t *testing.T) {
 		t.Errorf("a complete list claims to be truncated:\n%s", got)
 	}
 }
+
+// A page number arrives from callback_data, which any Bot API client can forge.
+// It must be bounded before it becomes an OFFSET multiplier, and an out-of-range
+// page must resolve to the last real page in one step — the old behavior
+// stepped back one page per recursion, so list:100000000 was a hundred million
+// database queries from a single tap (review 16.09, Security #2).
+func TestPageBoundsAreClampedNotRecursed(t *testing.T) {
+	if got := clampPage(-5); got != 0 {
+		t.Errorf("clampPage(-5) = %d, want 0", got)
+	}
+	if got := clampPage(3); got != 3 {
+		t.Errorf("clampPage(3) = %d, want 3", got)
+	}
+	if got := clampPage(100_000_000); got != maxListPage {
+		t.Errorf("clampPage(1e8) = %d, want maxListPage %d", got, maxListPage)
+	}
+	// The clamp must leave room for the offset multiplication.
+	if maxListPage*listPageSize < 0 || maxListPage*listPageSize > 1<<31 {
+		t.Errorf("maxListPage*listPageSize = %d overflows or is unreasonably large", maxListPage*listPageSize)
+	}
+
+	cases := map[int]int{0: 0, 1: 0, listPageSize: 0, listPageSize + 1: 1, 42: 2, 2 * listPageSize: 1}
+	for total, want := range cases {
+		if got := lastPage(total); got != want {
+			t.Errorf("lastPage(%d) = %d, want %d", total, got, want)
+		}
+	}
+}
