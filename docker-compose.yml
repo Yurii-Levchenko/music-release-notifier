@@ -69,6 +69,7 @@ services:
       USER_AGENT: ${USER_AGENT:-ReleaseRadar/0.1 ( unset@example.com )}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       HEARTBEAT_URL: ${HEARTBEAT_URL:-}
+      HEARTBEAT_DISABLED: ${HEARTBEAT_DISABLED:-}
       HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL:-5m}
       # The app does not make backups; it reports on them, so the freshness of
       # the dumps is a metric with an alert rather than something you remember
