@@ -46,6 +46,11 @@ services:
     build: .
     restart: unless-stopped
     logging: *default-logging
+    # Longer than the worst case of a clean stop: a send already on the wire
+    # finishes (30 s bound) and its outcome is written (5 s), while the HTTP
+    # server drains (15 s) alongside. Docker's default of 10 s killed the
+    # process in the middle of that, which is the duplicate it exists to avoid.
+    stop_grace_period: 45s
     # The binary is static, runs as nonroot, writes nothing to disk and needs no
     # capability. Saying so here means a compromise of the process stays a
     # compromise of the process.

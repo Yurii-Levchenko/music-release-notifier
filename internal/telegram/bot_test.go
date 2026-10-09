@@ -2,9 +2,11 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -20,98 +22,189 @@ func loopOnlyBot() *Bot {
 	return NewBot(nil, nil, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
-// The failure this whole health story exists for. When telego's long polling
-// dies it closes the channel; returning nil there looks like a clean exit to
-// the errgroup, so the process keeps running with no bot and nobody finds out.
-// That is the shape of the 14-hour silence on 29.08.2026.
-func TestPollingDyingIsAnError(t *testing.T) {
-	b := loopOnlyBot()
-	updates := make(chan telego.Update)
-	close(updates)
+// fakePoller stands in for telego's GetUpdates. Each call takes the next
+// scripted response; once the script runs out, calls block until the test is
+// over, the way an idle long poll would.
+type fakePoller struct {
+	mu        sync.Mutex
+	responses []pollResponse
+	params    []telego.GetUpdatesParams
+	deadlines []time.Duration
+	calls     chan struct{}
+	release   chan struct{}
+}
 
-	err := b.consume(context.Background(), updates)
-	if err == nil {
-		t.Fatal("long polling died and consume reported a clean exit; " +
-			"the process would run on with a dead bot")
+type pollResponse struct {
+	updates []telego.Update
+	err     error
+}
+
+func newFakePoller(responses ...pollResponse) *fakePoller {
+	return &fakePoller{responses: responses, calls: make(chan struct{}, 64), release: make(chan struct{})}
+}
+
+func (f *fakePoller) getUpdates(ctx context.Context, params *telego.GetUpdatesParams) ([]telego.Update, error) {
+	f.mu.Lock()
+	f.params = append(f.params, *params)
+	if d, ok := ctx.Deadline(); ok {
+		f.deadlines = append(f.deadlines, time.Until(d))
+	} else {
+		f.deadlines = append(f.deadlines, -1)
+	}
+	var r *pollResponse
+	if len(f.responses) > 0 {
+		r = &f.responses[0]
+		f.responses = f.responses[1:]
+	}
+	f.mu.Unlock()
+	f.calls <- struct{}{}
+
+	if r != nil {
+		return r.updates, r.err
+	}
+	// Ignores ctx on purpose: the fasthttp caller does too once the request is
+	// on the wire, and the loop must not depend on it noticing.
+	<-f.release
+	return nil, nil
+}
+
+func (f *fakePoller) waitCalls(t *testing.T, n int) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for i := 0; i < n; i++ {
+		select {
+		case <-f.calls:
+		case <-deadline:
+			t.Fatalf("getUpdates called %d times, want at least %d", i, n)
+		}
 	}
 }
 
-// The same channel closure during shutdown is expected and must not be
-// reported as a failure, or every deploy would look like a crash.
-func TestChannelClosureDuringShutdownIsClean(t *testing.T) {
+func runPoll(t *testing.T, b *Bot, f *fakePoller) (cancel func() error) {
+	t.Helper()
+	ctx, stop := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- b.poll(ctx, f.getUpdates) }()
+	t.Cleanup(func() { close(f.release) })
+	return func() error {
+		stop()
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(2 * time.Second):
+			t.Fatal("poll did not return after cancellation")
+			return nil
+		}
+	}
+}
+
+// The failure the old loop could not see. telego retried a failing getUpdates
+// behind a channel that stayed open while a ticker kept beating, so a revoked
+// token or a dead connection read as a healthy, idle bot and the heartbeat
+// stayed green. A poll that fails must not count as progress.
+func TestFailingPollsDoNotReportProgress(t *testing.T) {
+	var beats atomic.Int64
 	b := loopOnlyBot()
-	updates := make(chan telego.Update)
-	close(updates)
+	b.ReportProgressTo(func() { beats.Add(1) })
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	unauthorized := errors.New("telego: getUpdates: api: 401 \"Unauthorized\"")
+	f := newFakePoller(pollResponse{err: unauthorized}, pollResponse{err: unauthorized})
+	stop := runPoll(t, b, f)
 
-	if err := b.consume(ctx, updates); err != nil {
+	f.waitCalls(t, 2) // the second call proves the loop retried rather than exited
+	if got := beats.Load(); got != 0 {
+		t.Fatalf("beats = %d while every getUpdates failed, want 0", got)
+	}
+	if err := stop(); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+}
+
+// An idle bot must still report progress: an empty, successful long poll is
+// Telegram saying "nothing for you", and it is the only beat a quiet night has.
+func TestEmptySuccessfulPollReportsProgress(t *testing.T) {
+	var beats atomic.Int64
+	b := loopOnlyBot()
+	b.ReportProgressTo(func() { beats.Add(1) })
+
+	f := newFakePoller(pollResponse{})
+	stop := runPoll(t, b, f)
+
+	f.waitCalls(t, 2)
+	if got := beats.Load(); got != 1 {
+		t.Fatalf("beats = %d after one empty successful poll, want 1", got)
+	}
+	if err := stop(); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+}
+
+// Updates are confirmed by the next call's offset. Getting it wrong either
+// replays every update forever or skips the ones in between.
+func TestOffsetAdvancesPastHandledUpdates(t *testing.T) {
+	var beats atomic.Int64
+	b := loopOnlyBot()
+	b.ReportProgressTo(func() { beats.Add(1) })
+
+	// Updates with no message, callback or member change: handle ignores them,
+	// which is what makes them safe to use here without a full bot.
+	f := newFakePoller(pollResponse{updates: []telego.Update{{UpdateID: 5}, {UpdateID: 6}}})
+	stop := runPoll(t, b, f)
+
+	f.waitCalls(t, 2)
+	if err := stop(); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.params[0].Offset != 0 || f.params[1].Offset != 7 {
+		t.Fatalf("offsets = %d, %d; want 0, then 7", f.params[0].Offset, f.params[1].Offset)
+	}
+	if got := beats.Load(); got != 3 { // the poll, then each update
+		t.Fatalf("beats = %d, want 3", got)
+	}
+}
+
+// Every call carries a deadline: the fasthttp caller honors a deadline and
+// nothing else, so a call without one could hang on a dead connection forever.
+func TestEveryPollHasADeadline(t *testing.T) {
+	b := loopOnlyBot()
+	f := newFakePoller(pollResponse{})
+	stop := runPoll(t, b, f)
+
+	f.waitCalls(t, 2)
+	if err := stop(); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, d := range f.deadlines {
+		if d <= 0 || d > pollDeadline {
+			t.Fatalf("call %d: time to deadline = %v, want within (0, %v]", i, d, pollDeadline)
+		}
+	}
+	if f.params[0].Timeout != int(pollTimeout/time.Second) {
+		t.Fatalf("long-poll timeout = %d s, want %v", f.params[0].Timeout, pollTimeout)
+	}
+}
+
+// Shutdown must not wait out a long poll that is already on the wire. The fake
+// ignores cancellation, as the real caller does, so this passes only if the
+// loop stops waiting for it.
+func TestShutdownDoesNotWaitForAnInFlightPoll(t *testing.T) {
+	b := loopOnlyBot()
+	f := newFakePoller()
+	stop := runPoll(t, b, f)
+
+	f.waitCalls(t, 1)
+	start := time.Now()
+	if err := stop(); err != nil {
 		t.Fatalf("clean shutdown reported as an error: %v", err)
 	}
-}
-
-// An idle bot must still report progress. Long polling delivers nothing when
-// nobody is typing, so a traffic-driven heartbeat would mark a perfectly
-// healthy bot as wedged after five quiet minutes.
-func TestIdleBotStillReportsProgress(t *testing.T) {
-	var beats atomic.Int64
-	b := loopOnlyBot()
-	b.ReportProgressTo(func() { beats.Add(1) })
-
-	ctx, cancel := context.WithCancel(context.Background())
-	updates := make(chan telego.Update)
-
-	done := make(chan error, 1)
-	go func() { done <- b.consume(ctx, updates) }()
-
-	// The startup beat happens before any traffic, which is the property that
-	// matters: the registry is not empty while the bot waits.
-	deadline := time.After(2 * time.Second)
-	for beats.Load() == 0 {
-		select {
-		case <-deadline:
-			cancel()
-			t.Fatal("an idle bot never reported progress")
-		default:
-			time.Sleep(time.Millisecond)
-		}
-	}
-
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatalf("consume: %v", err)
-	}
-}
-
-func TestHandledUpdateReportsProgress(t *testing.T) {
-	var beats atomic.Int64
-	b := loopOnlyBot()
-	b.ReportProgressTo(func() { beats.Add(1) })
-
-	ctx, cancel := context.WithCancel(context.Background())
-	updates := make(chan telego.Update, 1)
-	// An update with no message, callback or member change: handle ignores it,
-	// which is what makes it safe to use here without a full bot.
-	updates <- telego.Update{UpdateID: 1}
-
-	done := make(chan error, 1)
-	go func() { done <- b.consume(ctx, updates) }()
-
-	deadline := time.After(2 * time.Second)
-	for beats.Load() < 2 { // one at startup, one for the update
-		select {
-		case <-deadline:
-			cancel()
-			t.Fatalf("beats = %d after handling an update, want at least 2", beats.Load())
-		default:
-			time.Sleep(time.Millisecond)
-		}
-	}
-
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatalf("consume: %v", err)
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("shutdown took %v with a poll in flight", took)
 	}
 }
 
@@ -120,12 +213,11 @@ func TestReportProgressToIgnoresNil(t *testing.T) {
 	b := loopOnlyBot()
 	b.ReportProgressTo(nil)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	updates := make(chan telego.Update)
-
-	if err := b.consume(ctx, updates); err != nil {
-		t.Fatalf("consume: %v", err)
+	f := newFakePoller(pollResponse{})
+	stop := runPoll(t, b, f)
+	f.waitCalls(t, 2)
+	if err := stop(); err != nil {
+		t.Fatalf("poll: %v", err)
 	}
 }
 
