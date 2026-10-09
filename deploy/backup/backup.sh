@@ -15,6 +15,14 @@ set -eu
 DIR=${BACKUP_DIR:-/backups}
 KEEP=${BACKUP_KEEP:-7}
 INTERVAL=${BACKUP_INTERVAL_SECONDS:-86400}
+RETRY=${BACKUP_RETRY_SECONDS:-300}
+DB_WAIT=${BACKUP_DB_WAIT_SECONDS:-120}
+
+# A failing attempt backs off from RETRY by doubling, up to this. Without a cap
+# a database that is down for a day would leave the next attempt a day away
+# from its recovery; without the doubling the same day would write 288 ERROR
+# lines into the panel people read.
+RETRY_MAX=3600
 
 log() {
 	# $1 level, $2 msg, $3 optional trailing JSON fields (with leading comma).
@@ -22,9 +30,35 @@ log() {
 		"$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "${3:-}"
 }
 
+# Every one of these ends up in arithmetic or in sleep, where a typo would
+# either abort mid-loop or, for an interval of 0, dump on every iteration.
+for setting in "KEEP=$KEEP" "INTERVAL=$INTERVAL" "RETRY=$RETRY" "DB_WAIT=$DB_WAIT"; do
+	case ${setting#*=} in
+	'' | *[!0-9]* | 0)
+		log ERROR "invalid setting, want a positive integer" ",\"setting\":\"$setting\""
+		exit 1
+		;;
+	esac
+done
+if [ "$RETRY" -gt "$RETRY_MAX" ]; then
+	RETRY_MAX=$RETRY
+fi
+
+# Sleeps in the background and waits on it. A foreground sleep defers traps
+# until it returns, and sh as PID 1 has no default action for SIGTERM: with a
+# plain sleep the worker ignored every `docker compose down` until the 10 s
+# kill timeout.
+pause() {
+	sleep "$1" &
+	wait $! || true
+}
+
+trap 'log INFO "backup worker stopping"; exit 0' TERM INT
+
 # Strips what would break the JSON above. Postgres error text is free-form and
 # routinely contains quotes and newlines.
 sanitize() {
+	# shellcheck disable=SC1003 # deletes " and \, not an attempt to escape a quote
 	tr -d '"\\' | tr '\n\r\t' '   ' | cut -c1-400
 }
 
@@ -105,26 +139,76 @@ mkdir -p "$DIR"
 # needs.
 find "$DIR" -maxdepth 1 -type f -name '*.dump.tmp' -exec rm -f {} + 2>/dev/null || true
 
-log INFO "backup worker started" ",\"dir\":\"$DIR\",\"keep\":$KEEP,\"interval_seconds\":$INTERVAL"
-
-# find takes minutes, and integer division floors: any interval under a minute
-# would ask for "-mmin -0", match nothing, and silently turn the skip below
-# into a no-op that dumps on every loop.
-SKIP_MINUTES=$((INTERVAL / 60))
-if [ "$SKIP_MINUTES" -lt 1 ]; then
-	SKIP_MINUTES=1
-fi
-
-while :; do
-	# Skip the dump if a recent one already exists. Without this, every
-	# `docker compose up -d` takes a fresh dump, and a machine that restarts
-	# often would spend its retention window on copies of the same minute
-	# while genuinely old days age out of it.
-	recent=$(find "$DIR" -maxdepth 1 -type f -name '*.dump' -mmin "-$SKIP_MINUTES" | wc -l | tr -d ' ')
-	if [ "$recent" -gt 0 ]; then
-		log INFO "recent dump exists, skipping this run"
-	else
-		run_backup || true
+# Seconds since the newest dump was written; empty when there is none. The
+# newest by mtime, which is the clock internal/backup reads for the freshness
+# metric, so this schedule and the BackupStale alert cannot disagree about how
+# old the last backup is.
+newest_age() {
+	newest=$(find "$DIR" -maxdepth 1 -type f -name '*.dump' -exec stat -c %Y {} + | sort -n | tail -n 1)
+	if [ -z "$newest" ]; then
+		return 0
 	fi
-	sleep "$INTERVAL"
+	age=$(($(date +%s) - newest))
+	# A dump stamped in the future (a clock change, a restored copy) counts as
+	# just written rather than asking for a sleep longer than the interval.
+	if [ "$age" -lt 0 ]; then
+		age=0
+	fi
+	echo "$age"
+}
+
+# Waits, up to DB_WAIT, for the server to accept connections. On every boot
+# of the machine Docker restarts db and backup at the same moment: depends_on
+# is honoured by `compose up`, not by the daemon's restart policy. So the
+# first attempt of every boot met "Connection refused" or "the database system
+# is starting up" — measured: every boot from 16.09 to 06.10, 20 days without
+# a dump. Not ready by the deadline is not an error here: the dump runs anyway
+# and fails with pg_dump's own message, which says more than a timeout would.
+wait_for_db() {
+	if pg_isready --quiet --timeout=5; then
+		return 0
+	fi
+	log INFO "database not accepting connections yet, waiting" ",\"max_seconds\":$DB_WAIT"
+	deadline=$(($(date +%s) + DB_WAIT))
+	until pg_isready --quiet --timeout=5; do
+		if [ "$(date +%s)" -ge "$deadline" ]; then
+			return 0
+		fi
+		pause 2
+	done
+}
+
+log INFO "backup worker started" ",\"dir\":\"$DIR\",\"keep\":$KEEP,\"interval_seconds\":$INTERVAL,\"retry_seconds\":$RETRY"
+
+backoff=$RETRY
+while :; do
+	# Due once the newest dump is INTERVAL old, counted from that dump rather
+	# than from this process's start. Counting from the start meant a restart
+	# 23 hours after a dump put the next one 47 hours after it, and a machine
+	# that restarts daily would never reach the next one at all. It also keeps
+	# `docker compose up -d` from taking a fresh dump each time, which would
+	# spend the retention window on copies of the same minute.
+	age=$(newest_age)
+	if [ -n "$age" ] && [ "$age" -lt "$INTERVAL" ]; then
+		due=$((INTERVAL - age))
+		log INFO "next backup scheduled" ",\"in_seconds\":$due"
+		pause "$due"
+		continue
+	fi
+
+	wait_for_db
+	if run_backup; then
+		backoff=$RETRY
+		continue
+	fi
+
+	# A failure retries in minutes, not after a full interval. Sleeping the
+	# interval was the 20-day outage: the one attempt per boot failed, and the
+	# next was a day away — further than the machine stayed up.
+	log INFO "backup will be retried" ",\"in_seconds\":$backoff"
+	pause "$backoff"
+	backoff=$((backoff * 2))
+	if [ "$backoff" -gt "$RETRY_MAX" ]; then
+		backoff=$RETRY_MAX
+	fi
 done
