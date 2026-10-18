@@ -14,13 +14,19 @@ import (
 )
 
 type fakeQueue struct {
-	pending int
-	oldest  time.Duration
-	err     error
+	pending   int
+	oldest    time.Duration
+	err       error
+	failed    int
+	failedErr error
 }
 
 func (q fakeQueue) QueueDepth(context.Context) (int, time.Duration, error) {
 	return q.pending, q.oldest, q.err
+}
+
+func (q fakeQueue) FailedCount(context.Context) (int, error) {
+	return q.failed, q.failedErr
 }
 
 func TestQueueCollectorReportsDepthAndAge(t *testing.T) {
@@ -80,6 +86,41 @@ releaseradar_queue_readable 0
 		if f.GetName() == "releaseradar_notifications_pending" {
 			t.Fatalf("published %s while the queue was unreadable; zero reads as an empty queue",
 				f.GetName())
+		}
+	}
+}
+
+// Failed notifications are each a release somebody did not hear about. The
+// count is published from the table, and only when it could be read: a zero
+// on error would resolve the alert exactly when the database is in trouble.
+func TestFailedNotificationsArePublishedOnlyWhenReadable(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := New(reg)
+	if err := m.RegisterQueue(reg, fakeQueue{failed: 3}); err != nil {
+		t.Fatalf("register queue: %v", err)
+	}
+	expected := `
+# HELP releaseradar_notifications_failed Notifications that ended without being delivered, as stored in the outbox.
+# TYPE releaseradar_notifications_failed gauge
+releaseradar_notifications_failed 3
+`
+	if err := testutil.GatherAndCompare(reg, strings.NewReader(expected),
+		"releaseradar_notifications_failed"); err != nil {
+		t.Fatal(err)
+	}
+
+	reg = prometheus.NewRegistry()
+	m = New(reg)
+	if err := m.RegisterQueue(reg, fakeQueue{failedErr: errors.New("timeout")}); err != nil {
+		t.Fatalf("register queue: %v", err)
+	}
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, f := range families {
+		if f.GetName() == "releaseradar_notifications_failed" {
+			t.Fatal("published a failed count that could not be read")
 		}
 	}
 }

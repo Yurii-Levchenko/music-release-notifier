@@ -260,8 +260,9 @@ func TestSelectedRowsGetAConfirmButton(t *testing.T) {
 
 	text, markup := renderList(items, 3, 0, sel)
 
-	if !strings.Contains(text, "Обрано: 2") {
-		t.Errorf("the count is missing from the text:\n%s", text)
+	// Names, not a count: "Обрано: 2" beside a numbered list reads as "item 2".
+	if !strings.Contains(text, "Відписатись від: Artist A, Artist C?") {
+		t.Errorf("the caption does not name who is selected:\n%s", text)
 	}
 	if !strings.Contains(text, "✓ 1. Artist A") || !strings.Contains(text, "✓ 3. Artist C") {
 		t.Errorf("ticked rows are not marked:\n%s", text)

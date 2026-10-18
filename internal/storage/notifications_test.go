@@ -61,8 +61,8 @@ func outboxFixtures(ctx context.Context, t *testing.T, tx pgx.Tx, chatID int64, 
 	// Backdated far enough that this row sorts ahead of anything in the real
 	// queue, so it is always within the claim limit.
 	if err := tx.QueryRow(ctx, `
-		INSERT INTO notifications (user_id, release_id, next_attempt_at)
-		VALUES ($1, $2, now() - interval '10 years')
+		INSERT INTO notifications (user_id, release_id, next_attempt_at, created_at)
+		VALUES ($1, $2, now() - interval '10 years', now() - interval '10 years')
 		RETURNING id`, f.userID, f.releaseID).Scan(&f.notifID); err != nil {
 		t.Fatalf("insert notification: %v", err)
 	}
@@ -460,6 +460,80 @@ func TestQueueDepthCountsPendingWork(t *testing.T) {
 	}
 	if sentDepth != before {
 		t.Fatalf("depth = %d after sending, want back to %d", sentDepth, before)
+	}
+}
+
+// The age is how long a person has been waiting, counted from when the row was
+// queued. It used to be counted from next_attempt_at, so a row rescheduled into
+// the future by a retry — every row, during a Telegram outage — read as age 0,
+// and the alert for a stuck queue stayed quiet for exactly that outage.
+func TestQueueAgeCountsFromWhenTheRowWasQueued(t *testing.T) {
+	ctx, tx := testTx(t)
+	outbox := storage.NewNotifications(tx, 5*time.Minute, 6)
+
+	f := outboxFixtures(ctx, t, tx, -999000121,
+		"aaaa1111-0000-4000-8000-000000000121", "bbbb1111-0000-4000-8000-000000000121")
+	// Retried and waiting for its next attempt, two hours from now.
+	if _, err := tx.Exec(ctx,
+		`UPDATE notifications SET next_attempt_at = now() + interval '2 hours' WHERE id = $1`,
+		f.notifID); err != nil {
+		t.Fatalf("reschedule: %v", err)
+	}
+
+	_, oldest, err := outbox.QueueDepth(ctx)
+	if err != nil {
+		t.Fatalf("queue depth: %v", err)
+	}
+	if oldest < 24*time.Hour {
+		t.Fatalf("oldest = %v for a row queued ten years ago and rescheduled ahead, want its real wait", oldest)
+	}
+}
+
+// A blocked user's rows can never be delivered. Counted as waiting, they kept
+// the queue-age alert firing forever.
+func TestQueueDepthLeavesOutBlockedUsers(t *testing.T) {
+	ctx, tx := testTx(t)
+	outbox := storage.NewNotifications(tx, 5*time.Minute, 6)
+
+	f := outboxFixtures(ctx, t, tx, -999000122,
+		"aaaa1111-0000-4000-8000-000000000122", "bbbb1111-0000-4000-8000-000000000122")
+	withRow, _, err := outbox.QueueDepth(ctx)
+	if err != nil {
+		t.Fatalf("queue depth: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE users SET blocked_at = now() WHERE id = $1`, f.userID); err != nil {
+		t.Fatalf("block: %v", err)
+	}
+	blocked, _, err := outbox.QueueDepth(ctx)
+	if err != nil {
+		t.Fatalf("queue depth: %v", err)
+	}
+	if blocked != withRow-1 {
+		t.Fatalf("depth = %d after blocking the row's user, want %d", blocked, withRow-1)
+	}
+}
+
+// Every failed row is a release somebody never got; the count is what the
+// NotificationsFailing alert watches.
+func TestFailedCountCountsUndeliveredRows(t *testing.T) {
+	ctx, tx := testTx(t)
+	outbox := storage.NewNotifications(tx, 5*time.Minute, 6)
+
+	before, err := outbox.FailedCount(ctx)
+	if err != nil {
+		t.Fatalf("failed count: %v", err)
+	}
+	f := outboxFixtures(ctx, t, tx, -999000123,
+		"aaaa1111-0000-4000-8000-000000000123", "bbbb1111-0000-4000-8000-000000000123")
+	if err := outbox.Fail(ctx, f.notifID, "can't parse entities"); err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+	after, err := outbox.FailedCount(ctx)
+	if err != nil {
+		t.Fatalf("failed count: %v", err)
+	}
+	if after != before+1 {
+		t.Fatalf("failed count went %d → %d after failing one row", before, after)
 	}
 }
 

@@ -260,17 +260,26 @@ func (n *Notifications) DropRecipient(ctx context.Context, userID int64, reason 
 	return tx.Commit(ctx)
 }
 
-// QueueDepth reports how much is waiting and how old the oldest item is.
+// QueueDepth reports how much is waiting and how long the longest wait is.
 //
-// These are the two numbers an alert should watch (SPEC.md §15a): depth is the
-// leading indicator, and the age of the oldest pending row is the actual delay
-// a person is experiencing.
+// These are the two numbers an alert should watch (SPEC §15a): depth is the
+// leading indicator, and the age of the oldest pending row is the delay a
+// person is actually experiencing.
+//
+// Age counts from created_at, the moment the row was queued. It used to count
+// from next_attempt_at, which measures how overdue the next attempt is: during
+// a Telegram outage every row is rescheduled into the future, so the "age" sat
+// at zero and QueueBacklogAgeing stayed quiet for exactly the outage it exists
+// for (review 16.09, Resilience #7). Blocked users are left out because their
+// rows can never be delivered — counting them kept the alert firing forever.
 func (n *Notifications) QueueDepth(ctx context.Context) (pending int, oldest time.Duration, err error) {
 	var oldestAt *time.Time
 	if err := n.db.QueryRow(ctx, `
-		SELECT count(*), min(next_attempt_at)
-		FROM notifications
-		WHERE state = 'pending'`).Scan(&pending, &oldestAt); err != nil {
+		SELECT count(*), min(n.created_at)
+		FROM notifications n
+		JOIN users u ON u.id = n.user_id
+		WHERE n.state = 'pending'
+		  AND u.blocked_at IS NULL`).Scan(&pending, &oldestAt); err != nil {
 		return 0, 0, fmt.Errorf("read queue depth: %w", err)
 	}
 	if oldestAt != nil {
@@ -279,6 +288,19 @@ func (n *Notifications) QueueDepth(ctx context.Context) (pending int, oldest tim
 		}
 	}
 	return pending, oldest, nil
+}
+
+// FailedCount is how many notifications ended without being delivered: given
+// up after the last retry, rejected as malformed, or abandoned after a send
+// that never reported back. Each one is a release somebody did not hear about,
+// and until now the only trace was a log line.
+func (n *Notifications) FailedCount(ctx context.Context) (int, error) {
+	var failed int
+	if err := n.db.QueryRow(ctx,
+		`SELECT count(*) FROM notifications WHERE state = 'failed'`).Scan(&failed); err != nil {
+		return 0, fmt.Errorf("count failed notifications: %w", err)
+	}
+	return failed, nil
 }
 
 // backoffFor spaces retries out: 1m, 5m, 30m, 2h, 12h.
