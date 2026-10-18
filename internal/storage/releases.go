@@ -139,17 +139,6 @@ func (r *Releases) Record(ctx context.Context, rel NewRelease, notify bool) (Fan
 	return out, tx.Commit(ctx)
 }
 
-// HasAnyReleases reports whether the table has ever been populated. Used to
-// decide whether a poll is the first-run seed.
-func (r *Releases) HasAnyReleases(ctx context.Context) (bool, error) {
-	var exists bool
-	if err := r.db.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM releases)`).Scan(&exists); err != nil {
-		return false, fmt.Errorf("check for existing releases: %w", err)
-	}
-	return exists, nil
-}
-
 // DedupKey is the fallback identity for a release, used when two sources
 // disagree about release groups.
 //

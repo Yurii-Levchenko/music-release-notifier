@@ -2,6 +2,7 @@ package storage_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
@@ -157,26 +158,21 @@ func TestSearchCacheExpiry(t *testing.T) {
 		_, _ = testDBPool.Exec(ctx, `DELETE FROM artist_search_cache WHERE query = $1`, query)
 	})
 
-	// A 40-year freshness window: long enough that no real entry is ever stale
+	// A 30-year freshness window: long enough that no real entry is ever stale
 	// to this instance, short enough that the 50-year-old fixture is.
-	const staleWindow = 40 * 365 * 24 * time.Hour
+	const staleWindow = 30 * 365 * 24 * time.Hour
 	writer := storage.NewSearchCache(testDBPool, staleWindow)
 	if _, err := writer.Put(ctx, query, []byte(`["x"]`)); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 
-	// Backdate the row rather than sleeping. Fifty years, not two hours, and
-	// the reason matters: EvictStale below issues an unscoped DELETE over the
-	// whole table. Backdating by hours and evicting with an hour-long TTL would
+	// Backdate the row rather than sleeping. Decades, not hours, and the
+	// reason matters: EvictStale issues an unscoped DELETE over the whole
+	// table. Backdating by hours and evicting with an hour-long TTL would
 	// delete every genuine cache entry older than an hour in whatever database
 	// this test happens to point at — which is exactly what happened once
 	// against the development database, and looked like "the cache is broken".
-	// With a 50-year horizon the only row old enough to match is this fixture.
-	if _, err := testDBPool.Exec(ctx,
-		`UPDATE artist_search_cache SET fetched_at = now() - interval '50 years' WHERE query = $1`,
-		query); err != nil {
-		t.Fatalf("backdate: %v", err)
-	}
+	backdate(ctx, t, query, "50 years")
 
 	if _, found, err := writer.Get(ctx, query); err != nil || found {
 		t.Fatalf("stale entry was returned: found=%v err=%v", found, err)
@@ -186,27 +182,57 @@ func TestSearchCacheExpiry(t *testing.T) {
 		t.Fatalf("stale entry returned by hash: found=%v err=%v", found, err)
 	}
 
-	// A wider window sees the same row again, proving it was expiry and not
+	// The outage fallback sees the same row, proving it was expiry and not
 	// deletion that hid it.
-	tolerant := storage.NewSearchCache(testDBPool, 100*365*24*time.Hour)
-	if _, found, err := tolerant.Get(ctx, query); err != nil || !found {
+	if _, found, err := writer.GetAnyAge(ctx, query); err != nil || !found {
 		t.Fatalf("row is gone, not merely stale: found=%v err=%v", found, err)
 	}
+}
 
-	// Eviction removes it for real — and must remove nothing else. EvictStale
-	// is an unscoped DELETE, so assert the blast radius rather than trusting it.
+// Eviction must spare what the outage fallback still needs and remove the
+// rest. A row past its TTL but inside the eviction horizon is exactly what
+// GetAnyAge serves while MusicBrainz is down; deleting it at the TTL would
+// leave the fallback almost empty.
+func TestSearchCacheEvictionKeepsTheOutageFallback(t *testing.T) {
+	ctx, _ := testTx(t)
+	if testDBPool == nil {
+		t.Skip("no database")
+	}
+
+	const (
+		fallback = "eviction fixture: past ttl, inside horizon"
+		ancient  = "eviction fixture: past horizon"
+	)
+	t.Cleanup(func() {
+		_, _ = testDBPool.Exec(ctx,
+			`DELETE FROM artist_search_cache WHERE query IN ($1, $2)`, fallback, ancient)
+	})
+
+	// TTL 30 years, so the horizon is 8 × 30 = 240. The fallback row is 50
+	// years old — stale, kept — and the ancient one 300 — gone. Only rows of
+	// these ages can match, whatever else is in the table (see TestSearchCacheExpiry).
+	cache := storage.NewSearchCache(testDBPool, 30*365*24*time.Hour)
+	for _, q := range []string{fallback, ancient} {
+		if _, err := cache.Put(ctx, q, []byte(`["x"]`)); err != nil {
+			t.Fatalf("Put %q: %v", q, err)
+		}
+	}
+	backdate(ctx, t, fallback, "50 years")
+	backdate(ctx, t, ancient, "300 years")
+
 	var before int
 	if err := testDBPool.QueryRow(ctx,
 		`SELECT count(*) FROM artist_search_cache`).Scan(&before); err != nil {
 		t.Fatalf("count before: %v", err)
 	}
-	removed, err := writer.EvictStale(ctx)
+	removed, err := cache.EvictStale(ctx)
 	if err != nil {
 		t.Fatalf("EvictStale: %v", err)
 	}
 	if removed != 1 {
-		t.Fatalf("EvictStale removed %d rows, want exactly 1 (this test's fixture)", removed)
+		t.Fatalf("EvictStale removed %d rows, want exactly 1 (the ancient fixture)", removed)
 	}
+	// An unscoped DELETE: assert the blast radius rather than trusting it.
 	var after int
 	if err := testDBPool.QueryRow(ctx,
 		`SELECT count(*) FROM artist_search_cache`).Scan(&after); err != nil {
@@ -216,8 +242,21 @@ func TestSearchCacheExpiry(t *testing.T) {
 		t.Fatalf("table went from %d to %d rows; the sweep took %d, want 1",
 			before, after, before-after)
 	}
-	if _, found, err := tolerant.Get(ctx, query); err != nil || found {
-		t.Fatalf("entry survived eviction: found=%v err=%v", found, err)
+
+	if _, found, err := cache.GetAnyAge(ctx, fallback); err != nil || !found {
+		t.Fatalf("eviction took a row the outage fallback still serves: found=%v err=%v", found, err)
+	}
+	if _, found, err := cache.GetAnyAge(ctx, ancient); err != nil || found {
+		t.Fatalf("a row past the horizon survived eviction: found=%v err=%v", found, err)
+	}
+}
+
+func backdate(ctx context.Context, t *testing.T, query, age string) {
+	t.Helper()
+	if _, err := testDBPool.Exec(ctx,
+		`UPDATE artist_search_cache SET fetched_at = now() - $2::interval WHERE query = $1`,
+		query, age); err != nil {
+		t.Fatalf("backdate %q: %v", query, err)
 	}
 }
 
