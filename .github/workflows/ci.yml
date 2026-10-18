@@ -202,11 +202,11 @@ jobs:
 
       - name: shellcheck
         run: |
-          docker run --rm -v "$PWD/deploy:/deploy:ro" koalaman/shellcheck:v0.10.0 -s sh /deploy/backup/backup.sh /deploy/alertmanager/entrypoint.sh /deploy/alertmanager/chat-id.sh
+          docker run --rm -v "$PWD/deploy:/deploy:ro" koalaman/shellcheck:v0.10.0 -s sh /deploy/backup/backup.sh /deploy/alertmanager/entrypoint.sh /deploy/alertmanager/chat-id.sh /deploy/alertmanager/silence.sh
 
       - name: busybox sh -n
         run: |
-          for f in deploy/backup/backup.sh deploy/alertmanager/entrypoint.sh deploy/alertmanager/chat-id.sh; do
+          for f in deploy/backup/backup.sh deploy/alertmanager/entrypoint.sh deploy/alertmanager/chat-id.sh deploy/alertmanager/silence.sh; do
             docker run --rm -v "$PWD/deploy:/deploy:ro" --entrypoint sh postgres:17-alpine -n "/$f" || exit 1
           done
 
