@@ -68,7 +68,10 @@ groups:
 
       - alert: QueueBacklogAgeing
         # The age of the oldest waiting item is the delay a person is actually
-        # experiencing, which is why it is the alert rather than depth.
+        # experiencing, which is why it is the alert rather than depth. Counted
+        # from when the row was queued since 18.10: before that it was counted
+        # from the next retry time, which a Telegram outage pushes into the
+        # future — so this read zero for the whole of the outage it is for.
         expr: releaseradar_notification_queue_age_seconds > 3600
         for: 10m
         labels:
@@ -188,6 +191,60 @@ groups:
           description: >-
             Alerts are being evaluated but may not be reaching anybody. Check
             the alert bot token and that the alertmanager container is up.
+
+      - alert: TelegramUnauthorized
+        # Telegram answered 401: the bot token is revoked or wrong. Nothing is
+        # delivered and nothing is received until a person replaces it, so it
+        # is critical by the definition above. Watched on sends and on the long
+        # poll, because on a day with no releases nothing is sent and the poll
+        # is the only place the 401 appears.
+        expr: >-
+          (sum(increase(releaseradar_telegram_requests_total{code="401"}[10m])) > 0)
+          or (sum(increase(releaseradar_bot_poll_failures_total{code="401"}[10m])) > 0)
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Telegram rejects the bot token
+          description: >-
+            Telegram answers 401 Unauthorized. The token was revoked or
+            replaced; get the current one from @BotFather and put it in
+            TELEGRAM_BOT_TOKEN.
+
+      - alert: DeliveriesFailing
+        # Most delivery attempts failing with a retryable error: Telegram is
+        # down or unreachable. Messages wait and retry for ~14.5 hours before
+        # anything is given up, so this is a warning — but it is the one that
+        # says why the queue is ageing. The volume floor keeps a single flaky
+        # send on a quiet day from reading as an outage.
+        expr: >-
+          sum(increase(releaseradar_notifications_total{disposition="transient"}[30m])) > 5
+          and
+          sum(increase(releaseradar_notifications_total{disposition="transient"}[30m]))
+          / sum(increase(releaseradar_notifications_total[30m])) > 0.5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Most notification deliveries are failing and being retried
+          description: >-
+            Over half of delivery attempts in 30 minutes failed with a
+            retryable error. Check the app's logs for the Telegram errors.
+
+      - alert: NotificationsFailed
+        # A notification that ended as failed is a release somebody never got:
+        # retries ran out, Telegram rejected the message as malformed, or a
+        # send never reported back. Read from the outbox, so it survives
+        # restarts and counts the rows Claim fails, which no log line did.
+        expr: (releaseradar_notifications_failed - releaseradar_notifications_failed offset 1h) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: A notification was given up in the last hour
+          description: >-
+            Somebody did not get a release. last_error on the failed rows says
+            why: SELECT id, last_error FROM notifications WHERE state = 'failed'
+            ORDER BY id DESC LIMIT 5;
 
       - alert: PermanentFailuresSpiking
         # Permanent means somebody's subscriptions were deleted. A handful is

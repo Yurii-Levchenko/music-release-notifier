@@ -38,16 +38,21 @@ func renderList(
 	fmt.Fprintf(&b, "🔔 <b>Твої підписки</b> — %d\n\n", total)
 
 	offset := page * listPageSize
+	var picked []string
 	for i, item := range items {
 		mark := ""
 		if sel.selected(i) {
 			mark = "✓ "
+			picked = append(picked, html.EscapeString(item.Name))
 		}
 		fmt.Fprintf(&b, "%s%d. %s\n", mark, offset+i+1, html.EscapeString(item.Name))
 	}
 
-	if n := sel.count(); n > 0 {
-		fmt.Fprintf(&b, "\nОбрано: %d. Натисни «Відписатись», щоб підтвердити.", n)
+	// Names, not a count. "Обрано: 1." next to a numbered list reads as "item 1
+	// is selected" — seen on a real screen with item 9 ticked. This is the
+	// line somebody reads right before a destructive tap, so it names who goes.
+	if len(picked) > 0 {
+		fmt.Fprintf(&b, "\nВідписатись від: %s. Натисни «Відписатись», щоб підтвердити.", namesList(picked))
 	} else {
 		b.WriteString("\nНатисни номери, щоб обрати кого прибрати.")
 	}
@@ -58,6 +63,16 @@ func renderList(
 	}
 
 	return b.String(), listKeyboard(items, page, pages, sel)
+}
+
+// namesList joins names for one line of text, and stops listing after a few so
+// a page with everything ticked does not turn the caption into a second list.
+func namesList(names []string) string {
+	const shown = 3
+	if len(names) <= shown {
+		return strings.Join(names, ", ")
+	}
+	return fmt.Sprintf("%s та ще %d", strings.Join(names[:shown], ", "), len(names)-shown)
 }
 
 func listKeyboard(items []storage.Subscription, page, pages int, sel selection) *telego.InlineKeyboardMarkup {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/mymmrac/telego"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // loopOnlyBot goes through the real constructor with nil dependencies. The
@@ -114,6 +115,11 @@ func TestFailingPollsDoNotReportProgress(t *testing.T) {
 	f.waitCalls(t, 2) // the second call proves the loop retried rather than exited
 	if got := beats.Load(); got != 0 {
 		t.Fatalf("beats = %d while every getUpdates failed, want 0", got)
+	}
+	// Counted, not only logged: on a day with nothing to send, a failing long
+	// poll is the only place a revoked token shows up.
+	if got := testutil.ToFloat64(b.metrics.BotPollFailures.WithLabelValues("transport")); got < 1 {
+		t.Fatalf("poll failures counted = %v, want at least 1", got)
 	}
 	if err := stop(); err != nil {
 		t.Fatalf("poll: %v", err)

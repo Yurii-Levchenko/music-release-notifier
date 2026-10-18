@@ -121,6 +121,81 @@ tests:
               summary: No successful poll in over 25 hours
               description: "New releases are not being detected, so notifications are late. The 7-day window means nothing is lost if polling resumes this week."
 
+  # A revoked token on a day with nothing to send: the only trace is the long
+  # poll failing with 401. It must still page.
+  - name: a 401 on the long poll alone is critical
+    interval: 1m
+    input_series:
+      - series: 'releaseradar_bot_poll_failures_total{job="releaseradar", instance="app:8080", code="401"}'
+        values: '0+4x30'
+      - series: 'releaseradar_telegram_requests_total{job="releaseradar", instance="app:8080", code="ok"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: TelegramUnauthorized
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: Telegram rejects the bot token
+              description: "Telegram answers 401 Unauthorized. The token was revoked or replaced; get the current one from @BotFather and put it in TELEGRAM_BOT_TOKEN."
+
+  # A Telegram outage: nearly every attempt is retried.
+  - name: mostly failing deliveries are a warning
+    interval: 1m
+    input_series:
+      - series: 'releaseradar_notifications_total{job="releaseradar", instance="app:8080", disposition="transient", kind="release"}'
+        values: '0+2x60'
+      - series: 'releaseradar_notifications_total{job="releaseradar", instance="app:8080", disposition="sent", kind="release"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: DeliveriesFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: Most notification deliveries are failing and being retried
+              description: "Over half of delivery attempts in 30 minutes failed with a retryable error. Check the app's logs for the Telegram errors."
+
+  # One flaky send on a quiet day is not an outage.
+  - name: a single retried send is not DeliveriesFailing
+    interval: 1m
+    input_series:
+      - series: 'releaseradar_notifications_total{job="releaseradar", instance="app:8080", disposition="transient", kind="release"}'
+        values: '0 1x60'
+      - series: 'releaseradar_notifications_total{job="releaseradar", instance="app:8080", disposition="sent", kind="release"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: DeliveriesFailing
+        exp_alerts: []
+
+  # A notification given up: fires while the hour that contains it is in view,
+  # and clears on its own once the count stops rising.
+  - name: a newly failed notification is a warning
+    interval: 5m
+    input_series:
+      - series: 'releaseradar_notifications_failed{job="releaseradar", instance="app:8080"}'
+        values: '2x12 3x24'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: NotificationsFailed
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: NotificationsFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: releaseradar
+              instance: app:8080
+            exp_annotations:
+              summary: A notification was given up in the last hour
+              description: "Somebody did not get a release. last_error on the failed rows says why: SELECT id, last_error FROM notifications WHERE state = 'failed' ORDER BY id DESC LIMIT 5;"
+      - eval_time: 170m
+        alertname: NotificationsFailed
+        exp_alerts: []
+
   # Running without the dead-man's switch is allowed, and never silent.
   - name: a disabled heartbeat is a warning
     interval: 1m

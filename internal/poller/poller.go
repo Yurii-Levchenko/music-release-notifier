@@ -121,6 +121,7 @@ func (p *Poller) Run(ctx context.Context) error {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 
+	failures := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -132,9 +133,15 @@ func (p *Poller) Run(ctx context.Context) error {
 		stats, err := p.PollOnce(ctx)
 		p.beat()
 		if err != nil {
+			failures++
+		} else {
+			failures = 0
+		}
+		next := p.nextPollIn(failures)
+		if err != nil {
 			// A failed poll is not fatal. The window is wide enough that the
 			// next attempt still covers everything this one missed.
-			p.log.Error("poll failed", "err", err, "retry_in", p.nextPollIn(err).String())
+			p.log.Error("poll failed", "err", err, "retry_in", next.String())
 		} else {
 			p.log.Info("poll complete",
 				"fetched", stats.Fetched,
@@ -145,24 +152,37 @@ func (p *Poller) Run(ctx context.Context) error {
 				"notified", stats.Notified,
 				"seeded", stats.Seeded)
 		}
-		timer.Reset(p.nextPollIn(err))
+		timer.Reset(next)
 	}
 }
 
-// failedPollRetry is how soon a failed poll is tried again.
-const failedPollRetry = time.Hour
+// A failed poll is retried after failedPollRetryMin, doubling per consecutive
+// failure up to failedPollRetryMax.
+const (
+	failedPollRetryMin = 5 * time.Minute
+	failedPollRetryMax = time.Hour
+)
 
-// nextPollIn is the full interval after a success and an hour after a failure.
-// The interval after a failure meant one ListenBrainz blip — or a laptop
-// resuming with no network yet — made every release a day late and kept
-// PollerStalled firing until the next day's attempt (review 16.09, Ops #8).
-// An hour, not minutes: the source is a daily feed, and the window is wide
-// enough that nothing is lost by waiting.
-func (p *Poller) nextPollIn(err error) time.Duration {
-	if err != nil && failedPollRetry < p.interval {
-		return failedPollRetry
+// nextPollIn is the full interval after a success, and a short, growing delay
+// after failures. The interval after a failure meant one ListenBrainz blip —
+// or a laptop resuming before its network — made every release a day late
+// and kept PollerStalled firing until the next day (review 16.09, Ops #8).
+//
+// Five minutes first, because the common failure is the momentary kind: a
+// machine that just woke up. Doubling after that, capped at an hour, because a
+// failure that survived the client's own retries and then a five-minute wait
+// is an outage, and ListenBrainz is a free community service — polling it
+// every five minutes through its outage would be bad manners for no gain: the
+// feed is daily and read with a 7-day window, so waiting loses nothing.
+func (p *Poller) nextPollIn(consecutiveFailures int) time.Duration {
+	if consecutiveFailures <= 0 {
+		return p.interval
 	}
-	return p.interval
+	d := failedPollRetryMin
+	for i := 1; i < consecutiveFailures && d < failedPollRetryMax; i++ {
+		d *= 2
+	}
+	return min(d, failedPollRetryMax, p.interval)
 }
 
 func (p *Poller) initialDelay(ctx context.Context) time.Duration {

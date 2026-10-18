@@ -187,6 +187,7 @@ func (b *Bot) poll(ctx context.Context, getUpdates getUpdatesFunc) error {
 		default:
 		}
 		if err != nil {
+			b.metrics.BotPollFailures.WithLabelValues(codeLabel(err)).Inc()
 			b.log.Warn("getUpdates failed, retrying", "err", err, "retry_in", retry.String())
 			wait = retry
 			retry = min(retry*2, pollRetryMax)

@@ -26,6 +26,7 @@ const namespace = "releaseradar"
 // QueueReader is the queue state the collector reads at scrape time.
 type QueueReader interface {
 	QueueDepth(ctx context.Context) (pending int, oldest time.Duration, err error)
+	FailedCount(ctx context.Context) (int, error)
 }
 
 type Metrics struct {
@@ -82,6 +83,12 @@ type Metrics struct {
 	// --- bot ---
 
 	BotUpdates *prometheus.CounterVec
+
+	// BotPollFailures counts failed getUpdates calls by result code. Sends are
+	// already counted in TelegramRequests, but a revoked token on a quiet day
+	// sends nothing — the only place a 401 shows up is the long poll, which
+	// fails every few seconds and until now only logged it.
+	BotPollFailures *prometheus.CounterVec
 
 	// --- the monitoring itself ---
 
@@ -186,6 +193,12 @@ func New(reg prometheus.Registerer) *Metrics {
 			Help:      "Telegram updates handled, by kind.",
 		}, "kind"),
 
+		BotPollFailures: factory.counterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "bot_poll_failures_total",
+			Help:      "Failed getUpdates calls, by result code.",
+		}, "code"),
+
 		HeartbeatEnabled: factory.gauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "heartbeat_enabled",
@@ -240,6 +253,9 @@ func (m *Metrics) RegisterQueue(reg prometheus.Registerer, queue QueueReader) er
 		up: prometheus.NewDesc(
 			namespace+"_queue_readable",
 			"1 if the queue could be read at scrape time, 0 otherwise.", nil, nil),
+		failed: prometheus.NewDesc(
+			namespace+"_notifications_failed",
+			"Notifications that ended without being delivered, as stored in the outbox.", nil, nil),
 	})
 }
 
@@ -248,12 +264,17 @@ type queueCollector struct {
 	pending *prometheus.Desc
 	oldest  *prometheus.Desc
 	up      *prometheus.Desc
+	// failed is read from the table rather than counted in the notifier, for
+	// the same reason as the backups: the rows are the truth, and a counter in
+	// process memory would miss the rows Claim fails and reset on restart.
+	failed *prometheus.Desc
 }
 
 func (c *queueCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.pending
 	ch <- c.oldest
 	ch <- c.up
+	ch <- c.failed
 }
 
 // Collect reads the queue. The timeout is short because a scrape must never
@@ -273,6 +294,13 @@ func (c *queueCollector) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(c.up, prometheus.GaugeValue, 1)
 	ch <- prometheus.MustNewConstMetric(c.pending, prometheus.GaugeValue, float64(pending))
 	ch <- prometheus.MustNewConstMetric(c.oldest, prometheus.GaugeValue, oldest.Seconds())
+
+	// Published only when it could be read. A zero on error would read as
+	// "nothing failed", and an alert on it would resolve exactly when the
+	// database is in trouble.
+	if failed, err := c.queue.FailedCount(ctx); err == nil {
+		ch <- prometheus.MustNewConstMetric(c.failed, prometheus.GaugeValue, float64(failed))
+	}
 }
 
 // promauto is a tiny local version of the upstream helper. Written out because

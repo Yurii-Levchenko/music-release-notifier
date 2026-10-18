@@ -169,7 +169,7 @@ func (n *Notifier) Run(ctx context.Context) error {
 		case <-timer.C:
 		}
 
-		sent, err := n.drainOnce(ctx)
+		sent, pause, err := n.drainOnce(ctx)
 		n.beat()
 		if err != nil && ctx.Err() == nil {
 			// A failed drain is not fatal: the lease expires and the rows come
@@ -181,18 +181,30 @@ func (n *Notifier) Run(ctx context.Context) error {
 		if sent >= batchSize {
 			wait = busyInterval
 		}
+		// Telegram's retry_after is a limit on the bot, not on one message.
+		// Only the 429'd row used to be rescheduled, and the next drain a
+		// minute later sent the rest of the queue straight back into the
+		// limit — one 429 a minute for as long as it lasted, and repeated
+		// 429s are how a short lockout becomes a long one (SPEC §10, review
+		// 16.09 Resilience #6). So the whole loop waits it out.
+		if pause > wait {
+			n.log.Warn("rate limited by the channel; pausing delivery", "for", pause.String())
+			wait = pause
+		}
 		timer.Reset(wait)
 	}
 }
 
-// drainOnce claims a batch and delivers it. Returns how many were handled.
-func (n *Notifier) drainOnce(ctx context.Context) (int, error) {
+// drainOnce claims a batch and delivers it. Returns how many were handled and,
+// when the channel asked us to slow down, how long to pause before the next
+// batch.
+func (n *Notifier) drainOnce(ctx context.Context) (int, time.Duration, error) {
 	batch, err := n.queue.Claim(ctx, batchSize)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if len(batch) == 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
 
 	n.forgetIdleChats()
@@ -212,7 +224,7 @@ func (n *Notifier) drainOnce(ctx context.Context) (int, error) {
 
 	for i := range batch {
 		if ctx.Err() != nil {
-			return i, ctx.Err()
+			return i, 0, ctx.Err()
 		}
 		p := &batch[i]
 
@@ -222,7 +234,8 @@ func (n *Notifier) drainOnce(ctx context.Context) (int, error) {
 			continue
 		}
 
-		switch n.deliver(ctx, p) {
+		result, retryAfter := n.deliver(ctx, p)
+		switch result {
 		case outcomeDropped:
 			dropped[p.UserID] = true
 
@@ -234,12 +247,12 @@ func (n *Notifier) drainOnce(ctx context.Context) (int, error) {
 			n.metrics.BatchesAbandoned.Inc()
 			n.log.Warn("upstream asked us to slow down; abandoning the rest of this batch",
 				"delivered", i, "abandoned", len(batch)-i-1)
-			return i, nil
+			return i, retryAfter, nil
 
 		case outcomeDone:
 		}
 	}
-	return len(batch), nil
+	return len(batch), 0, nil
 }
 
 // forgetIdleChats drops per-chat timing state that can no longer delay
@@ -255,8 +268,9 @@ func (n *Notifier) forgetIdleChats() {
 }
 
 // deliver sends one notification, records the result, and reports what that
-// result means for the rest of the batch.
-func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) outcome {
+// result means for the rest of the batch — with the server's requested delay
+// when the answer is outcomeBackOff.
+func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) (outcome, time.Duration) {
 	log := n.log.With(
 		"notification_id", p.ID,
 		"chat_id", p.ChatID,
@@ -269,12 +283,12 @@ func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) outcome {
 		// but neither is the message wrong — leave it queued for a build that
 		// can.
 		log.Error("no channel to deliver on", "err", err)
-		return outcomeDone
+		return outcomeDone, 0
 	}
 
 	if err := n.waitForSlot(ctx, p.ChatID); err != nil {
 		// Context canceled; the lease expires and the row returns.
-		return outcomeDone
+		return outcomeDone, 0
 	}
 
 	// Detached from shutdown, bounded by its own deadline. A send already
@@ -316,10 +330,10 @@ func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) outcome {
 			// The message went out. Failing to record that means it will be sent
 			// again when the lease expires — worth an error, not a retry.
 			log.Error("delivered but could not mark sent", "err", err)
-			return outcomeDone
+			return outcomeDone, 0
 		}
 		log.Info("notification sent", "artist", p.ArtistName, "title", p.Title)
-		return outcomeDone
+		return outcomeDone, 0
 	}
 
 	disposition, retryAfter := notify.DispositionOf(sendErr)
@@ -333,9 +347,9 @@ func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) outcome {
 			log.Error("could not drop recipient", "err", err)
 			// The drop did not stick, so the rest of this batch cannot be
 			// treated as already handled.
-			return outcomeDone
+			return outcomeDone, 0
 		}
-		return outcomeDropped
+		return outcomeDropped, 0
 
 	case notify.BadMessage:
 		n.metrics.Notifications.WithLabelValues("bad_message", kindLabel(p)).Inc()
@@ -345,18 +359,18 @@ func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) outcome {
 		if err := n.queue.Fail(rec, p.ID, sendErr.Error()); err != nil {
 			log.Error("could not mark failed", "err", err)
 		}
-		return outcomeDone
+		return outcomeDone, 0
 
 	default: // notify.Transient
 		n.metrics.Notifications.WithLabelValues("transient", kindLabel(p)).Inc()
 		gaveUp, err := n.queue.Retry(rec, p.ID, p.Attempts, retryAfter, sendErr.Error())
 		if err != nil {
 			log.Error("could not reschedule", "err", err)
-			return outcomeDone
+			return outcomeDone, 0
 		}
 		if gaveUp {
 			log.Error("giving up on notification", "attempts", p.Attempts, "err", sendErr)
-			return outcomeDone
+			return outcomeDone, 0
 		}
 		log.Warn("delivery failed, will retry",
 			"retry_after", retryAfter.Round(time.Second), "err", sendErr)
@@ -364,9 +378,9 @@ func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) outcome {
 		if retryAfter > 0 {
 			// A server-supplied delay is a rate limit, not a hiccup: it applies
 			// to the connection, not to this one message.
-			return outcomeBackOff
+			return outcomeBackOff, retryAfter
 		}
-		return outcomeDone
+		return outcomeDone, 0
 	}
 }
 

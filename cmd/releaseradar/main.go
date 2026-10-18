@@ -51,7 +51,13 @@ const claimLease = 5 * time.Minute
 // After this many attempts a notification is failed rather than retried
 // forever: a message nobody can receive should stop consuming rate-limit budget
 // that live ones need.
-const maxDeliveryAttempts = 5
+//
+// Six, so that every step of the backoff (1m, 5m, 30m, 2h, 12h) is actually
+// used. Attempts are counted at claim time, and with five the 12h step was
+// never reached: a Telegram outage longer than about 2h36m failed every queued
+// notification for good. Six gives an outage roughly 14h36m before anything is
+// given up (review 16.09, Resilience #4).
+const maxDeliveryAttempts = 6
 
 func main() {
 	// run() so every exit path can defer cleanly; main only sets the exit code.

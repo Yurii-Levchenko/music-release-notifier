@@ -181,27 +181,78 @@ func TestRecordDoesNotReachLaterSubscribers(t *testing.T) {
 	}
 }
 
-// A blocked user keeps their queued notification. A block is reversible, and
-// the notifier skips them at send time — deleting the row would lose the
-// release permanently if they came back.
-func TestRecordStillQueuesForBlockedUsers(t *testing.T) {
+// Blocking the bot means the user has left (SPEC D16). Their subscriptions go,
+// whatever was queued for them is skipped rather than left pending forever,
+// and later releases do not fan out to them. This used to keep all three, so
+// the outcome depended on whether we heard about the block from Telegram's
+// my_chat_member update or from a 403 on the next send — which deleted them.
+func TestBlockingTheBotDropsTheUser(t *testing.T) {
 	ctx, releases, subs := testReleases(t)
 	users := storage.NewUsers(testDBPool)
+	artist := storage.ArtistRef{MBID: relArtist, Name: "Radiohead"}
 
-	if _, err := subs.Subscribe(ctx, relChatA,
-		storage.ArtistRef{MBID: relArtist, Name: "Radiohead"}, "bot"); err != nil {
-		t.Fatalf("subscribe: %v", err)
+	for _, chat := range []int64{relChatA, relChatB} {
+		if _, err := subs.Subscribe(ctx, chat, artist, "bot"); err != nil {
+			t.Fatalf("subscribe %d: %v", chat, err)
+		}
 	}
+	if _, err := releases.Record(ctx, newRelease(relGroup), true); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+
 	if err := users.SetBlocked(ctx, relChatA, true); err != nil {
 		t.Fatalf("block: %v", err)
 	}
 
-	out, err := releases.Record(ctx, newRelease(relGroup), true)
+	var subsLeft, pendingLeft int
+	if err := testDBPool.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM subscriptions s JOIN users u ON u.id = s.user_id
+			 WHERE u.telegram_chat_id = $1),
+			(SELECT count(*) FROM notifications n JOIN users u ON u.id = n.user_id
+			 WHERE u.telegram_chat_id = $1 AND n.state = 'pending')`,
+		relChatA).Scan(&subsLeft, &pendingLeft); err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	if subsLeft != 0 || pendingLeft != 0 {
+		t.Fatalf("after blocking: %d subscriptions and %d pending rows left, want none", subsLeft, pendingLeft)
+	}
+
+	next := newRelease(relGroup2)
+	next.Title = "Kid A" // a different release, so a different dedup key
+	out, err := releases.Record(ctx, next, true)
 	if err != nil {
 		t.Fatalf("Record: %v", err)
 	}
 	if out.Notified != 1 {
-		t.Fatalf("notified %d for a blocked subscriber, want 1", out.Notified)
+		t.Fatalf("notified %d for the next release, want 1 — only the subscriber who stayed", out.Notified)
+	}
+
+	// Someone else's block must not touch this user.
+	if n := countNotifications(ctx, t, relChatB); n != 2 {
+		t.Fatalf("the other subscriber has %d notifications, want 2", n)
+	}
+
+	// Unblocking clears the flag and nothing else: there is nothing to resume.
+	if err := users.SetBlocked(ctx, relChatA, false); err != nil {
+		t.Fatalf("unblock: %v", err)
+	}
+	if err := testDBPool.QueryRow(ctx, `
+		SELECT count(*) FROM subscriptions s JOIN users u ON u.id = s.user_id
+		WHERE u.telegram_chat_id = $1 AND u.blocked_at IS NULL`, relChatA).Scan(&subsLeft); err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	if subsLeft != 0 {
+		t.Fatalf("unblocking brought back %d subscriptions", subsLeft)
+	}
+}
+
+// Blocking a chat we have never seen is not an error: my_chat_member can
+// arrive for a user who never pressed /start.
+func TestBlockingAnUnknownChatIsANoOp(t *testing.T) {
+	ctx, _, _ := testReleases(t)
+	if err := storage.NewUsers(testDBPool).SetBlocked(ctx, -999000099, true); err != nil {
+		t.Fatalf("block unknown chat: %v", err)
 	}
 }
 

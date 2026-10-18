@@ -236,13 +236,19 @@ The interesting tests assert database invariants, because that is where
 correctness lives:
 
 ```bash
+docker compose exec db psql -U releaseradar -d postgres -c "CREATE DATABASE releaseradar_test"   # once
 set -a; . ./.env; set +a      # TEST_DATABASE_URL lives in .env, with the real password
 go test ./... -count=1
 ```
 
-Each one runs in a transaction that is always rolled back, so they leave no rows
-behind. Without `TEST_DATABASE_URL` they skip rather than fail, keeping
-`go test ./...` green with no Docker running.
+They run against their own database, `releaseradar_test`, and apply the
+migrations themselves. Most run in a transaction that is always rolled back;
+the ones that test real concurrency cannot, because statements inside one
+transaction are serialized, so they commit and clean up — which is why the
+queue race test refuses to run against any database not named `*_test` outside
+CI: a due notification committed into the live database would be sent by the
+running app. Without `TEST_DATABASE_URL` the database tests skip rather than
+fail, keeping `go test ./...` green with no Docker running.
 
 ## Roadmap
 

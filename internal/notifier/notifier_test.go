@@ -409,7 +409,7 @@ func TestDrainOnceHandlesAnEmptyQueue(t *testing.T) {
 	q := &fakeQueue{}
 	n, _, _ := testNotifier(q, &fakeChannel{})
 
-	sent, err := n.drainOnce(context.Background())
+	sent, _, err := n.drainOnce(context.Background())
 	if err != nil {
 		t.Fatalf("drainOnce on an empty queue: %v", err)
 	}
@@ -423,7 +423,7 @@ func TestDrainOncePropagatesClaimFailure(t *testing.T) {
 	q := &fakeQueue{claimErr: wantErr}
 	n, _, _ := testNotifier(q, &fakeChannel{})
 
-	if _, err := n.drainOnce(context.Background()); !errors.Is(err, wantErr) {
+	if _, _, err := n.drainOnce(context.Background()); !errors.Is(err, wantErr) {
 		t.Fatalf("err = %v, want the claim error", err)
 	}
 }
@@ -472,7 +472,7 @@ func TestDrainOnceDeliversEveryRowInTheBatch(t *testing.T) {
 	}}}
 	n, _, _ := testNotifier(q, ch)
 
-	sent, err := n.drainOnce(context.Background())
+	sent, _, err := n.drainOnce(context.Background())
 	if err != nil {
 		t.Fatalf("drainOnce: %v", err)
 	}
@@ -503,12 +503,18 @@ func TestBatchIsAbandonedWhenTheServerAsksUsToWait(t *testing.T) {
 	}}}
 	n, _, _ := testNotifier(q, ch)
 
-	if _, err := n.drainOnce(context.Background()); err != nil {
+	_, pause, err := n.drainOnce(context.Background())
+	if err != nil {
 		t.Fatalf("drainOnce: %v", err)
 	}
 
 	if len(ch.sent) != 2 {
 		t.Fatalf("attempted %d sends, want 2 — the batch kept going after a 429", len(ch.sent))
+	}
+	// The delay belongs to the whole loop, not to the one row: the next batch
+	// must wait it out, or it walks straight back into the limit.
+	if pause != 30*time.Second {
+		t.Fatalf("pause = %v after retry_after 30s, want 30s", pause)
 	}
 	if len(q.retries) != 1 || q.retries[0].id != 2 {
 		t.Fatalf("retries = %+v, want the rate-limited row rescheduled", q.retries)
@@ -531,11 +537,15 @@ func TestBatchContinuesAfterAPlainTransientFailure(t *testing.T) {
 	}}}
 	n, _, _ := testNotifier(q, ch)
 
-	if _, err := n.drainOnce(context.Background()); err != nil {
+	_, pause, err := n.drainOnce(context.Background())
+	if err != nil {
 		t.Fatalf("drainOnce: %v", err)
 	}
 	if len(ch.sent) != 3 {
 		t.Fatalf("attempted %d sends, want 3 — one bad send stalled the batch", len(ch.sent))
+	}
+	if pause != 0 {
+		t.Fatalf("pause = %v after a plain transient failure, want none", pause)
 	}
 	if len(q.marked) != 2 {
 		t.Fatalf("marked %d, want 2", len(q.marked))
@@ -558,7 +568,7 @@ func TestDroppedRecipientsRemainingRowsAreNotAttempted(t *testing.T) {
 	}}}
 	n, _, _ := testNotifier(q, ch)
 
-	if _, err := n.drainOnce(context.Background()); err != nil {
+	if _, _, err := n.drainOnce(context.Background()); err != nil {
 		t.Fatalf("drainOnce: %v", err)
 	}
 
@@ -592,7 +602,7 @@ func TestDropFailureDoesNotSuppressTheRestOfTheBatch(t *testing.T) {
 	}}
 	n, _, _ := testNotifier(q, ch)
 
-	if _, err := n.drainOnce(context.Background()); err != nil {
+	if _, _, err := n.drainOnce(context.Background()); err != nil {
 		t.Fatalf("drainOnce: %v", err)
 	}
 	if len(ch.sent) != 2 {
@@ -616,7 +626,7 @@ func TestIdleChatsAreForgotten(t *testing.T) {
 	n, _, clock := testNotifier(q, ch)
 
 	ctx := context.Background()
-	if _, err := n.drainOnce(ctx); err != nil {
+	if _, _, err := n.drainOnce(ctx); err != nil {
 		t.Fatalf("first drain: %v", err)
 	}
 	if len(n.lastSent) != 1 {
@@ -625,7 +635,7 @@ func TestIdleChatsAreForgotten(t *testing.T) {
 
 	// Move past the gap: chat 111 can no longer delay anything.
 	*clock = clock.Add(10 * time.Second)
-	if _, err := n.drainOnce(ctx); err != nil {
+	if _, _, err := n.drainOnce(ctx); err != nil {
 		t.Fatalf("second drain: %v", err)
 	}
 	if _, stillThere := n.lastSent[111]; stillThere {
