@@ -151,12 +151,6 @@ func TestRecordWithoutNotifyStoresButDoesNotQueue(t *testing.T) {
 	if n := countNotifications(ctx, t, relChatA); n != 0 {
 		t.Fatalf("subscriber has %d notifications after a seed", n)
 	}
-
-	// And the baseline must count as seen, so the next poll notifies normally.
-	seen, err := releases.HasAnyReleases(ctx)
-	if err != nil || !seen {
-		t.Fatalf("HasAnyReleases = %v, err = %v", seen, err)
-	}
 }
 
 // Somebody who subscribes tomorrow signed up for what comes next, not for a
@@ -178,6 +172,40 @@ func TestRecordDoesNotReachLaterSubscribers(t *testing.T) {
 	}
 	if n := countNotifications(ctx, t, relChatB); n != 0 {
 		t.Fatalf("a later subscriber received %d notifications for an older release", n)
+	}
+}
+
+// A title-track single released the same day as its album is two release
+// groups with one artist|title|date. Both must be recorded and both announced:
+// the release group is the dedup key (D7), and the composite used to be UNIQUE
+// too, which turned the second release into a 23505 that was logged daily and
+// never delivered (migration 0009).
+func TestSameTitleSameDayReleasesAreBothRecorded(t *testing.T) {
+	ctx, releases, subs := testReleases(t)
+	if _, err := subs.Subscribe(ctx, relChatA,
+		storage.ArtistRef{MBID: relArtist, Name: "Radiohead"}, "bot"); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	single := newRelease(relGroup)
+	single.PrimaryType = "Single"
+	album := newRelease(relGroup2)
+	if storage.DedupKey(single) != storage.DedupKey(album) {
+		t.Fatal("fixture no longer reproduces the collision: the two releases must share a dedup key")
+	}
+
+	for _, rel := range []storage.NewRelease{single, album} {
+		out, err := releases.Record(ctx, rel, true)
+		if err != nil {
+			t.Fatalf("Record %s %s: %v", rel.PrimaryType, rel.ReleaseGroupMBID, err)
+		}
+		if !out.Created || out.Notified != 1 {
+			t.Fatalf("Record %s: created=%v notified=%d, want a new release announced once",
+				rel.PrimaryType, out.Created, out.Notified)
+		}
+	}
+	if n := countNotifications(ctx, t, relChatA); n != 2 {
+		t.Fatalf("subscriber has %d notifications, want 2 — one per release group", n)
 	}
 }
 

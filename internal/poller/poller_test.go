@@ -652,3 +652,74 @@ func TestCompilationsAreNotNotified(t *testing.T) {
 			stats.SkippedByType)
 	}
 }
+
+// --- janitor ----------------------------------------------------------------
+
+type fakeJanitor struct {
+	evictErr   error
+	tokensErr  error
+	evictCalls int
+	tokenCalls int
+}
+
+func (f *fakeJanitor) EvictStale(context.Context) (int64, error) {
+	f.evictCalls++
+	return 3, f.evictErr
+}
+
+func (f *fakeJanitor) DeleteExpiredLinkTokens(context.Context) (int64, error) {
+	f.tokenCalls++
+	return 2, f.tokensErr
+}
+
+func janitorStore() *fakeStore {
+	return &fakeStore{
+		tracked:    map[string]struct{}{tracked1: {}},
+		stateFound: true,
+		state:      storage.PollState{LastOKAt: fixedNow.Add(-24 * time.Hour)},
+	}
+}
+
+// The deletes rode on nothing before: they were written, tested, and never
+// called, so expired rows stayed forever. Riding on the poll gives them a daily
+// schedule without a timer of their own.
+func TestPollRunsTheJanitor(t *testing.T) {
+	j := &fakeJanitor{}
+	p := testPoller(&fakeFeed{}, janitorStore()).WithJanitor(j)
+
+	if _, err := p.PollOnce(context.Background()); err != nil {
+		t.Fatalf("PollOnce: %v", err)
+	}
+	if j.evictCalls != 1 || j.tokenCalls != 1 {
+		t.Fatalf("janitor ran evict=%d tokens=%d times, want once each", j.evictCalls, j.tokenCalls)
+	}
+}
+
+// Housekeeping must never decide whether a poll succeeded, and one failed
+// delete must not cancel the other: they touch different tables.
+func TestJanitorFailureNeitherFailsThePollNorSkipsTheOtherDelete(t *testing.T) {
+	j := &fakeJanitor{evictErr: errors.New("canceling statement due to statement timeout")}
+	p := testPoller(&fakeFeed{}, janitorStore()).WithJanitor(j)
+
+	if _, err := p.PollOnce(context.Background()); err != nil {
+		t.Fatalf("a failed eviction failed the poll: %v", err)
+	}
+	if j.tokenCalls != 1 {
+		t.Fatal("a failed eviction skipped the link-code cleanup")
+	}
+}
+
+// A ListenBrainz outage is no reason to keep expired rows: the sweep runs after
+// the poll whatever the poll's outcome, like the link backfill.
+func TestJanitorRunsAfterAFailedPoll(t *testing.T) {
+	j := &fakeJanitor{}
+	p := testPoller(&fakeFeed{err: errors.New("503")}, janitorStore()).WithJanitor(j)
+
+	if _, err := p.PollOnce(context.Background()); err == nil {
+		t.Fatal("the feed failed but PollOnce reported success")
+	}
+	if j.evictCalls != 1 || j.tokenCalls != 1 {
+		t.Fatalf("janitor ran evict=%d tokens=%d times after a failed poll, want once each",
+			j.evictCalls, j.tokenCalls)
+	}
+}

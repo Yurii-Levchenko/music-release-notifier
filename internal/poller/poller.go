@@ -59,6 +59,8 @@ type Poller struct {
 
 	// links is optional; nil disables the backfill.
 	links LinkBackfill
+	// janitor is optional; nil disables the daily sweep.
+	janitor Janitor
 	// catchUp is optional; nil makes CatchUp a no-op.
 	catchUp CatchUpStore
 	// feed3 caches the short catch-up window, which is fetched on a button
@@ -270,6 +272,48 @@ func (p *Poller) backfillLinks(ctx context.Context) {
 	}
 }
 
+// Janitor deletes rows that have outlived their use: search results too old
+// even for the outage fallback, and link codes nobody redeemed.
+//
+// Both deletes existed and were tested long before anything called them, so
+// the cache's seven-day TTL (SPEC §8) only filtered reads and every row stayed
+// forever (review 16.09, Data #1). Link codes matter more than their size
+// suggests: /link/init is unauthenticated, so anyone can mint them.
+type Janitor interface {
+	EvictStale(ctx context.Context) (int64, error)
+	DeleteExpiredLinkTokens(ctx context.Context) (int64, error)
+}
+
+// WithJanitor enables the daily sweep. Optional, like the backfill.
+func (p *Poller) WithJanitor(j Janitor) *Poller {
+	p.janitor = j
+	return p
+}
+
+// sweep runs the janitor once. Never fatal, for the same reason as the
+// backfill: housekeeping that fails is retried tomorrow, and it must not make a
+// successful poll look failed. Each delete runs even if the other failed —
+// they touch different tables and share nothing but the schedule.
+func (p *Poller) sweep(ctx context.Context) {
+	if p.janitor == nil {
+		return
+	}
+
+	evicted, err := p.janitor.EvictStale(ctx)
+	if err != nil {
+		p.log.Warn("could not evict stale search results", "err", err)
+	}
+	expired, err := p.janitor.DeleteExpiredLinkTokens(ctx)
+	if err != nil {
+		p.log.Warn("could not delete expired link codes", "err", err)
+	}
+	if evicted > 0 || expired > 0 {
+		p.log.Info("housekeeping done",
+			"search_results_evicted", evicted,
+			"link_codes_deleted", expired)
+	}
+}
+
 // WithMetrics attaches collectors.
 func (p *Poller) WithMetrics(m *metrics.Metrics) *Poller {
 	if m != nil {
@@ -294,8 +338,9 @@ func (p *Poller) PollOnce(ctx context.Context) (Stats, error) {
 	}
 
 	// After the poll, never instead of it: detecting releases is the job, and
-	// filling in links is housekeeping.
+	// filling in links and deleting expired rows is housekeeping.
 	p.backfillLinks(ctx)
+	p.sweep(ctx)
 
 	// Record the attempt either way: the gap between last_polled_at and
 	// last_ok_at is how an alert learns the poller has been failing.
