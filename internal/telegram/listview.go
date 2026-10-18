@@ -52,7 +52,7 @@ func renderList(
 	// is selected" — seen on a real screen with item 9 ticked. This is the
 	// line somebody reads right before a destructive tap, so it names who goes.
 	if len(picked) > 0 {
-		fmt.Fprintf(&b, "\nВідписатись від: %s. Натисни «Відписатись», щоб підтвердити.", namesList(picked))
+		fmt.Fprintf(&b, "\nВідписатись від: %s? \nНатисни «Відписатись», щоб підтвердити.", namesList(picked))
 	} else {
 		b.WriteString("\nНатисни номери, щоб обрати кого прибрати.")
 	}
