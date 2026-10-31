@@ -298,8 +298,6 @@ func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) (outcome, ti
 	// batch after this one message.
 	sendCtx, cancelSend := context.WithTimeout(context.WithoutCancel(ctx), sendTimeout)
 	defer cancelSend()
-	rec, cancelRec := recordContext(ctx)
-	defer cancelRec()
 
 	start := n.now()
 	sendErr := channel.Send(sendCtx, notify.Recipient{
@@ -322,6 +320,14 @@ func (n *Notifier) deliver(ctx context.Context, p *storage.Pending) (outcome, ti
 		},
 	})
 	n.lastSent[p.ChatID] = n.now()
+
+	// Started only now that the send is over. It used to start before the
+	// send, so a slow one ate the whole budget: on 31.10 a cover Telegram could
+	// not fetch, a retry and the text fallback took 7 s, MarkSent then ran on a
+	// context already 2 s past its 5 s deadline, and the release went out
+	// twice. The budget is for writing the outcome down, so it starts then.
+	rec, cancelRec := recordContext(ctx)
+	defer cancelRec()
 	n.metrics.DeliverySeconds.Observe(n.now().Sub(start).Seconds())
 
 	if sendErr == nil {

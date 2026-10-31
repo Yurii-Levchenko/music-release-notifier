@@ -56,6 +56,8 @@ type fakeQueue struct {
 	claims  int
 
 	marked   []int64
+	// markBudget is how much time MarkSent had left when it was called.
+	markBudget []time.Duration
 	retries  []retryCall
 	failed   []int64
 	dropped  []int64
@@ -81,6 +83,9 @@ func (q *fakeQueue) Claim(context.Context, int) ([]storage.Pending, error) {
 func (q *fakeQueue) MarkSent(ctx context.Context, id int64) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if d, ok := ctx.Deadline(); ok {
+		q.markBudget = append(q.markBudget, time.Until(d))
 	}
 	q.marked = append(q.marked, id)
 	return nil
@@ -332,6 +337,28 @@ func TestDeliveredButUnrecordedIsNotRetried(t *testing.T) {
 }
 
 type failingMarkQueue struct{ fakeQueue }
+
+// A slow send must not eat the time set aside for recording it. On 31.10 a
+// cover Telegram could not fetch took 7 s with the retry and text fallback;
+// the 5 s record budget had started before the send, MarkSent failed, and the
+// release went out twice after the reservation expired.
+func TestSlowSendLeavesTheFullBudgetForRecordingIt(t *testing.T) {
+	const slow = 300 * time.Millisecond
+	ch := &fakeChannel{during: func(context.Context) { time.Sleep(slow) }}
+	q := &fakeQueue{}
+	n, _, _ := testNotifier(q, ch)
+
+	p := pending(1, 10, 999, 1)
+	n.deliver(context.Background(), &p)
+
+	if len(q.marked) != 1 || len(q.markBudget) != 1 {
+		t.Fatalf("marked = %v, want the delivery recorded once", q.marked)
+	}
+	if left := q.markBudget[0]; left < recordTimeout-slow/2 {
+		t.Fatalf("MarkSent had %v left of %v after a %v send; the budget started before the send",
+			left, recordTimeout, slow)
+	}
+}
 
 // SIGTERM while a message is on the wire. Telegram accepts it, so the outcome
 // must still be written down: a MarkSent on the canceled context failed
