@@ -55,13 +55,13 @@ type fakeQueue struct {
 	batches [][]storage.Pending
 	claims  int
 
-	marked   []int64
+	marked []int64
 	// markBudget is how much time MarkSent had left when it was called.
 	markBudget []time.Duration
-	retries  []retryCall
-	failed   []int64
-	dropped  []int64
-	gaveUpOn map[int64]bool
+	retries    []retryCall
+	failed     []int64
+	dropped    []int64
+	gaveUpOn   map[int64]bool
 
 	claimErr error
 	depth    int
