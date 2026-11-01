@@ -33,6 +33,25 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) error {
 	}
 	defer conn.Release()
 
+	// The pool's limits (applySessionLimits) are sized for request-path
+	// queries. Migrations are the exception on both counts: a schema change
+	// may legitimately run long, and waiting for a lock — behind the nightly
+	// pg_dump, or behind another instance holding the advisory lock below — is
+	// the right answer at boot, where a lock_timeout would turn a few seconds'
+	// wait into a refused start and a restart loop. Nothing else runs yet, so
+	// the wait blocks nobody. Lifted for this session only and restored before
+	// the connection goes back to the pool.
+	if _, err := conn.Exec(ctx, `SET statement_timeout = 0; SET lock_timeout = 0`); err != nil {
+		return fmt.Errorf("lift session limits for migration: %w", err)
+	}
+	defer func() {
+		if _, err := conn.Exec(ctx, `RESET statement_timeout; RESET lock_timeout`); err != nil {
+			// A connection that kept the lifted limits must not serve queries.
+			log.Warn("restore session limits after migration", "err", err)
+			_ = conn.Conn().Close(ctx)
+		}
+	}()
+
 	// Serialize migration across instances. Released when the session ends,
 	// but we unlock explicitly so a long-lived pooled connection is not held.
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, advisoryLockKey); err != nil {

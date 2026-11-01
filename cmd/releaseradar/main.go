@@ -207,6 +207,12 @@ func run() error {
 		Subscriptions: storage.NewSubscriptions(pool),
 		Client:        mb,
 	})
+	// Wired whether or not the bot and the API are: rows minted while they
+	// were on still have to go when they are off.
+	releasePoller.WithJanitor(janitor{
+		SearchCache: storage.NewSearchCache(pool, searchCacheTTL),
+		Linking:     storage.NewLinking(pool),
+	})
 
 	// The extension API (S8). Mounted only alongside a bot, because linking
 	// ends in Telegram: /link/init would otherwise hand out a deep link to a
@@ -307,4 +313,11 @@ func run() error {
 type linkBackfill struct {
 	*storage.Subscriptions
 	*musicbrainz.Client
+}
+
+// janitor satisfies poller.Janitor from the two stores that each own one kind
+// of expiring row. Embedding for the same reason as linkBackfill.
+type janitor struct {
+	*storage.SearchCache
+	*storage.Linking
 }
