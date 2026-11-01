@@ -82,18 +82,20 @@ func (l *Linking) CreateLinkToken(ctx context.Context, installID string) (LinkTo
 	// install is a thing to explain rather than a feature, and it is what turns
 	// an unauthenticated endpoint into unbounded row growth.
 	//
-	// Redeemed rows are untouched: they are the record of when this install was
-	// linked, and deleting them would lose it.
-	if _, err := l.db.Exec(ctx,
-		`DELETE FROM link_tokens WHERE install_id = $1 AND redeemed_at IS NULL`,
-		installID); err != nil {
-		return LinkToken{}, fmt.Errorf("clear previous link tokens: %w", err)
-	}
-
-	// short_code is UNIQUE and six characters, so a collision with a live code
-	// is possible however unlikely. Retrying on the constraint is the honest
-	// way to handle it: checking first would be a race, and the database
-	// already knows the answer.
+	// The database enforces it: link_tokens_live_install_idx admits one
+	// unredeemed row per install, and this statement overwrites that row rather
+	// than adding one. It used to be a DELETE and then an INSERT, and two calls
+	// racing for one install could both commit and leave two working codes
+	// (review 16.09, Data #6). Concurrent upserts on one install serialize on
+	// the index; the last one wins, which is what "replace the code" means.
+	//
+	// Redeemed rows are untouched — the index does not cover them: they are the
+	// record of when this install was linked, and overwriting them would lose it.
+	//
+	// short_code is UNIQUE and six characters, so a collision with another
+	// install's code is possible however unlikely. Retrying on the constraint is
+	// the honest way to handle it: checking first would be a race, and the
+	// database already knows the answer.
 	for attempt := 0; attempt < 5; attempt++ {
 		code, codeErr := randomCode()
 		if codeErr != nil {
@@ -102,7 +104,13 @@ func (l *Linking) CreateLinkToken(ctx context.Context, installID string) (LinkTo
 
 		_, err = l.db.Exec(ctx, `
 			INSERT INTO link_tokens (token_hash, short_code, install_id, expires_at, api_token_hash)
-			VALUES ($1, $2, $3, $4, $5)`,
+			VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT (install_id) WHERE redeemed_at IS NULL DO UPDATE
+				SET token_hash = EXCLUDED.token_hash,
+				    short_code = EXCLUDED.short_code,
+				    expires_at = EXCLUDED.expires_at,
+				    api_token_hash = EXCLUDED.api_token_hash,
+				    created_at = now()`,
 			hashToken(token), code, installID, expires, hashToken(apiToken))
 		if err == nil {
 			return LinkToken{
@@ -209,9 +217,17 @@ func (l *Linking) InstallByAPIToken(ctx context.Context, apiToken string) (Insta
 // Deliberately best-effort and separate from the lookup: a write on every
 // authenticated read would put the API's availability at the mercy of a
 // statistic nobody reads during an incident.
+//
+// At most once an hour per install. last_seen_at answers "is this extension
+// still in use", which an hour's precision answers fully, while an UPDATE per
+// request left a dead row version behind every read — 32 dead to 1 live after
+// one evening of testing (review 16.09, Data #9).
 func (l *Linking) TouchInstall(ctx context.Context, installID string) error {
-	if _, err := l.db.Exec(ctx,
-		`UPDATE installs SET last_seen_at = now() WHERE install_id = $1`, installID); err != nil {
+	if _, err := l.db.Exec(ctx, `
+		UPDATE installs SET last_seen_at = now()
+		WHERE install_id = $1
+		  AND (last_seen_at IS NULL OR last_seen_at < now() - interval '1 hour')`,
+		installID); err != nil {
 		return fmt.Errorf("touch install %s: %w", installID, err)
 	}
 	return nil

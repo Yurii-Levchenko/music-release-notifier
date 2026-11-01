@@ -68,8 +68,8 @@ func (c *SearchCache) Get(ctx context.Context, query string) (CachedSearch, bool
 	err := c.pool.QueryRow(ctx, `
 		SELECT query, query_hash, payload, fetched_at
 		FROM artist_search_cache
-		WHERE query = $1 AND fetched_at > now() - $2::interval`,
-		normalized, c.ttl.String(),
+		WHERE query = $1 AND fetched_at > now() - make_interval(secs => $2)`,
+		normalized, c.ttl.Seconds(),
 	).Scan(&out.Query, &out.Hash, &out.Payload, &out.FetchedAt)
 
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -126,8 +126,8 @@ func (c *SearchCache) GetByHash(ctx context.Context, hash string) (CachedSearch,
 	err := c.pool.QueryRow(ctx, `
 		SELECT query, query_hash, payload, fetched_at
 		FROM artist_search_cache
-		WHERE query_hash = $1 AND fetched_at > now() - $2::interval`,
-		hash, c.ttl.String(),
+		WHERE query_hash = $1 AND fetched_at > now() - make_interval(secs => $2)`,
+		hash, c.ttl.Seconds(),
 	).Scan(&out.Query, &out.Hash, &out.Payload, &out.FetchedAt)
 
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -141,10 +141,13 @@ func (c *SearchCache) GetByHash(ctx context.Context, hash string) (CachedSearch,
 
 // Put stores or refreshes an entry.
 //
-// Two conflicts are possible and both are handled by overwriting: the same query
-// searched again (the common case, refreshes fetched_at) and a hash collision
-// between two different queries (vanishingly rare, last writer wins and Get's
-// exact-query check keeps the loser correct).
+// The same query searched again overwrites its row and refreshes fetched_at.
+// A hash collision between two different queries is not overwritten, whatever
+// this comment used to promise: query_hash is UNIQUE and ON CONFLICT absorbs
+// only the query key, so the second Put fails with 23505. The caller logs it
+// and carries on, and its buttons resolve to the older entry, which GetByHash
+// returns with that entry's own query text. At 48 bits that is vanishingly
+// rare (review 16.09, Data #5).
 func (c *SearchCache) Put(ctx context.Context, query string, payload []byte) (string, error) {
 	normalized := NormalizeQuery(query)
 	if normalized == "" {
@@ -170,12 +173,26 @@ func (c *SearchCache) Put(ctx context.Context, query string, payload []byte) (st
 // alone and never reach for the package-level function.
 func (c *SearchCache) HashQuery(query string) string { return HashQuery(query) }
 
-// EvictStale removes expired entries and reports how many went. Called on a
-// slow timer; the cache is a convenience, so this never needs to be precise.
+// evictAfterTTLs is how many freshness windows an entry outlives before it is
+// deleted.
+//
+// Not one. An entry past its TTL is no longer served first, but it is exactly
+// what GetAnyAge falls back to when MusicBrainz is down, so evicting at the TTL
+// would empty the outage fallback of everything but the last week. Eight weeks
+// keeps it useful while still bounding the table — and bounding how long the
+// text people typed into the bot is kept (review 16.09, Security #10).
+const evictAfterTTLs = 8
+
+// EvictStale removes entries far past their freshness window and reports how
+// many went. Called once a day by the poller; the cache is a convenience, so
+// this never needs to be precise.
+//
+// The horizon is multiplied in SQL, not in Go: a time.Duration overflows past
+// 292 years, and the tests use windows measured in decades.
 func (c *SearchCache) EvictStale(ctx context.Context) (int64, error) {
 	tag, err := c.pool.Exec(ctx,
-		`DELETE FROM artist_search_cache WHERE fetched_at < now() - $1::interval`,
-		c.ttl.String())
+		`DELETE FROM artist_search_cache WHERE fetched_at < now() - make_interval(secs => $1) * $2`,
+		c.ttl.Seconds(), evictAfterTTLs)
 	if err != nil {
 		return 0, fmt.Errorf("evict search cache: %w", err)
 	}
