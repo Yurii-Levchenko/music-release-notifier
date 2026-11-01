@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"html"
 	"log/slog"
+	"net"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/mymmrac/telego"
+	"github.com/valyala/fasthttp"
 
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/metrics"
 	"github.com/Yurii-Levchenko/music-release-notifier/internal/musicbrainz"
@@ -33,11 +35,25 @@ type Client struct {
 func NewClient(token string, log *slog.Logger) (*Client, error) {
 	// WithDiscardLogger: telego's default logger may print sensitive data, and
 	// we already have structured logging.
-	api, err := telego.NewBot(token, telego.WithDiscardLogger())
+	api, err := telego.NewBot(token, telego.WithDiscardLogger(),
+		telego.WithFastHTTPClient(&fasthttp.Client{DialTimeout: dialBothFamilies}))
 	if err != nil {
 		return nil, fmt.Errorf("create telegram bot: %w", err)
 	}
 	return &Client{api: api, log: log, metrics: metrics.Nop()}, nil
+}
+
+// dialBothFamilies connects over IPv4 or IPv6, whichever answers. fasthttp's
+// own dialer uses IPv4 only unless told otherwise, and the server has no public
+// IPv4 address (one costs money on Google Cloud): on 01.11 the first start
+// there timed out dialing Telegram's IPv4 address and restarted in a loop. Go's
+// standard dialer tries both families and keeps the first that connects
+// (RFC 6555), the same way every other HTTP client in this program already
+// does through net/http. A Dial with a timeout, not without, so a request's
+// deadline also bounds the connect.
+func dialBothFamilies(addr string, timeout time.Duration) (net.Conn, error) {
+	// fasthttp hands over a timeout, not a context; the timeout is the bound.
+	return (&net.Dialer{Timeout: timeout}).DialContext(context.Background(), "tcp", addr)
 }
 
 // Init verifies the token and caches the bot's own identity. Called once at

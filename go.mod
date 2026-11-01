@@ -6,6 +6,7 @@ require (
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/mymmrac/telego v1.11.2
 	github.com/prometheus/client_golang v1.24.1
+	github.com/valyala/fasthttp v1.73.0
 	golang.org/x/sync v0.22.0
 	golang.org/x/time v0.15.0
 )
@@ -31,7 +32,6 @@ require (
 	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
-	github.com/valyala/fasthttp v1.73.0 // indirect
 	github.com/valyala/fastjson v1.6.10 // indirect
 	golang.org/x/arch v0.0.0-20210923205945-b76863e36670 // indirect
 	golang.org/x/sys v0.47.0 // indirect
