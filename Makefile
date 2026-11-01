@@ -1,5 +1,10 @@
 .PHONY: run build test test-db lint fmt vet check up down logs psql spike ci-local alert-chat-id silence silences unsilence
 
+# Git Bash on Windows rewrites arguments that start with / into Windows paths,
+# so /etc/alertmanager/... reached docker as C:/Program Files/Git/etc/... .
+# Harmless everywhere else.
+export MSYS_NO_PATHCONV := 1
+
 # --- development ---
 run:      ; go run ./cmd/releaseradar
 build:    ; go build -trimpath -o bin/releaseradar ./cmd/releaseradar
@@ -40,18 +45,20 @@ alert-chat-id:
 # I'm on it": it stops the repeats without touching the rule, expires on its
 # own so it cannot outlive the incident, and survives restarts because
 # Alertmanager keeps it on its volume. Muting by editing the rule does none of
-# those. amtool runs inside the container, which keeps the API off the host.
+# those. amtool runs inside the container, which keeps the API off the host,
+# and deploy/alertmanager/silence.sh posts a line to the alert chat so the
+# silence is visible where the alert arrived.
 ALERT ?=
 FOR ?= 24h
 REASON ?= acknowledged
 AMTOOL = docker compose exec -T alertmanager amtool --alertmanager.url=http://localhost:9093
 silence:
 	@[ -n "$(ALERT)" ] || { echo "usage: make silence ALERT=<alertname> [FOR=24h] [REASON=...]"; exit 1; }
-	@$(AMTOOL) silence add alertname="$(ALERT)" --duration="$(FOR)" --comment="$(REASON)" --author=owner
+	@docker compose exec -T -e ACTION=add -e ALERT="$(ALERT)" -e FOR="$(FOR)" -e REASON="$(REASON)" alertmanager sh /etc/alertmanager/silence.sh
 silences: ; @$(AMTOOL) silence query
 unsilence:
 	@[ -n "$(ID)" ] || { echo "usage: make unsilence ID=<id from make silences>"; exit 1; }
-	@$(AMTOOL) silence expire "$(ID)"
+	@docker compose exec -T -e ACTION=expire -e ID="$(ID)" alertmanager sh /etc/alertmanager/silence.sh
 
 logs:     ; docker compose logs -f app
 psql:     ; docker compose exec db psql -U releaseradar -d releaseradar
