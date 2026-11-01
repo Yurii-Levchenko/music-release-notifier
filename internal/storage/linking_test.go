@@ -297,6 +297,95 @@ func TestExpiredTokensAreCleanedUpButRedeemedOnesStay(t *testing.T) {
 	}
 }
 
+// One live code per install is a constraint, not a habit of CreateLinkToken:
+// any writer — a future endpoint, a hand-run INSERT — hits the same wall.
+func TestOneLiveLinkCodePerInstallIsASchemaRule(t *testing.T) {
+	ctx, tx := testTx(t)
+
+	insert := func(hash, code string) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO link_tokens (token_hash, short_code, install_id, expires_at, api_token_hash)
+			VALUES ($1, $2, 'install-schema-rule', now() + interval '15 minutes', $3)`,
+			[]byte(hash), code, []byte("api-"+hash))
+		return err
+	}
+	if err := insert("first", "AAAAAA"); err != nil {
+		t.Fatalf("first live code: %v", err)
+	}
+	if _, err := tx.Exec(ctx, "SAVEPOINT second_code"); err != nil {
+		t.Fatalf("savepoint: %v", err)
+	}
+	if err := insert("second", "BBBBBB"); err == nil {
+		t.Fatal("a second live code for one install was accepted")
+	}
+	if _, err := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT second_code"); err != nil {
+		t.Fatalf("rollback to savepoint: %v", err)
+	}
+
+	// A redeemed code is history, not a live code, and does not count.
+	if _, err := tx.Exec(ctx,
+		`UPDATE link_tokens SET redeemed_at = now() WHERE install_id = 'install-schema-rule'`); err != nil {
+		t.Fatalf("redeem: %v", err)
+	}
+	if err := insert("third", "CCCCCC"); err != nil {
+		t.Fatalf("a new live code after a redeemed one was refused: %v", err)
+	}
+}
+
+// The race the schema rule exists for: two /link/init calls for one install at
+// once. Committed through the pool, because a race inside one transaction is
+// not a race.
+func TestConcurrentLinkInitLeavesOneLiveCode(t *testing.T) {
+	if testDBPool == nil {
+		t.Skip("TEST_DATABASE_URL not set; skipping database tests")
+	}
+	ctx := context.Background()
+	const install = "install-init-race"
+	t.Cleanup(func() {
+		_, _ = testDBPool.Exec(ctx, `DELETE FROM link_tokens WHERE install_id = $1`, install)
+	})
+
+	linking := storage.NewLinking(testDBPool)
+	const callers = 8
+	tokens := make([]storage.LinkToken, callers)
+	errs := make([]error, callers)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := range callers {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			tokens[idx], errs[idx] = linking.CreateLinkToken(ctx, install)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	issued := map[string]bool{}
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("caller %d: %v", i, err)
+		}
+		issued[tokens[i].ShortCode] = true
+	}
+
+	var live int
+	var code string
+	if err := testDBPool.QueryRow(ctx, `
+		SELECT count(*), min(short_code)
+		FROM link_tokens WHERE install_id = $1 AND redeemed_at IS NULL`,
+		install).Scan(&live, &code); err != nil {
+		t.Fatalf("count live codes: %v", err)
+	}
+	if live != 1 {
+		t.Fatalf("%d live codes for one install after %d concurrent inits, want 1", live, callers)
+	}
+	if !issued[code] {
+		t.Fatalf("the surviving code %q was never handed to a caller", code)
+	}
+}
+
 func TestLooksLikeShortCode(t *testing.T) {
 	yes := []string{"K7F2QX", "k7f2qx", "  K7F2QX  ", "234567"}
 	no := []string{
