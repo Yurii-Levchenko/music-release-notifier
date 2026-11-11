@@ -438,3 +438,13 @@ func TestHeaderWithoutAHandle(t *testing.T) {
 		t.Errorf("fresh release header = %q", fresh)
 	}
 }
+
+// The Music app on iOS reads "+" literally, so a search for "Drake+Ya+Hit"
+// found nothing useful. Spaces must be %20; a real "+" in a title stays %2B.
+func TestAppleMusicSearchEncodesSpacesAsPercent20(t *testing.T) {
+	got := appleMusicSearchURL("Future Ya Hit (feat. Drake) C++")
+	want := "https://music.apple.com/search?term=Future%20Ya%20Hit%20%28feat.%20Drake%29%20C%2B%2B"
+	if got != want {
+		t.Fatalf("appleMusicSearchURL = %s, want %s", got, want)
+	}
+}
