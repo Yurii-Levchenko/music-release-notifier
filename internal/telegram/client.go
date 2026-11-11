@@ -382,7 +382,12 @@ func youTubeSearchURL(query string) string {
 func appleMusicSearchURL(query string) string {
 	// Apple answers this with a 301 to the viewer's regional store, which is
 	// the correct destination and not something to hardcode.
-	return "https://music.apple.com/search?term=" + url.QueryEscape(query)
+	//
+	// Spaces as %20, not "+". QueryEscape writes a space as "+", which the web
+	// reads as a space but the Music app on iOS takes literally: the link
+	// opened a search for "Drake+Ya+Hit" (seen 11.11). A literal "+" in a
+	// title is still %2B, so swapping the remaining "+" cannot touch it.
+	return "https://music.apple.com/search?term=" + strings.ReplaceAll(url.QueryEscape(query), "+", "%20")
 }
 
 func link(href, label string) string {
